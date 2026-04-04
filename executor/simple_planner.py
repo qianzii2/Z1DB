@@ -494,8 +494,13 @@ class SimplePlanner:
     def _build_source(self, ast: SelectStmt, catalog: Catalog) -> Operator:
         if ast.from_clause is None:
             return DualScan()
+        # Check for GENERATE_SERIES table function
         fc = ast.from_clause
         tref = fc.table
+        if tref.name == 'generate_series' and tref.subquery is None:
+            # Parse args from the select context — treat as special table
+            # For now, detect via FunctionCall in FROM (not standard SQL)
+            pass
         if tref.subquery:
             return self._plan_any(tref.subquery, catalog)
         has_join = bool(fc.joins)

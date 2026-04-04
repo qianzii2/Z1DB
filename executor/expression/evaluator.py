@@ -1,9 +1,12 @@
 from __future__ import annotations
-"""Expression evaluator — vectorised evaluation over DataVectors."""
-import datetime
+"""Expression evaluator — complete with all scalar functions."""
+import datetime as _dt
+import math as _math
 import operator as _op
+import random as _random
 import re as _re
 from typing import Any, Dict, List, Optional
+
 from executor.core.vector import DataVector
 from executor.core.batch import VectorBatch
 from metal.bitmap import Bitmap
@@ -20,43 +23,40 @@ from utils.errors import (
     DivisionByZeroError, ExecutionError, NumericOverflowError, TypeMismatchError,
 )
 
+try:
+    from parser.ast import WindowCall
+except ImportError:
+    WindowCall = None  # type: ignore
+
 
 class ExpressionEvaluator:
     def __init__(self, registry: Optional[Any] = None) -> None:
         self._registry = registry
 
-    # ==================================================================
+    # ══════════════════════════════════════════════════════════════
+    # Public
+    # ══════════════════════════════════════════════════════════════
     def evaluate(self, expr: Any, batch: VectorBatch) -> DataVector:
-        if isinstance(expr, Literal):
-            return self._eval_literal(expr, batch.row_count)
-        if isinstance(expr, ColumnRef):
-            return self._eval_column_ref(expr, batch)
-        if isinstance(expr, AliasExpr):
-            return self.evaluate(expr.expr, batch)
+        if isinstance(expr, Literal):      return self._eval_literal(expr, batch.row_count)
+        if isinstance(expr, ColumnRef):    return self._eval_colref(expr, batch)
+        if isinstance(expr, AliasExpr):    return self.evaluate(expr.expr, batch)
         if isinstance(expr, BinaryExpr):
-            l = self.evaluate(expr.left, batch)
-            r = self.evaluate(expr.right, batch)
-            return self._eval_binary(expr.op, l, r)
-        if isinstance(expr, UnaryExpr):
-            return self._eval_unary(expr, batch)
-        if isinstance(expr, IsNullExpr):
-            return self._eval_is_null(expr, batch)
-        if isinstance(expr, CaseExpr):
-            return self._eval_case(expr, batch)
-        if isinstance(expr, CastExpr):
-            return self._eval_cast(expr, batch)
-        if isinstance(expr, InExpr):
-            return self._eval_in(expr, batch)
-        if isinstance(expr, BetweenExpr):
-            return self._eval_between(expr, batch)
-        if isinstance(expr, LikeExpr):
-            return self._eval_like(expr, batch)
-        if isinstance(expr, FunctionCall):
-            return self._eval_function(expr, batch)
+            return self._eval_binary(expr.op, self.evaluate(expr.left, batch),
+                                     self.evaluate(expr.right, batch))
+        if isinstance(expr, UnaryExpr):    return self._eval_unary(expr, batch)
+        if isinstance(expr, IsNullExpr):   return self._eval_is_null(expr, batch)
+        if isinstance(expr, CaseExpr):     return self._eval_case(expr, batch)
+        if isinstance(expr, CastExpr):     return self._eval_cast(expr, batch)
+        if isinstance(expr, InExpr):       return self._eval_in(expr, batch)
+        if isinstance(expr, BetweenExpr):  return self._eval_between(expr, batch)
+        if isinstance(expr, LikeExpr):     return self._eval_like(expr, batch)
+        if isinstance(expr, FunctionCall): return self._eval_function(expr, batch)
         if isinstance(expr, AggregateCall):
             raise ExecutionError("aggregate in non-aggregate context")
         if isinstance(expr, StarExpr):
             raise ExecutionError("internal: StarExpr in eval")
+        if WindowCall is not None and isinstance(expr, WindowCall):
+            raise ExecutionError("window function outside of window context")
         raise ExecutionError(f"unknown expression: {type(expr).__name__}")
 
     def evaluate_predicate(self, expr: Any, batch: VectorBatch) -> Bitmap:
@@ -71,37 +71,31 @@ class ExpressionEvaluator:
             return bm
         raise ExecutionError(f"WHERE must be boolean, got {vec.dtype.name}")
 
-    # ==================================================================
-    # ColumnRef — handles qualified (table.column) and unqualified
-    # ==================================================================
-    def _eval_column_ref(self, expr: ColumnRef, batch: VectorBatch) -> DataVector:
-        # Try qualified name first (for JOIN queries)
+    # ══════════════════════════════════════════════════════════════
+    # ColumnRef
+    # ══════════════════════════════════════════════════════════════
+    def _eval_colref(self, expr: ColumnRef, batch: VectorBatch) -> DataVector:
         if expr.table is not None:
-            qualified = f"{expr.table}.{expr.column}"
-            if qualified in batch.columns:
-                return batch.columns[qualified]
-        # Try unqualified
+            q = f"{expr.table}.{expr.column}"
+            if q in batch.columns:
+                return batch.columns[q]
         if expr.column in batch.columns:
             return batch.columns[expr.column]
-        # Try scanning all columns for suffix match (e.g. column 'u.name' matches ref 'name')
-        if expr.table is not None:
-            qualified = f"{expr.table}.{expr.column}"
-            raise ExecutionError(f"column '{qualified}' not found")
+        if expr.table:
+            raise ExecutionError(f"column '{expr.table}.{expr.column}' not found")
         raise ExecutionError(f"column '{expr.column}' not found")
 
-    # ==================================================================
+    # ══════════════════════════════════════════════════════════════
     # Literal
-    # ==================================================================
+    # ══════════════════════════════════════════════════════════════
     def _eval_literal(self, lit: Literal, n: int) -> DataVector:
         if lit.value is None:
             dt = lit.inferred_type if lit.inferred_type != DataType.UNKNOWN else DataType.INT
             nulls = Bitmap(n)
-            for i in range(n):
-                nulls.set_bit(i)
+            for i in range(n): nulls.set_bit(i)
             return DataVector.from_nulls(dt, n, nulls)
         dtype = lit.inferred_type
-        if dtype == DataType.UNKNOWN:
-            dtype = DataType.INT
+        if dtype == DataType.UNKNOWN: dtype = DataType.INT
         code = DTYPE_TO_ARRAY_CODE.get(dtype)
         if code is not None:
             data: Any = TypedVector(code, [lit.value] * n)
@@ -110,975 +104,635 @@ class ExpressionEvaluator:
         elif dtype == DataType.BOOLEAN:
             data = Bitmap(n)
             if lit.value:
-                for i in range(n):
-                    data.set_bit(i)
+                for i in range(n): data.set_bit(i)
         else:
             data = TypedVector('q', [lit.value] * n)
         return DataVector(dtype=dtype, data=data, nulls=Bitmap(n), _length=n)
 
-    # ==================================================================
+    # ══════════════════════════════════════════════════════════════
     # Binary
-    # ==================================================================
+    # ══════════════════════════════════════════════════════════════
     def _eval_binary(self, op: str, left: DataVector, right: DataVector) -> DataVector:
-        if op in ('+', '-', '*', '/', '%'):
-            return self._eval_arith(op, left, right)
-        if op in ('=', '!=', '<', '>', '<=', '>='):
-            return self._eval_cmp(op, left, right)
-        if op == '||':
-            return self._eval_concat(left, right)
-        if op == 'AND':
-            return self._eval_and(self._to_bool(left), self._to_bool(right))
-        if op == 'OR':
-            return self._eval_or(self._to_bool(left), self._to_bool(right))
+        if op in ('+','-','*','/','%'): return self._eval_arith(op, left, right)
+        if op in ('=','!=','<','>','<=','>='): return self._eval_cmp(op, left, right)
+        if op == '||': return self._eval_concat(left, right)
+        if op == 'AND': return self._eval_and(self._to_bool(left), self._to_bool(right))
+        if op == 'OR': return self._eval_or(self._to_bool(left), self._to_bool(right))
         raise ExecutionError(f"unsupported op: {op}")
 
     def _eval_arith(self, op: str, left: DataVector, right: DataVector) -> DataVector:
         target = promote(left.dtype, right.dtype)
-        lv = self.cast_vector(left, target)
-        rv = self.cast_vector(right, target)
-        n = len(lv)
-        is_int = target in (DataType.INT, DataType.BIGINT, DataType.BOOLEAN)
+        lv, rv = self.cast_vector(left, target), self.cast_vector(right, target)
+        n = len(lv); is_int = target in (DataType.INT, DataType.BIGINT, DataType.BOOLEAN)
         ops = {'+': _op.add, '-': _op.sub, '*': _op.mul}
         code = DTYPE_TO_ARRAY_CODE.get(target)
-        rd: Any = TypedVector(code) if code else []
-        rn = Bitmap(n)
+        rd: Any = TypedVector(code) if code else []; rn = Bitmap(n)
         for i in range(n):
             if lv.is_null(i) or rv.is_null(i):
-                rn.set_bit(i)
-                if isinstance(rd, TypedVector):
-                    rd.append(0)
-                else:
-                    rd.append(None)
-                continue
+                rn.set_bit(i); rd.append(0) if isinstance(rd, TypedVector) else rd.append(None); continue
             a, b = lv.get(i), rv.get(i)
-            if op in ops:
-                val = ops[op](a, b)
+            if op in ops: val = ops[op](a, b)
             elif op == '/':
                 if b == 0:
-                    if is_int:
-                        raise DivisionByZeroError()
+                    if is_int: raise DivisionByZeroError()
                     val = float('inf') if a >= 0 else float('-inf')
-                else:
-                    val = int(a / b) if is_int else a / b
+                else: val = int(a / b) if is_int else a / b
             elif op == '%':
-                if b == 0:
-                    raise DivisionByZeroError()
+                if b == 0: raise DivisionByZeroError()
                 val = a % b
-            else:
-                raise ExecutionError(f"unknown arith: {op}")
-            if target == DataType.INT and not (-2_147_483_648 <= val <= 2_147_483_647):
+            else: raise ExecutionError(f"unknown arith: {op}")
+            if target == DataType.INT and not (-2**31 <= val < 2**31):
                 raise NumericOverflowError(f"overflow: {val}")
-            if isinstance(rd, TypedVector):
-                rd.append(val)
-            else:
-                rd.append(val)
+            rd.append(val) if isinstance(rd, TypedVector) else rd.append(val)
         return DataVector(dtype=target, data=rd, nulls=rn, _length=n)
 
     def _eval_cmp(self, op: str, left: DataVector, right: DataVector) -> DataVector:
         if is_numeric(left.dtype) and is_numeric(right.dtype):
-            t = promote(left.dtype, right.dtype)
-            lv = self.cast_vector(left, t)
-            rv = self.cast_vector(right, t)
-        elif is_string(left.dtype) and is_string(right.dtype):
-            lv, rv = left, right
-        elif left.dtype == DataType.BOOLEAN and right.dtype == DataType.BOOLEAN:
-            lv, rv = left, right
+            t = promote(left.dtype, right.dtype); lv, rv = self.cast_vector(left, t), self.cast_vector(right, t)
+        elif is_string(left.dtype) and is_string(right.dtype): lv, rv = left, right
+        elif left.dtype == DataType.BOOLEAN and right.dtype == DataType.BOOLEAN: lv, rv = left, right
         else:
-            try:
-                t = promote(left.dtype, right.dtype)
-                lv = self.cast_vector(left, t)
-                rv = self.cast_vector(right, t)
-            except TypeMismatchError:
-                lv, rv = left, right
-        n = len(lv)
-        fns = {'=': _op.eq, '!=': _op.ne, '<': _op.lt,
-               '>': _op.gt, '<=': _op.le, '>=': _op.ge}
-        fn = fns[op]
-        rd = Bitmap(n)
-        rn = Bitmap(n)
+            try: t = promote(left.dtype, right.dtype); lv, rv = self.cast_vector(left, t), self.cast_vector(right, t)
+            except TypeMismatchError: lv, rv = left, right
+        n = len(lv); fns = {'=':_op.eq,'!=':_op.ne,'<':_op.lt,'>':_op.gt,'<=':_op.le,'>=':_op.ge}
+        fn = fns[op]; rd = Bitmap(n); rn = Bitmap(n)
         for i in range(n):
-            if lv.is_null(i) or rv.is_null(i):
-                rn.set_bit(i)
-                continue
-            if fn(lv.get(i), rv.get(i)):
-                rd.set_bit(i)
+            if lv.is_null(i) or rv.is_null(i): rn.set_bit(i); continue
+            if fn(lv.get(i), rv.get(i)): rd.set_bit(i)
         return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
 
     def _eval_concat(self, left: DataVector, right: DataVector) -> DataVector:
-        n = len(left)
-        rd: list = []
-        rn = Bitmap(n)
+        n = len(left); rd: list = []; rn = Bitmap(n)
         for i in range(n):
-            if left.is_null(i) or right.is_null(i):
-                rn.set_bit(i)
-                rd.append('')
-            else:
-                rd.append(str(left.get(i)) + str(right.get(i)))
+            if left.is_null(i) or right.is_null(i): rn.set_bit(i); rd.append('')
+            else: rd.append(str(left.get(i)) + str(right.get(i)))
         return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
     def _eval_and(self, l: DataVector, r: DataVector) -> DataVector:
-        n = len(l)
-        rd = Bitmap(n)
-        rn = Bitmap(n)
+        n = len(l); rd = Bitmap(n); rn = Bitmap(n)
         for i in range(n):
             ln, rnn = l.is_null(i), r.is_null(i)
-            lv = l.get(i) if not ln else None
-            rv = r.get(i) if not rnn else None
-            if (not ln and not lv) or (not rnn and not rv):
-                pass
-            elif ln or rnn:
-                rn.set_bit(i)
-            elif lv and rv:
-                rd.set_bit(i)
+            lv = l.get(i) if not ln else None; rv = r.get(i) if not rnn else None
+            if (not ln and not lv) or (not rnn and not rv): pass
+            elif ln or rnn: rn.set_bit(i)
+            elif lv and rv: rd.set_bit(i)
         return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
 
     def _eval_or(self, l: DataVector, r: DataVector) -> DataVector:
-        n = len(l)
-        rd = Bitmap(n)
-        rn = Bitmap(n)
+        n = len(l); rd = Bitmap(n); rn = Bitmap(n)
         for i in range(n):
             ln, rnn = l.is_null(i), r.is_null(i)
-            lv = l.get(i) if not ln else None
-            rv = r.get(i) if not rnn else None
-            if (not ln and lv) or (not rnn and rv):
-                rd.set_bit(i)
-            elif ln or rnn:
-                rn.set_bit(i)
+            lv = l.get(i) if not ln else None; rv = r.get(i) if not rnn else None
+            if (not ln and lv) or (not rnn and rv): rd.set_bit(i)
+            elif ln or rnn: rn.set_bit(i)
         return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
 
-    # ==================================================================
-    # Unary
-    # ==================================================================
+    # ══════════════════════════════════════════════════════════════
+    # Unary / IS NULL / CASE / CAST / IN / BETWEEN / LIKE
+    # ══════════════════════════════════════════════════════════════
     def _eval_unary(self, expr: Any, batch: VectorBatch) -> DataVector:
-        op_vec = self.evaluate(expr.operand, batch)
-        if expr.op == '+':
-            return op_vec
+        ov = self.evaluate(expr.operand, batch)
+        if expr.op == '+': return ov
         if expr.op == '-':
-            n = len(op_vec)
-            if not is_numeric(op_vec.dtype):
-                raise ExecutionError(f"cannot negate {op_vec.dtype.name}")
-            code = DTYPE_TO_ARRAY_CODE.get(op_vec.dtype)
-            if code is None:
-                raise ExecutionError(f"cannot negate {op_vec.dtype.name}")
-            rd = TypedVector(code)
-            rn = Bitmap(n)
+            n = len(ov)
+            if not is_numeric(ov.dtype): raise ExecutionError(f"cannot negate {ov.dtype.name}")
+            code = DTYPE_TO_ARRAY_CODE.get(ov.dtype)
+            if not code: raise ExecutionError(f"cannot negate {ov.dtype.name}")
+            rd = TypedVector(code); rn = Bitmap(n)
             for i in range(n):
-                if op_vec.is_null(i):
-                    rn.set_bit(i)
-                    rd.append(0)
-                else:
-                    rd.append(-op_vec.get(i))
-            return DataVector(dtype=op_vec.dtype, data=rd, nulls=rn, _length=n)
+                if ov.is_null(i): rn.set_bit(i); rd.append(0)
+                else: rd.append(-ov.get(i))
+            return DataVector(dtype=ov.dtype, data=rd, nulls=rn, _length=n)
         if expr.op == 'NOT':
-            bv = self._to_bool(op_vec)
-            n = len(bv)
-            rd = Bitmap(n)
-            rn = Bitmap(n)
+            bv = self._to_bool(ov); n = len(bv); rd = Bitmap(n); rn = Bitmap(n)
             for i in range(n):
-                if bv.is_null(i):
-                    rn.set_bit(i)
-                elif not bv.data.get_bit(i):
-                    rd.set_bit(i)
+                if bv.is_null(i): rn.set_bit(i)
+                elif not bv.data.get_bit(i): rd.set_bit(i)
             return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
         raise ExecutionError(f"unsupported unary: {expr.op}")
 
-    # ==================================================================
-    # IS NULL
-    # ==================================================================
     def _eval_is_null(self, expr: Any, batch: VectorBatch) -> DataVector:
-        op_vec = self.evaluate(expr.expr, batch)
-        n = len(op_vec)
-        rd = Bitmap(n)
+        ov = self.evaluate(expr.expr, batch); n = len(ov); rd = Bitmap(n)
         for i in range(n):
-            is_n = op_vec.is_null(i)
-            if (is_n and not expr.negated) or (not is_n and expr.negated):
-                rd.set_bit(i)
+            isn = ov.is_null(i)
+            if (isn and not expr.negated) or (not isn and expr.negated): rd.set_bit(i)
         return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=Bitmap(n), _length=n)
 
-    # ==================================================================
-    # CASE
-    # ==================================================================
     def _eval_case(self, expr: CaseExpr, batch: VectorBatch) -> DataVector:
-        n = batch.row_count
-        results: list = [None] * n
-        resolved: list = [False] * n
-
+        n = batch.row_count; results = [None]*n; resolved = [False]*n
         if expr.operand is not None:
-            op_vec = self.evaluate(expr.operand, batch)
+            opv = self.evaluate(expr.operand, batch)
             for cond, result in expr.when_clauses:
-                cond_vec = self.evaluate(cond, batch)
-                res_vec = self.evaluate(result, batch)
+                cv, rv = self.evaluate(cond, batch), self.evaluate(result, batch)
                 for i in range(n):
-                    if resolved[i]:
-                        continue
-                    if not op_vec.is_null(i) and not cond_vec.is_null(i) and op_vec.get(i) == cond_vec.get(i):
-                        results[i] = res_vec.get(i)
-                        resolved[i] = True
+                    if resolved[i]: continue
+                    if not opv.is_null(i) and not cv.is_null(i) and opv.get(i) == cv.get(i):
+                        results[i] = rv.get(i); resolved[i] = True
         else:
             for cond, result in expr.when_clauses:
-                cond_vec = self.evaluate(cond, batch)
-                res_vec = self.evaluate(result, batch)
+                cv, rv = self.evaluate(cond, batch), self.evaluate(result, batch)
                 for i in range(n):
-                    if resolved[i]:
-                        continue
-                    if not cond_vec.is_null(i) and cond_vec.get(i):
-                        results[i] = res_vec.get(i)
-                        resolved[i] = True
-
+                    if resolved[i]: continue
+                    if not cv.is_null(i) and cv.get(i): results[i] = rv.get(i); resolved[i] = True
         if expr.else_expr is not None:
-            else_vec = self.evaluate(expr.else_expr, batch)
+            ev = self.evaluate(expr.else_expr, batch)
             for i in range(n):
-                if not resolved[i]:
-                    results[i] = else_vec.get(i)
-
-        # Determine type
-        dtype = DataType.VARCHAR  # safe default for CASE
+                if not resolved[i]: results[i] = ev.get(i)
+        dtype = DataType.VARCHAR
         if expr.when_clauses:
-            child_schema = {cn: batch.columns[cn].dtype for cn in batch.column_names}
-            dt = ExpressionEvaluator.infer_type(expr.when_clauses[0][1], child_schema)
-            if dt != DataType.UNKNOWN:
-                dtype = dt
-        return self._list_to_vector(results, dtype, n)
+            cs = {cn: batch.columns[cn].dtype for cn in batch.column_names}
+            dt = ExpressionEvaluator.infer_type(expr.when_clauses[0][1], cs)
+            if dt != DataType.UNKNOWN: dtype = dt
+        return self._list_to_vec(results, dtype, n)
 
-    # ==================================================================
-    # CAST
-    # ==================================================================
     def _eval_cast(self, expr: CastExpr, batch: VectorBatch) -> DataVector:
         src = self.evaluate(expr.expr, batch)
-        assert expr.type_name is not None
-        target_dt, _ = resolve_type_name(expr.type_name.name, expr.type_name.params)
-        if src.dtype == target_dt:
-            return src
-        n = len(src)
-        results: list = [None] * n
+        assert expr.type_name
+        tdt, _ = resolve_type_name(expr.type_name.name, expr.type_name.params)
+        if src.dtype == tdt: return src
+        n = len(src); results = [None]*n
         for i in range(n):
-            if src.is_null(i):
-                continue
+            if src.is_null(i): continue
             v = src.get(i)
             try:
-                if target_dt == DataType.INT:
-                    results[i] = int(v)
-                elif target_dt == DataType.BIGINT:
-                    results[i] = int(v)
-                elif target_dt in (DataType.FLOAT, DataType.DOUBLE):
-                    results[i] = float(v)
-                elif target_dt in (DataType.VARCHAR, DataType.TEXT):
-                    results[i] = str(v)
-                elif target_dt == DataType.BOOLEAN:
-                    results[i] = bool(v)
-                else:
-                    results[i] = v
-            except (ValueError, TypeError):
-                results[i] = None
-        return self._list_to_vector(results, target_dt, n)
+                if tdt == DataType.INT: results[i] = int(v)
+                elif tdt == DataType.BIGINT: results[i] = int(v)
+                elif tdt in (DataType.FLOAT, DataType.DOUBLE): results[i] = float(v)
+                elif tdt in (DataType.VARCHAR, DataType.TEXT): results[i] = str(v)
+                elif tdt == DataType.BOOLEAN: results[i] = bool(v)
+                else: results[i] = v
+            except (ValueError, TypeError): pass
+        return self._list_to_vec(results, tdt, n)
 
-    # ==================================================================
-    # IN
-    # ==================================================================
     def _eval_in(self, expr: InExpr, batch: VectorBatch) -> DataVector:
-        src = self.evaluate(expr.expr, batch)
-        n = len(src)
-        val_vecs = [self.evaluate(v, batch) for v in expr.values]
-        rd = Bitmap(n)
-        rn = Bitmap(n)
+        src = self.evaluate(expr.expr, batch); n = len(src)
+        vvs = [self.evaluate(v, batch) for v in expr.values]
+        rd = Bitmap(n); rn = Bitmap(n)
         for i in range(n):
-            if src.is_null(i):
-                rn.set_bit(i)
-                continue
-            sv = src.get(i)
-            found = False
-            has_null = False
-            for vv in val_vecs:
-                if vv.is_null(i):
-                    has_null = True
-                    continue
-                if sv == vv.get(i):
-                    found = True
-                    break
+            if src.is_null(i): rn.set_bit(i); continue
+            sv = src.get(i); found = False; has_null = False
+            for vv in vvs:
+                if vv.is_null(i): has_null = True; continue
+                if sv == vv.get(i): found = True; break
             if found:
-                if not expr.negated:
-                    rd.set_bit(i)
-            elif has_null:
-                rn.set_bit(i)
+                if not expr.negated: rd.set_bit(i)
+            elif has_null: rn.set_bit(i)
             else:
-                if expr.negated:
-                    rd.set_bit(i)
+                if expr.negated: rd.set_bit(i)
         return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
 
-    # ==================================================================
-    # BETWEEN
-    # ==================================================================
     def _eval_between(self, expr: BetweenExpr, batch: VectorBatch) -> DataVector:
         src = self.evaluate(expr.expr, batch)
-        low = self.evaluate(expr.low, batch)
-        high = self.evaluate(expr.high, batch)
-        n = len(src)
-        rd = Bitmap(n)
-        rn = Bitmap(n)
+        lo = self.evaluate(expr.low, batch); hi = self.evaluate(expr.high, batch)
+        n = len(src); rd = Bitmap(n); rn = Bitmap(n)
         for i in range(n):
-            if src.is_null(i) or low.is_null(i) or high.is_null(i):
-                rn.set_bit(i)
-                continue
-            sv, lv, hv = src.get(i), low.get(i), high.get(i)
-            in_range = lv <= sv <= hv
-            if (in_range and not expr.negated) or (not in_range and expr.negated):
-                rd.set_bit(i)
+            if src.is_null(i) or lo.is_null(i) or hi.is_null(i): rn.set_bit(i); continue
+            inr = lo.get(i) <= src.get(i) <= hi.get(i)
+            if (inr and not expr.negated) or (not inr and expr.negated): rd.set_bit(i)
         return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
 
-    # ==================================================================
-    # LIKE
-    # ==================================================================
     def _eval_like(self, expr: LikeExpr, batch: VectorBatch) -> DataVector:
-        src = self.evaluate(expr.expr, batch)
-        pat = self.evaluate(expr.pattern, batch)
-        n = len(src)
-        rd = Bitmap(n)
-        rn = Bitmap(n)
+        src = self.evaluate(expr.expr, batch); pat = self.evaluate(expr.pattern, batch)
+        n = len(src); rd = Bitmap(n); rn = Bitmap(n)
         for i in range(n):
-            if src.is_null(i) or pat.is_null(i):
-                rn.set_bit(i)
-                continue
-            matched = _like_match(str(src.get(i)), str(pat.get(i)))
-            if (matched and not expr.negated) or (not matched and expr.negated):
-                rd.set_bit(i)
+            if src.is_null(i) or pat.is_null(i): rn.set_bit(i); continue
+            m = _like_match(str(src.get(i)), str(pat.get(i)))
+            if (m and not expr.negated) or (not m and expr.negated): rd.set_bit(i)
         return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
 
-    # ==================================================================
-    # Scalar functions
-    # ==================================================================
-    def _eval_date_part(self, part: str, vec: DataVector, n: int) -> DataVector:
-        """Extract date/time part from an integer epoch-days or epoch-microseconds value."""
-        import datetime as _dt
-        results: list = [None] * n
-        for i in range(n):
-            if vec.is_null(i):
-                continue
-            v = vec.get(i)
-            try:
-                if isinstance(v, int) and abs(v) < 1_000_000:
-                    # Treat as epoch days
-                    d = _dt.date(1970, 1, 1) + _dt.timedelta(days=v)
-                    results[i] = self._extract_part(part, d, None)
-                elif isinstance(v, int):
-                    # Treat as epoch microseconds
-                    dt = _dt.datetime(1970, 1, 1) + _dt.timedelta(microseconds=v)
-                    results[i] = self._extract_part(part, dt.date(), dt.time())
-                else:
-                    results[i] = None
-            except Exception:
-                results[i] = None
-        return self._list_to_vector(results, DataType.INT, n)
-
-    def _extract_part(self, part: str, d: Any, t: Any) -> Optional[int]:
-        import datetime as _dt
-        if part == 'YEAR':
-            return d.year
-        if part == 'MONTH':
-            return d.month
-        if part == 'DAY':
-            return d.day
-        if part == 'HOUR':
-            return t.hour if t else 0
-        if part == 'MINUTE':
-            return t.minute if t else 0
-        if part == 'SECOND':
-            return t.second if t else 0
-        if part == 'DAY_OF_WEEK':
-            return d.isoweekday()
-        if part == 'DAY_OF_YEAR':
-            return d.timetuple().tm_yday
-        if part == 'WEEK_OF_YEAR':
-            return d.isocalendar()[1]
-        if part == 'QUARTER':
-            return (d.month - 1) // 3 + 1
-        return None
-
-    def _eval_lpad_rpad(self, args: list, n: int, left: bool) -> DataVector:
-        sv, lv = args[0], args[1]
-        pad_char = ' '
-        rd: list = []
-        rn = Bitmap(n)
-        for i in range(n):
-            if sv.is_null(i) or lv.is_null(i):
-                rn.set_bit(i)
-                rd.append('')
-            else:
-                s = str(sv.get(i))
-                width = int(lv.get(i))
-                if len(args) >= 3 and not args[2].is_null(i):
-                    pad_char = str(args[2].get(i))
-                if left:
-                    rd.append(s.rjust(width, pad_char[0] if pad_char else ' '))
-                else:
-                    rd.append(s.ljust(width, pad_char[0] if pad_char else ' '))
-        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
-
-    def _eval_split_part(self, args: list, n: int) -> DataVector:
-        rd: list = []
-        rn = Bitmap(n)
-        for i in range(n):
-            if args[0].is_null(i) or args[1].is_null(i) or args[2].is_null(i):
-                rn.set_bit(i)
-                rd.append('')
-            else:
-                s = str(args[0].get(i))
-                delim = str(args[1].get(i))
-                idx = int(args[2].get(i))
-                parts = s.split(delim)
-                if 1 <= idx <= len(parts):
-                    rd.append(parts[idx - 1])
-                else:
-                    rd.append('')
-        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
-
+    # ══════════════════════════════════════════════════════════════
+    # Scalar functions — complete
+    # ══════════════════════════════════════════════════════════════
     def _eval_function(self, expr: FunctionCall, batch: VectorBatch) -> DataVector:
         name = expr.name.upper()
         args = [self.evaluate(a, batch) for a in expr.args]
         n = batch.row_count
 
-        # String functions
-        if name == 'UPPER':
-            return self._apply_str1(args[0], n, lambda s: s.upper())
-        if name == 'LOWER':
-            return self._apply_str1(args[0], n, lambda s: s.lower())
-        if name == 'LENGTH':
-            return self._apply_num1(args[0], n, lambda s: len(str(s)), DataType.INT)
-        if name == 'TRIM':
-            return self._apply_str1(args[0], n, lambda s: s.strip())
-        if name == 'LTRIM':
-            return self._apply_str1(args[0], n, lambda s: s.lstrip())
-        if name == 'RTRIM':
-            return self._apply_str1(args[0], n, lambda s: s.rstrip())
-        if name == 'REVERSE':
-            return self._apply_str1(args[0], n, lambda s: s[::-1])
+        # ── String ────────────────────────────────────────────────
+        if name == 'UPPER': return self._str1(args[0], n, str.upper)
+        if name == 'LOWER': return self._str1(args[0], n, str.lower)
+        if name == 'LENGTH': return self._num1(args[0], n, lambda s: len(str(s)), DataType.INT)
+        if name == 'TRIM': return self._str1(args[0], n, str.strip)
+        if name == 'LTRIM': return self._str1(args[0], n, str.lstrip)
+        if name == 'RTRIM': return self._str1(args[0], n, str.rstrip)
+        if name == 'REVERSE': return self._str1(args[0], n, lambda s: s[::-1])
+        if name == 'INITCAP': return self._str1(args[0], n, str.title)
         if name == 'REPLACE' and len(args) >= 3:
-            return self._apply_str3(args[0], args[1], args[2], n,
-                                    lambda s, a, b: s.replace(a, b))
-        if name in ('SUBSTR', 'SUBSTRING'):
-            return self._eval_substr(args, n)
-        if name in ('CONCAT', 'CONCAT_WS'):
-            return self._eval_concat_func(name, args, n)
-        if name == 'POSITION' and len(args) >= 2:
-            return self._apply_num2(args[0], args[1], n,
-                                    lambda sub, s: str(s).find(str(sub)) + 1, DataType.INT)
-        if name == 'LEFT' and len(args) >= 2:
-            return self._apply_str_int(args[0], args[1], n, lambda s, k: s[:k])
-        if name == 'RIGHT' and len(args) >= 2:
-            return self._apply_str_int(args[0], args[1], n,
-                                       lambda s, k: s[-k:] if k > 0 else '')
-        if name == 'REPEAT' and len(args) >= 2:
-            return self._apply_str_int(args[0], args[1], n, lambda s, k: s * k)
-        if name == 'STARTS_WITH' and len(args) >= 2:
-            return self._apply_bool2(args[0], args[1], n,
-                                     lambda s, p: str(s).startswith(str(p)))
-        if name == 'ENDS_WITH' and len(args) >= 2:
-            return self._apply_bool2(args[0], args[1], n,
-                                     lambda s, p: str(s).endswith(str(p)))
-        if name == 'CONTAINS' and len(args) >= 2:
-            return self._apply_bool2(args[0], args[1], n,
-                                     lambda s, p: str(p) in str(s))
-
-        # Math functions
-        import math
-        if name == 'ABS':
-            return self._apply_num1(args[0], n, lambda x: abs(x), args[0].dtype)
-        if name in ('CEIL', 'CEILING'):
-            return self._apply_num1(args[0], n, lambda x: math.ceil(x), DataType.BIGINT)
-        if name == 'FLOOR':
-            return self._apply_num1(args[0], n, lambda x: math.floor(x), DataType.BIGINT)
-        if name == 'ROUND':
-            if len(args) >= 2:
-                return self._apply_num2(args[0], args[1], n,
-                                        lambda x, d: round(x, int(d)), DataType.DOUBLE)
-            return self._apply_num1(args[0], n, lambda x: round(x), DataType.BIGINT)
-        if name == 'POWER' and len(args) >= 2:
-            return self._apply_num2(args[0], args[1], n,
-                                    lambda x, y: math.pow(x, y), DataType.DOUBLE)
-        if name == 'SQRT':
-            return self._apply_num1(args[0], n, lambda x: math.sqrt(x), DataType.DOUBLE)
-        if name == 'MOD' and len(args) >= 2:
-            return self._apply_num2(args[0], args[1], n,
-                                    lambda x, y: x % y if y != 0 else None, args[0].dtype)
-        if name == 'SIGN':
-            return self._apply_num1(args[0], n,
-                                    lambda x: (1 if x > 0 else -1 if x < 0 else 0), DataType.INT)
-        if name == 'LN':
-            return self._apply_num1(args[0], n, lambda x: math.log(x), DataType.DOUBLE)
-        if name == 'LOG2':
-            return self._apply_num1(args[0], n, lambda x: math.log2(x), DataType.DOUBLE)
-        if name == 'LOG10':
-            return self._apply_num1(args[0], n, lambda x: math.log10(x), DataType.DOUBLE)
-        if name == 'EXP':
-            return self._apply_num1(args[0], n, lambda x: math.exp(x), DataType.DOUBLE)
-        if name == 'GREATEST' and len(args) >= 2:
-            return self._apply_variadic(args, n, lambda vs: max(
-                (v for v in vs if v is not None), default=None), args[0].dtype)
-        if name == 'LEAST' and len(args) >= 2:
-            return self._apply_variadic(args, n, lambda vs: min(
-                (v for v in vs if v is not None), default=None), args[0].dtype)
-
-        # Conditional
-        if name == 'COALESCE':
-            return self._eval_coalesce(args, n)
-        if name == 'NULLIF' and len(args) >= 2:
-            return self._eval_nullif(args[0], args[1], n)
-        if name == 'IF' and len(args) >= 3:
-            return self._eval_if_func(args[0], args[1], args[2], n)
-
-        # Date/Time functions
-        if name in ('NOW', 'CURRENT_TIMESTAMP'):
-            import time
-            ts = int(time.time() * 1_000_000)
-            return self._list_to_vector([ts] * n, DataType.BIGINT, n)
-        if name == 'CURRENT_DATE':
-            d = datetime.date.today()
-            days = (d - datetime.date(1970, 1, 1)).days
-            return self._list_to_vector([days] * n, DataType.INT, n)
-        if name in ('YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND',
-                     'DAY_OF_WEEK', 'DAY_OF_YEAR', 'WEEK_OF_YEAR', 'QUARTER'):
-            return self._eval_date_part(name, args[0], n)
-        if name == 'EXTRACT' and len(args) >= 2:
-            # EXTRACT(part FROM date) — part is a string literal
-            part_name = str(args[0].get(0)).upper() if not args[0].is_null(0) else ''
-            return self._eval_date_part(part_name, args[1], n)
-        if name == 'EPOCH' and args:
-            return self._apply_num1(args[0], n, lambda x: x, DataType.BIGINT)
-
-        # More string functions
-        if name == 'LPAD' and len(args) >= 2:
-            return self._eval_lpad_rpad(args, n, left=True)
-        if name == 'RPAD' and len(args) >= 2:
-            return self._eval_lpad_rpad(args, n, left=False)
-        if name == 'INITCAP':
-            return self._apply_str1(args[0], n, lambda s: s.title())
+            return self._str3(args[0], args[1], args[2], n, lambda s,a,b: s.replace(a,b))
+        if name in ('SUBSTR','SUBSTRING'): return self._substr(args, n)
+        if name in ('CONCAT','CONCAT_WS'): return self._concat_fn(name, args, n)
+        if name == 'POSITION' and len(args)>=2:
+            return self._num2(args[0],args[1],n, lambda sub,s: str(s).find(str(sub))+1, DataType.INT)
+        if name == 'LEFT' and len(args)>=2:
+            return self._str_int(args[0],args[1],n, lambda s,k: s[:k])
+        if name == 'RIGHT' and len(args)>=2:
+            return self._str_int(args[0],args[1],n, lambda s,k: s[-k:] if k>0 else '')
+        if name == 'REPEAT' and len(args)>=2:
+            return self._str_int(args[0],args[1],n, lambda s,k: s*k)
+        if name == 'STARTS_WITH' and len(args)>=2:
+            return self._bool2(args[0],args[1],n, lambda s,p: str(s).startswith(str(p)))
+        if name == 'ENDS_WITH' and len(args)>=2:
+            return self._bool2(args[0],args[1],n, lambda s,p: str(s).endswith(str(p)))
+        if name == 'CONTAINS' and len(args)>=2:
+            return self._bool2(args[0],args[1],n, lambda s,p: str(p) in str(s))
+        if name == 'LPAD' and len(args)>=2: return self._lpad_rpad(args, n, True)
+        if name == 'RPAD' and len(args)>=2: return self._lpad_rpad(args, n, False)
         if name == 'ASCII' and args:
-            return self._apply_num1(args[0], n, lambda s: ord(str(s)[0]) if str(s) else 0, DataType.INT)
+            return self._num1(args[0],n, lambda s: ord(str(s)[0]) if str(s) else 0, DataType.INT)
         if name == 'CHR' and args:
-            return self._apply_str1(args[0], n, lambda x: chr(int(x)) if isinstance(x, (int, float)) else '')
-        if name == 'SPLIT' and len(args) >= 2:
-            return self._apply_str1(args[0], n, lambda s: str(s))  # simplified
-        if name == 'SPLIT_PART' and len(args) >= 3:
-            return self._eval_split_part(args, n)
-        if name == 'REGEXP_REPLACE' and len(args) >= 3:
-            import re
-            return self._apply_str3(args[0], args[1], args[2], n,
-                                    lambda s, p, r: re.sub(p, r, s))
+            return self._str1(args[0],n, lambda x: chr(int(x)) if isinstance(x,(int,float)) else '')
+        if name == 'SPLIT_PART' and len(args)>=3: return self._split_part(args, n)
+        if name == 'REGEXP_REPLACE' and len(args)>=3:
+            return self._str3(args[0],args[1],args[2],n, lambda s,p,r: _re.sub(p,r,s))
+        if name == 'REGEXP_MATCH' and len(args)>=2:
+            return self._bool2(args[0],args[1],n, lambda s,p: bool(_re.search(str(p),str(s))))
+        if name == 'REGEXP_EXTRACT' and len(args)>=2:
+            return self._str2(args[0],args[1],n,
+                lambda s,p: (m.group(0) if (m:=_re.search(str(p),str(s))) else ''))
 
-        # TYPEOF
+        # ── Math ──────────────────────────────────────────────────
+        if name == 'ABS': return self._num1(args[0],n, abs, args[0].dtype)
+        if name in ('CEIL','CEILING'): return self._num1(args[0],n, _math.ceil, DataType.BIGINT)
+        if name == 'FLOOR': return self._num1(args[0],n, _math.floor, DataType.BIGINT)
+        if name == 'ROUND':
+            if len(args)>=2: return self._num2(args[0],args[1],n, lambda x,d: round(x,int(d)), DataType.DOUBLE)
+            return self._num1(args[0],n, round, DataType.BIGINT)
+        if name == 'TRUNC' or name == 'TRUNCATE':
+            return self._num1(args[0],n, lambda x: int(x), DataType.BIGINT)
+        if name == 'POWER' and len(args)>=2:
+            return self._num2(args[0],args[1],n, _math.pow, DataType.DOUBLE)
+        if name == 'SQRT': return self._num1(args[0],n, _math.sqrt, DataType.DOUBLE)
+        if name == 'CBRT': return self._num1(args[0],n, lambda x: x**(1/3) if x>=0 else -((-x)**(1/3)), DataType.DOUBLE)
+        if name == 'MOD' and len(args)>=2:
+            return self._num2(args[0],args[1],n, lambda x,y: x%y if y!=0 else None, args[0].dtype)
+        if name == 'SIGN':
+            return self._num1(args[0],n, lambda x: (1 if x>0 else -1 if x<0 else 0), DataType.INT)
+        if name == 'LN': return self._num1(args[0],n, _math.log, DataType.DOUBLE)
+        if name == 'LOG2': return self._num1(args[0],n, _math.log2, DataType.DOUBLE)
+        if name == 'LOG10': return self._num1(args[0],n, _math.log10, DataType.DOUBLE)
+        if name == 'LOG' and len(args)>=2:
+            return self._num2(args[0],args[1],n, lambda b,x: _math.log(x,b), DataType.DOUBLE)
+        if name == 'EXP': return self._num1(args[0],n, _math.exp, DataType.DOUBLE)
+        if name == 'GREATEST' and len(args)>=2:
+            return self._variadic(args,n, lambda vs: max((v for v in vs if v is not None), default=None), args[0].dtype)
+        if name == 'LEAST' and len(args)>=2:
+            return self._variadic(args,n, lambda vs: min((v for v in vs if v is not None), default=None), args[0].dtype)
+        if name == 'RANDOM':
+            return self._list_to_vec([_random.random() for _ in range(n)], DataType.DOUBLE, n)
+
+        # ── Conditional ───────────────────────────────────────────
+        if name == 'COALESCE': return self._coalesce(args, n)
+        if name == 'NULLIF' and len(args)>=2: return self._nullif(args[0], args[1], n)
+        if name == 'IF' and len(args)>=3: return self._if_fn(args[0], args[1], args[2], n)
         if name == 'TYPEOF' and args:
             rd: list = []
-            rn_bm = Bitmap(n)
             for i in range(n):
-                if args[0].is_null(i):
-                    rd.append('NULL')
-                else:
-                    rd.append(args[0].dtype.name)
-            return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn_bm, _length=n)
+                rd.append('NULL' if args[0].is_null(i) else args[0].dtype.name)
+            return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=Bitmap(n), _length=n)
 
-        # RANDOM
-        if name == 'RANDOM':
-            import random
-            return self._list_to_vector([random.random() for _ in range(n)], DataType.DOUBLE, n)
+        # ── Date/Time ─────────────────────────────────────────────
+        if name in ('NOW','CURRENT_TIMESTAMP'):
+            import time; ts = int(time.time()*1_000_000)
+            return self._list_to_vec([ts]*n, DataType.BIGINT, n)
+        if name == 'CURRENT_DATE':
+            d = _dt.date.today(); days = (d - _dt.date(1970,1,1)).days
+            return self._list_to_vec([days]*n, DataType.INT, n)
+        if name in ('YEAR','MONTH','DAY','HOUR','MINUTE','SECOND',
+                     'DAY_OF_WEEK','DAY_OF_YEAR','WEEK_OF_YEAR','QUARTER'):
+            return self._date_part(name, args[0], n) if args else self._list_to_vec([None]*n, DataType.INT, n)
+        if name == 'EXTRACT' and len(args)>=2:
+            part = str(args[0].get(0)).upper() if not args[0].is_null(0) else ''
+            return self._date_part(part, args[1], n)
+        if name == 'EPOCH' and args:
+            return self._num1(args[0],n, lambda x: x, DataType.BIGINT)
+        if name == 'DATE_ADD' and len(args)>=2:
+            return self._num2(args[0],args[1],n, lambda d,delta: d+int(delta), DataType.INT)
+        if name == 'DATE_SUB' and len(args)>=2:
+            return self._num2(args[0],args[1],n, lambda d,delta: d-int(delta), DataType.INT)
+        if name == 'DATE_DIFF' and len(args)>=2:
+            return self._num2(args[0],args[1],n, lambda a,b: int(a)-int(b), DataType.INT)
+        if name == 'GENERATE_SERIES':
+            if len(args) >= 2:
+                start = int(args[0].get(0)) if not args[0].is_null(0) else 0
+                stop = int(args[1].get(0)) if not args[1].is_null(0) else 0
+                step = int(args[2].get(0)) if len(args) >= 3 and not args[2].is_null(0) else 1
+                if step == 0: raise ExecutionError("GENERATE_SERIES step cannot be 0")
+                values = list(range(start, stop + (1 if step > 0 else -1), step))
+                return self._list_to_vec(values, DataType.BIGINT, len(values))
+            raise ExecutionError("GENERATE_SERIES requires at least 2 arguments")
 
         raise ExecutionError(f"unknown function: {expr.name}")
 
-    # ==================================================================
+    # ══════════════════════════════════════════════════════════════
     # Function helpers
-    # ==================================================================
-    def _apply_str1(self, v: DataVector, n: int, fn: Any) -> DataVector:
-        rd: list = []
-        rn = Bitmap(n)
+    # ══════════════════════════════════════════════════════════════
+    def _str1(self, v: DataVector, n: int, fn: Any) -> DataVector:
+        rd: list=[]; rn=Bitmap(n)
         for i in range(n):
-            if v.is_null(i):
-                rn.set_bit(i)
-                rd.append('')
-            else:
-                rd.append(fn(str(v.get(i))))
+            if v.is_null(i): rn.set_bit(i); rd.append('')
+            else: rd.append(fn(str(v.get(i))))
         return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
-    def _apply_str3(self, a: DataVector, b: DataVector, c: DataVector,
-                    n: int, fn: Any) -> DataVector:
-        rd: list = []
-        rn = Bitmap(n)
+    def _str2(self, a: DataVector, b: DataVector, n: int, fn: Any) -> DataVector:
+        rd: list=[]; rn=Bitmap(n)
         for i in range(n):
-            if a.is_null(i) or b.is_null(i) or c.is_null(i):
-                rn.set_bit(i)
-                rd.append('')
-            else:
-                rd.append(fn(str(a.get(i)), str(b.get(i)), str(c.get(i))))
+            if a.is_null(i) or b.is_null(i): rn.set_bit(i); rd.append('')
+            else: rd.append(fn(str(a.get(i)), str(b.get(i))))
         return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
-    def _apply_str_int(self, sv: DataVector, iv: DataVector,
-                       n: int, fn: Any) -> DataVector:
-        rd: list = []
-        rn = Bitmap(n)
+    def _str3(self, a: DataVector, b: DataVector, c: DataVector, n: int, fn: Any) -> DataVector:
+        rd: list=[]; rn=Bitmap(n)
         for i in range(n):
-            if sv.is_null(i) or iv.is_null(i):
-                rn.set_bit(i)
-                rd.append('')
-            else:
-                rd.append(fn(str(sv.get(i)), int(iv.get(i))))
+            if a.is_null(i) or b.is_null(i) or c.is_null(i): rn.set_bit(i); rd.append('')
+            else: rd.append(fn(str(a.get(i)), str(b.get(i)), str(c.get(i))))
         return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
-    def _apply_num1(self, v: DataVector, n: int, fn: Any,
-                    dt: DataType) -> DataVector:
-        code = DTYPE_TO_ARRAY_CODE.get(dt)
-        rd: Any = TypedVector(code) if code else []
-        rn = Bitmap(n)
+    def _str_int(self, sv: DataVector, iv: DataVector, n: int, fn: Any) -> DataVector:
+        rd: list=[]; rn=Bitmap(n)
         for i in range(n):
-            if v.is_null(i):
-                rn.set_bit(i)
-                if isinstance(rd, TypedVector):
-                    rd.append(0)
-                else:
-                    rd.append(None)
+            if sv.is_null(i) or iv.is_null(i): rn.set_bit(i); rd.append('')
+            else: rd.append(fn(str(sv.get(i)), int(iv.get(i))))
+        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
+
+    def _num1(self, v: DataVector, n: int, fn: Any, dt: DataType) -> DataVector:
+        code=DTYPE_TO_ARRAY_CODE.get(dt); rd: Any=TypedVector(code) if code else []; rn=Bitmap(n)
+        for i in range(n):
+            if v.is_null(i): rn.set_bit(i); rd.append(0) if isinstance(rd,TypedVector) else rd.append(None)
             else:
-                val = fn(v.get(i))
-                if val is None:
-                    rn.set_bit(i)
-                    val = 0 if isinstance(rd, TypedVector) else None
-                if isinstance(rd, TypedVector):
-                    rd.append(val)
-                else:
-                    rd.append(val)
+                val=fn(v.get(i))
+                if val is None: rn.set_bit(i); val=0 if isinstance(rd,TypedVector) else None
+                rd.append(val)
         return DataVector(dtype=dt, data=rd, nulls=rn, _length=n)
 
-    def _apply_num2(self, a: DataVector, b: DataVector, n: int,
-                    fn: Any, dt: DataType) -> DataVector:
-        code = DTYPE_TO_ARRAY_CODE.get(dt)
-        rd: Any = TypedVector(code) if code else []
-        rn = Bitmap(n)
+    def _num2(self, a: DataVector, b: DataVector, n: int, fn: Any, dt: DataType) -> DataVector:
+        code=DTYPE_TO_ARRAY_CODE.get(dt); rd: Any=TypedVector(code) if code else []; rn=Bitmap(n)
         for i in range(n):
-            if a.is_null(i) or b.is_null(i):
-                rn.set_bit(i)
-                if isinstance(rd, TypedVector):
-                    rd.append(0)
-                else:
-                    rd.append(None)
+            if a.is_null(i) or b.is_null(i): rn.set_bit(i); rd.append(0) if isinstance(rd,TypedVector) else rd.append(None)
             else:
-                val = fn(a.get(i), b.get(i))
-                if val is None:
-                    rn.set_bit(i)
-                    val = 0 if isinstance(rd, TypedVector) else None
-                if isinstance(rd, TypedVector):
-                    rd.append(val)
-                else:
-                    rd.append(val)
+                val=fn(a.get(i), b.get(i))
+                if val is None: rn.set_bit(i); val=0 if isinstance(rd,TypedVector) else None
+                rd.append(val)
         return DataVector(dtype=dt, data=rd, nulls=rn, _length=n)
 
-    def _apply_bool2(self, a: DataVector, b: DataVector, n: int,
-                     fn: Any) -> DataVector:
-        rd = Bitmap(n)
-        rn = Bitmap(n)
+    def _bool2(self, a: DataVector, b: DataVector, n: int, fn: Any) -> DataVector:
+        rd=Bitmap(n); rn=Bitmap(n)
         for i in range(n):
-            if a.is_null(i) or b.is_null(i):
-                rn.set_bit(i)
-            elif fn(a.get(i), b.get(i)):
-                rd.set_bit(i)
+            if a.is_null(i) or b.is_null(i): rn.set_bit(i)
+            elif fn(a.get(i), b.get(i)): rd.set_bit(i)
         return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
 
-    def _apply_variadic(self, args: list, n: int, fn: Any,
-                        dt: DataType) -> DataVector:
-        results: list = [None] * n
-        for i in range(n):
-            vals = [a.get(i) for a in args]
-            results[i] = fn(vals)
-        return self._list_to_vector(results, dt, n)
+    def _variadic(self, args: list, n: int, fn: Any, dt: DataType) -> DataVector:
+        results=[None]*n
+        for i in range(n): results[i] = fn([a.get(i) for a in args])
+        return self._list_to_vec(results, dt, n)
 
-    def _eval_substr(self, args: list, n: int) -> DataVector:
-        sv = args[0]
-        rd: list = []
-        rn = Bitmap(n)
+    def _substr(self, args: list, n: int) -> DataVector:
+        sv=args[0]; rd: list=[]; rn=Bitmap(n)
         for i in range(n):
-            if sv.is_null(i):
-                rn.set_bit(i)
-                rd.append('')
-                continue
-            s = str(sv.get(i))
-            start = int(args[1].get(i)) - 1 if len(args) > 1 and not args[1].is_null(i) else 0
-            if start < 0:
-                start = 0
-            if len(args) > 2 and not args[2].is_null(i):
-                length = int(args[2].get(i))
-                rd.append(s[start:start + length])
-            else:
-                rd.append(s[start:])
+            if sv.is_null(i): rn.set_bit(i); rd.append(''); continue
+            s=str(sv.get(i))
+            start = int(args[1].get(i))-1 if len(args)>1 and not args[1].is_null(i) else 0
+            if start<0: start=0
+            if len(args)>2 and not args[2].is_null(i):
+                rd.append(s[start:start+int(args[2].get(i))])
+            else: rd.append(s[start:])
         return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
-    def _eval_concat_func(self, name: str, args: list, n: int) -> DataVector:
-        rd: list = []
-        rn = Bitmap(n)
+    def _concat_fn(self, name: str, args: list, n: int) -> DataVector:
+        rd: list=[]; rn=Bitmap(n)
         for i in range(n):
-            if name == 'CONCAT_WS':
-                if args[0].is_null(i):
-                    rn.set_bit(i)
-                    rd.append('')
-                    continue
-                sep = str(args[0].get(i))
-                parts = [str(a.get(i)) for a in args[1:] if not a.is_null(i)]
-                rd.append(sep.join(parts))
+            if name=='CONCAT_WS':
+                if args[0].is_null(i): rn.set_bit(i); rd.append(''); continue
+                sep=str(args[0].get(i))
+                rd.append(sep.join(str(a.get(i)) for a in args[1:] if not a.is_null(i)))
             else:
-                parts = []
-                any_null = False
-                for a in args:
-                    if a.is_null(i):
-                        any_null = True
-                        break
-                    parts.append(str(a.get(i)))
-                if any_null:
-                    rn.set_bit(i)
-                    rd.append('')
-                else:
-                    rd.append(''.join(parts))
+                if any(a.is_null(i) for a in args): rn.set_bit(i); rd.append('')
+                else: rd.append(''.join(str(a.get(i)) for a in args))
         return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
-    def _eval_coalesce(self, args: list, n: int) -> DataVector:
-        # Determine type from first arg that has actual non-null values
-        dt = DataType.UNKNOWN
+    def _lpad_rpad(self, args: list, n: int, left: bool) -> DataVector:
+        sv,lv=args[0],args[1]; rd: list=[]; rn=Bitmap(n)
+        for i in range(n):
+            if sv.is_null(i) or lv.is_null(i): rn.set_bit(i); rd.append('')
+            else:
+                s=str(sv.get(i)); w=int(lv.get(i))
+                pc = str(args[2].get(i))[0] if len(args)>=3 and not args[2].is_null(i) else ' '
+                rd.append(s.rjust(w,pc) if left else s.ljust(w,pc))
+        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
+
+    def _split_part(self, args: list, n: int) -> DataVector:
+        rd: list=[]; rn=Bitmap(n)
+        for i in range(n):
+            if any(args[j].is_null(i) for j in range(3)): rn.set_bit(i); rd.append('')
+            else:
+                parts=str(args[0].get(i)).split(str(args[1].get(i)))
+                idx=int(args[2].get(i))
+                rd.append(parts[idx-1] if 1<=idx<=len(parts) else '')
+        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
+
+    def _coalesce(self, args: list, n: int) -> DataVector:
+        dt=DataType.UNKNOWN
         for a in args:
-            has_val = any(not a.is_null(i) for i in range(len(a))) if len(a) > 0 else False
-            if has_val:
-                dt = a.dtype
-                break
-        if dt == DataType.UNKNOWN:
-            # Fallback: first non-UNKNOWN dtype
+            if any(not a.is_null(i) for i in range(len(a))): dt=a.dtype; break
+        if dt==DataType.UNKNOWN:
             for a in args:
-                if a.dtype != DataType.UNKNOWN:
-                    dt = a.dtype
-                    break
-        if dt == DataType.UNKNOWN:
-            dt = DataType.INT
-        results: list = [None] * n
+                if a.dtype!=DataType.UNKNOWN: dt=a.dtype; break
+        if dt==DataType.UNKNOWN: dt=DataType.INT
+        results=[None]*n
         for i in range(n):
             for a in args:
-                if not a.is_null(i):
-                    results[i] = a.get(i)
-                    break
-        return self._list_to_vector(results, dt, n)
+                if not a.is_null(i): results[i]=a.get(i); break
+        return self._list_to_vec(results, dt, n)
 
-    def _eval_nullif(self, a: DataVector, b: DataVector, n: int) -> DataVector:
-        results: list = [None] * n
+    def _nullif(self, a: DataVector, b: DataVector, n: int) -> DataVector:
+        results=[None]*n
         for i in range(n):
-            if a.is_null(i):
-                continue
-            if b.is_null(i):
-                results[i] = a.get(i)
-                continue
-            results[i] = None if a.get(i) == b.get(i) else a.get(i)
-        return self._list_to_vector(results, a.dtype, n)
+            if a.is_null(i): continue
+            if b.is_null(i): results[i]=a.get(i); continue
+            results[i] = None if a.get(i)==b.get(i) else a.get(i)
+        return self._list_to_vec(results, a.dtype, n)
 
-    def _eval_if_func(self, cond: DataVector, then: DataVector,
-                      else_: DataVector, n: int) -> DataVector:
-        results: list = [None] * n
+    def _if_fn(self, c: DataVector, t: DataVector, e: DataVector, n: int) -> DataVector:
+        results=[None]*n
         for i in range(n):
-            if cond.is_null(i) or not cond.get(i):
-                results[i] = else_.get(i)
-            else:
-                results[i] = then.get(i)
-        dt = then.dtype if then.dtype != DataType.UNKNOWN else else_.dtype
-        return self._list_to_vector(results, dt, n)
+            results[i] = t.get(i) if (not c.is_null(i) and c.get(i)) else e.get(i)
+        dt = t.dtype if t.dtype!=DataType.UNKNOWN else e.dtype
+        return self._list_to_vec(results, dt, n)
 
-    # ==================================================================
-    # Helpers
-    # ==================================================================
+    def _date_part(self, part: str, vec: DataVector, n: int) -> DataVector:
+        results=[None]*n
+        for i in range(n):
+            if vec.is_null(i): continue
+            v=vec.get(i)
+            try:
+                if isinstance(v,int) and abs(v)<1_000_000:
+                    d=_dt.date(1970,1,1)+_dt.timedelta(days=v)
+                    results[i]=self._extract(part,d,None)
+                elif isinstance(v,int):
+                    dt_obj=_dt.datetime(1970,1,1)+_dt.timedelta(microseconds=v)
+                    results[i]=self._extract(part,dt_obj.date(),dt_obj.time())
+                else:
+                    results[i]=None
+            except Exception: pass
+        return self._list_to_vec(results, DataType.INT, n)
+
+    def _extract(self, part: str, d: Any, t: Any) -> Optional[int]:
+        if part=='YEAR': return d.year
+        if part=='MONTH': return d.month
+        if part=='DAY': return d.day
+        if part=='HOUR': return t.hour if t else 0
+        if part=='MINUTE': return t.minute if t else 0
+        if part=='SECOND': return t.second if t else 0
+        if part=='DAY_OF_WEEK': return d.isoweekday()
+        if part=='DAY_OF_YEAR': return d.timetuple().tm_yday
+        if part=='WEEK_OF_YEAR': return d.isocalendar()[1]
+        if part=='QUARTER': return (d.month-1)//3+1
+        return None
+
+    # ══════════════════════════════════════════════════════════════
+    # Conversion helpers
+    # ══════════════════════════════════════════════════════════════
     def _to_bool(self, vec: DataVector) -> DataVector:
-        if vec.dtype == DataType.BOOLEAN:
-            return vec
+        if vec.dtype==DataType.BOOLEAN: return vec
         if is_numeric(vec.dtype):
-            n = len(vec)
-            d = Bitmap(n)
-            nl = Bitmap(n)
+            n=len(vec); d=Bitmap(n); nl=Bitmap(n)
             for i in range(n):
-                if vec.is_null(i):
-                    nl.set_bit(i)
-                elif vec.get(i) != 0:
-                    d.set_bit(i)
+                if vec.is_null(i): nl.set_bit(i)
+                elif vec.get(i)!=0: d.set_bit(i)
             return DataVector(dtype=DataType.BOOLEAN, data=d, nulls=nl, _length=n)
         raise ExecutionError(f"cannot convert {vec.dtype.name} to BOOLEAN")
 
     def _bool_to_bitmap(self, vec: DataVector) -> Bitmap:
-        n = len(vec)
-        bm = Bitmap(n)
+        n=len(vec); bm=Bitmap(n)
         assert isinstance(vec.data, Bitmap)
         for i in range(n):
-            if not vec.is_null(i) and vec.data.get_bit(i):
-                bm.set_bit(i)
+            if not vec.is_null(i) and vec.data.get_bit(i): bm.set_bit(i)
         return bm
 
-    def _list_to_vector(self, values: list, dtype: DataType, n: int) -> DataVector:
-        """Convert Python list (with Nones) to DataVector."""
-        if dtype == DataType.UNKNOWN:
-            dtype = DataType.INT
-        code = DTYPE_TO_ARRAY_CODE.get(dtype)
-        nulls = Bitmap(n)
-        if dtype == DataType.BOOLEAN:
-            data: Any = Bitmap(n)
+    def _list_to_vec(self, values: list, dtype: DataType, n: int) -> DataVector:
+        if dtype==DataType.UNKNOWN: dtype=DataType.INT
+        code=DTYPE_TO_ARRAY_CODE.get(dtype); nulls=Bitmap(n)
+        if dtype==DataType.BOOLEAN:
+            data: Any=Bitmap(n)
             for i in range(n):
-                if values[i] is None:
-                    nulls.set_bit(i)
-                elif values[i]:
-                    data.set_bit(i)
-        elif dtype in (DataType.VARCHAR, DataType.TEXT):
-            data = []
+                if values[i] is None: nulls.set_bit(i)
+                elif values[i]: data.set_bit(i)
+        elif dtype in (DataType.VARCHAR,DataType.TEXT):
+            data=[]
             for i in range(n):
-                if values[i] is None:
-                    nulls.set_bit(i)
-                    data.append('')
-                else:
-                    data.append(str(values[i]))
-        elif code is not None:
-            data = TypedVector(code)
+                if values[i] is None: nulls.set_bit(i); data.append('')
+                else: data.append(str(values[i]))
+        elif code:
+            data=TypedVector(code)
             for i in range(n):
-                if values[i] is None:
-                    nulls.set_bit(i)
-                    data.append(0)
-                else:
-                    data.append(values[i])
+                if values[i] is None: nulls.set_bit(i); data.append(0)
+                else: data.append(values[i])
         else:
-            data = TypedVector('q')
+            data=TypedVector('q')
             for i in range(n):
-                if values[i] is None:
-                    nulls.set_bit(i)
-                    data.append(0)
-                else:
-                    data.append(values[i])
+                if values[i] is None: nulls.set_bit(i); data.append(0)
+                else: data.append(int(values[i]))
         return DataVector(dtype=dtype, data=data, nulls=nulls, _length=n)
 
-    # ==================================================================
+    # ══════════════════════════════════════════════════════════════
     # Static type inference
-    # ==================================================================
+    # ══════════════════════════════════════════════════════════════
     @staticmethod
-    def infer_type(expr: Any, input_schema: Dict[str, DataType]) -> DataType:
+    def infer_type(expr: Any, schema: Dict[str,DataType]) -> DataType:
         if isinstance(expr, Literal):
-            return expr.inferred_type if expr.inferred_type != DataType.UNKNOWN else DataType.INT
+            return expr.inferred_type if expr.inferred_type!=DataType.UNKNOWN else DataType.INT
         if isinstance(expr, ColumnRef):
-            # Try qualified
             if expr.table:
-                q = f"{expr.table}.{expr.column}"
-                if q in input_schema:
-                    return input_schema[q]
-            return input_schema.get(expr.column, DataType.UNKNOWN)
-        if isinstance(expr, AliasExpr):
-            return ExpressionEvaluator.infer_type(expr.expr, input_schema)
+                q=f"{expr.table}.{expr.column}"
+                if q in schema: return schema[q]
+            return schema.get(expr.column, DataType.UNKNOWN)
+        if isinstance(expr, AliasExpr): return ExpressionEvaluator.infer_type(expr.expr, schema)
         if isinstance(expr, BinaryExpr):
-            if expr.op in ('+', '-', '*', '/', '%'):
-                lt = ExpressionEvaluator.infer_type(expr.left, input_schema)
-                rt = ExpressionEvaluator.infer_type(expr.right, input_schema)
-                try:
-                    return promote(lt, rt)
-                except TypeMismatchError:
-                    return DataType.UNKNOWN
-            if expr.op == '||':
-                return DataType.VARCHAR
+            if expr.op in ('+','-','*','/','%'):
+                lt=ExpressionEvaluator.infer_type(expr.left,schema)
+                rt=ExpressionEvaluator.infer_type(expr.right,schema)
+                try: return promote(lt,rt)
+                except TypeMismatchError: return DataType.UNKNOWN
+            if expr.op=='||': return DataType.VARCHAR
             return DataType.BOOLEAN
         if isinstance(expr, UnaryExpr):
-            if expr.op == 'NOT':
-                return DataType.BOOLEAN
-            return ExpressionEvaluator.infer_type(expr.operand, input_schema)
-        if isinstance(expr, IsNullExpr):
-            return DataType.BOOLEAN
-        if isinstance(expr, (InExpr, BetweenExpr, LikeExpr)):
-            return DataType.BOOLEAN
+            if expr.op=='NOT': return DataType.BOOLEAN
+            return ExpressionEvaluator.infer_type(expr.operand, schema)
+        if isinstance(expr, IsNullExpr): return DataType.BOOLEAN
+        if isinstance(expr, (InExpr,BetweenExpr,LikeExpr)): return DataType.BOOLEAN
         if isinstance(expr, CaseExpr):
-            if expr.when_clauses:
-                return ExpressionEvaluator.infer_type(expr.when_clauses[0][1], input_schema)
+            if expr.when_clauses: return ExpressionEvaluator.infer_type(expr.when_clauses[0][1], schema)
             return DataType.UNKNOWN
         if isinstance(expr, CastExpr):
             if expr.type_name:
-                dt, _ = resolve_type_name(expr.type_name.name, expr.type_name.params)
-                return dt
+                dt,_=resolve_type_name(expr.type_name.name,expr.type_name.params); return dt
             return DataType.UNKNOWN
         if isinstance(expr, FunctionCall):
-            name = expr.name.upper()
-            if name in ('UPPER', 'LOWER', 'TRIM', 'LTRIM', 'RTRIM', 'REVERSE', 'REPLACE',
-                         'SUBSTR', 'SUBSTRING', 'CONCAT', 'CONCAT_WS', 'LEFT', 'RIGHT',
-                         'REPEAT', 'COALESCE'):
-                if name == 'COALESCE' and expr.args:
-                    return ExpressionEvaluator.infer_type(expr.args[0], input_schema)
-                return DataType.VARCHAR
-            if name in ('LENGTH', 'SIGN', 'POSITION'):
-                return DataType.INT
-            if name == 'ABS' and expr.args:
-                return ExpressionEvaluator.infer_type(expr.args[0], input_schema)
-            if name in ('CEIL', 'CEILING', 'FLOOR') or (name == 'ROUND' and len(expr.args) < 2):
-                return DataType.BIGINT
-            if name in ('POWER', 'SQRT', 'LN', 'LOG2', 'LOG10', 'EXP', 'ROUND'):
-                return DataType.DOUBLE
-            if name in ('STARTS_WITH', 'ENDS_WITH', 'CONTAINS'):
-                return DataType.BOOLEAN
-            if name == 'NULLIF' and expr.args:
-                return ExpressionEvaluator.infer_type(expr.args[0], input_schema)
-            if name == 'IF' and len(expr.args) >= 2:
-                return ExpressionEvaluator.infer_type(expr.args[1], input_schema)
+            name=expr.name.upper()
+            if name in ('UPPER','LOWER','TRIM','LTRIM','RTRIM','REVERSE','REPLACE','SUBSTR','SUBSTRING',
+                         'CONCAT','CONCAT_WS','LEFT','RIGHT','REPEAT','LPAD','RPAD','INITCAP','CHR',
+                         'SPLIT_PART','REGEXP_REPLACE','REGEXP_EXTRACT'): return DataType.VARCHAR
+            if name in ('LENGTH','SIGN','POSITION','ASCII','YEAR','MONTH','DAY','HOUR','MINUTE','SECOND',
+                         'DAY_OF_WEEK','DAY_OF_YEAR','WEEK_OF_YEAR','QUARTER','DATE_DIFF','DATE_ADD','DATE_SUB',
+                         'CURRENT_DATE','TRUNC','TRUNCATE'): return DataType.INT
+            if name in ('CEIL','CEILING','FLOOR') or (name=='ROUND' and len(expr.args)<2): return DataType.BIGINT
+            if name in ('POWER','SQRT','CBRT','LN','LOG','LOG2','LOG10','EXP','ROUND','RANDOM'): return DataType.DOUBLE
+            if name in ('NOW','CURRENT_TIMESTAMP','EPOCH'): return DataType.BIGINT
+            if name in ('STARTS_WITH','ENDS_WITH','CONTAINS','REGEXP_MATCH'): return DataType.BOOLEAN
+            if name=='ABS' and expr.args: return ExpressionEvaluator.infer_type(expr.args[0],schema)
+            if name=='COALESCE' and expr.args: return ExpressionEvaluator.infer_type(expr.args[0],schema)
+            if name=='NULLIF' and expr.args: return ExpressionEvaluator.infer_type(expr.args[0],schema)
+            if name=='IF' and len(expr.args)>=2: return ExpressionEvaluator.infer_type(expr.args[1],schema)
+            if name=='TYPEOF': return DataType.VARCHAR
+            if name in ('GREATEST','LEAST') and expr.args: return ExpressionEvaluator.infer_type(expr.args[0],schema)
+            if name=='MOD' and expr.args: return ExpressionEvaluator.infer_type(expr.args[0],schema)
             return DataType.UNKNOWN
         if isinstance(expr, AggregateCall):
-            upper = expr.name.upper()
-            if upper == 'COUNT':
+            u=expr.name.upper()
+            if u=='COUNT': return DataType.BIGINT
+            if u=='AVG': return DataType.DOUBLE
+            if u=='SUM':
+                if expr.args and not isinstance(expr.args[0],StarExpr):
+                    at=ExpressionEvaluator.infer_type(expr.args[0],schema)
+                    if at in (DataType.FLOAT,DataType.DOUBLE): return DataType.DOUBLE
                 return DataType.BIGINT
-            if upper == 'AVG':
-                return DataType.DOUBLE
-            if upper == 'SUM':
-                if expr.args and not isinstance(expr.args[0], StarExpr):
-                    at = ExpressionEvaluator.infer_type(expr.args[0], input_schema)
-                    if at in (DataType.FLOAT, DataType.DOUBLE):
-                        return DataType.DOUBLE
-                return DataType.BIGINT
-            if upper in ('MIN', 'MAX'):
-                if expr.args and not isinstance(expr.args[0], StarExpr):
-                    return ExpressionEvaluator.infer_type(expr.args[0], input_schema)
+            if u in ('MIN','MAX'):
+                if expr.args and not isinstance(expr.args[0],StarExpr):
+                    return ExpressionEvaluator.infer_type(expr.args[0],schema)
+            if u in ('STDDEV','STDDEV_POP','VARIANCE','VAR_POP'): return DataType.DOUBLE
+            if u=='STRING_AGG': return DataType.VARCHAR
             return DataType.UNKNOWN
         return DataType.UNKNOWN
 
-    # ==================================================================
-    # Type casting
-    # ==================================================================
     @staticmethod
     def cast_vector(vec: DataVector, target: DataType) -> DataVector:
-        if vec.dtype == target:
-            return vec
-        n = len(vec)
-        if vec.dtype == DataType.BOOLEAN and is_numeric(target):
-            code = DTYPE_TO_ARRAY_CODE.get(target, 'q')
-            assert code is not None
-            data = TypedVector(code)
-            nulls = Bitmap(n)
+        if vec.dtype==target: return vec
+        n=len(vec)
+        if vec.dtype==DataType.BOOLEAN and is_numeric(target):
+            code=DTYPE_TO_ARRAY_CODE.get(target,'q'); assert code
+            data=TypedVector(code); nulls=Bitmap(n)
             for i in range(n):
-                if vec.is_null(i):
-                    nulls.set_bit(i)
-                    data.append(0)
-                else:
-                    data.append(1 if vec.get(i) else 0)
+                if vec.is_null(i): nulls.set_bit(i); data.append(0)
+                else: data.append(1 if vec.get(i) else 0)
             return DataVector(dtype=target, data=data, nulls=nulls, _length=n)
-        src_rank = {DataType.INT: 0, DataType.BIGINT: 1, DataType.FLOAT: 2, DataType.DOUBLE: 3}
-        if vec.dtype in src_rank and target in src_rank:
-            if src_rank[target] >= src_rank[vec.dtype]:
-                code = DTYPE_TO_ARRAY_CODE.get(target, 'q')
-                assert code is not None
-                data = TypedVector(code)
-                nulls = Bitmap(n)
-                for i in range(n):
-                    if vec.is_null(i):
-                        nulls.set_bit(i)
-                        data.append(0)
-                    else:
-                        v = vec.get(i)
-                        data.append(float(v) if target in (DataType.FLOAT, DataType.DOUBLE) else int(v))
-                return DataVector(dtype=target, data=data, nulls=nulls, _length=n)
+        sr={DataType.INT:0,DataType.BIGINT:1,DataType.FLOAT:2,DataType.DOUBLE:3}
+        if vec.dtype in sr and target in sr and sr[target]>=sr[vec.dtype]:
+            code=DTYPE_TO_ARRAY_CODE.get(target,'q'); assert code
+            data=TypedVector(code); nulls=Bitmap(n)
+            for i in range(n):
+                if vec.is_null(i): nulls.set_bit(i); data.append(0)
+                else: data.append(float(vec.get(i)) if target in (DataType.FLOAT,DataType.DOUBLE) else int(vec.get(i)))
+            return DataVector(dtype=target, data=data, nulls=nulls, _length=n)
         raise TypeMismatchError(f"cannot cast {vec.dtype.name} to {target.name}",
                                 expected=target.name, actual=vec.dtype.name)
 
 
 def _like_match(text: str, pattern: str) -> bool:
-    """SQL LIKE: % = any string, _ = any char."""
-    regex = '^'
+    regex='^'
     for ch in pattern:
-        if ch == '%':
-            regex += '.*'
-        elif ch == '_':
-            regex += '.'
-        elif ch in r'\.^$+?{}[]|()':
-            regex += '\\' + ch
-        else:
-            regex += ch
-    regex += '$'
+        if ch=='%': regex+='.*'
+        elif ch=='_': regex+='.'
+        elif ch in r'\.^$+?{}[]|()': regex+='\\'+ch
+        else: regex+=ch
+    regex+='$'
     return bool(_re.match(regex, text, _re.DOTALL))

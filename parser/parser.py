@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Recursive-descent + Pratt parser — Phase 4: EXPLAIN, ALTER TABLE."""
+"""Recursive-descent + Pratt parser — Phase 5 fix."""
 from typing import List, Optional
 from parser.ast import *
 from parser.precedence import Precedence
@@ -28,9 +28,21 @@ _INFIX = {
     TokenType.STAR:Precedence.MULTIPLY,TokenType.SLASH:Precedence.MULTIPLY,
     TokenType.PERCENT:Precedence.MULTIPLY,
 }
-_AGGS = frozenset({'COUNT','SUM','AVG','MIN','MAX'})
-_WINFUNCS = frozenset({'ROW_NUMBER','RANK','DENSE_RANK','NTILE','PERCENT_RANK',
-                        'CUME_DIST','LAG','LEAD','FIRST_VALUE','LAST_VALUE','NTH_VALUE'})
+_AGGS = frozenset({
+    'COUNT','SUM','AVG','MIN','MAX',
+    'STDDEV','STDDEV_POP','VARIANCE','VAR_POP',
+    'MEDIAN','MODE','ARRAY_AGG','STRING_AGG',
+    'COUNT_DISTINCT',
+})
+_WINFUNCS = frozenset({
+    'ROW_NUMBER','RANK','DENSE_RANK','NTILE','PERCENT_RANK',
+    'CUME_DIST','LAG','LEAD','FIRST_VALUE','LAST_VALUE','NTH_VALUE',
+})
+# Zero-arg keywords that act as functions (no parens needed)
+_NOARG_FUNCS = frozenset({
+    'current_date','current_timestamp','now',
+})
+
 
 class Parser:
     def __init__(self, tokens: list[Token]) -> None:
@@ -76,31 +88,27 @@ class Parser:
         raise ParseError(f"unexpected: {self._c.value!r}",self._c.line,self._c.col)
 
     def _explain(self):
-        self._ex(TokenType.EXPLAIN)
-        inner = self._stmt()
+        self._ex(TokenType.EXPLAIN); inner = self._stmt()
         while self._c.type in (TokenType.UNION,TokenType.INTERSECT,TokenType.EXCEPT):
             inner = self._setop(inner)
         return ExplainStmt(statement=inner)
 
     def _alter(self):
-        self._ex(TokenType.ALTER); self._ex(TokenType.TABLE)
-        table = self._aid()
+        self._ex(TokenType.ALTER); self._ex(TokenType.TABLE); table = self._aid()
         if self._c.type == TokenType.ADD:
             self._adv()
             if self._c.type == TokenType.COLUMN: self._adv()
-            cd = self._cd()
-            return AlterTableStmt(table=table,action='ADD_COLUMN',column_def=cd)
+            return AlterTableStmt(table=table,action='ADD_COLUMN',column_def=self._cd())
         if self._c.type == TokenType.DROP:
             self._adv()
             if self._c.type == TokenType.COLUMN: self._adv()
-            col = self._aid()
-            return AlterTableStmt(table=table,action='DROP_COLUMN',column_name=col)
+            return AlterTableStmt(table=table,action='DROP_COLUMN',column_name=self._aid())
         if self._c.type == TokenType.RENAME:
             self._adv()
             if self._c.type == TokenType.COLUMN: self._adv()
             old = self._aid(); self._ex(TokenType.TO); new = self._aid()
             return AlterTableStmt(table=table,action='RENAME_COLUMN',column_name=old,new_name=new)
-        raise ParseError(f"expected ADD/DROP/RENAME after ALTER TABLE",self._c.line,self._c.col)
+        raise ParseError(f"expected ADD/DROP/RENAME",self._c.line,self._c.col)
 
     def _sel(self):
         self._ex(TokenType.SELECT); dist=False
@@ -119,18 +127,22 @@ class Parser:
         if self._c.type==TokenType.LIMIT: self._adv(); lm=self._expr()
         of=None
         if self._c.type==TokenType.OFFSET: self._adv(); of=self._expr()
-        return SelectStmt(distinct=dist,select_list=sl,from_clause=fc,where=w,group_by=gb,having=hv,order_by=ob,limit=lm,offset=of)
+        return SelectStmt(distinct=dist,select_list=sl,from_clause=fc,where=w,
+                          group_by=gb,having=hv,order_by=ob,limit=lm,offset=of)
 
     def _si(self):
         e=self._expr()
         if self._c.type==TokenType.AS: self._adv(); return AliasExpr(expr=e,alias=self._aid())
-        if self._c.type==TokenType.IDENTIFIER: a=self._c.value; self._adv(); return AliasExpr(expr=e,alias=a)
+        if self._c.type==TokenType.IDENTIFIER:
+            a=self._c.value; self._adv(); return AliasExpr(expr=e,alias=a)
         return e
 
     def _fr(self):
         self._ex(TokenType.FROM); tr=self._tref(); joins=[]
-        while self._c.type in (TokenType.JOIN,TokenType.INNER,TokenType.LEFT,TokenType.RIGHT,TokenType.CROSS,TokenType.FULL,TokenType.COMMA):
-            if self._c.type==TokenType.COMMA: self._adv(); joins.append(JoinClause(join_type='CROSS',table=self._tref())); continue
+        while self._c.type in (TokenType.JOIN,TokenType.INNER,TokenType.LEFT,TokenType.RIGHT,
+                                TokenType.CROSS,TokenType.FULL,TokenType.COMMA):
+            if self._c.type==TokenType.COMMA:
+                self._adv(); joins.append(JoinClause(join_type='CROSS',table=self._tref())); continue
             joins.append(self._jn())
         return FromClause(table=tr,joins=joins)
 
@@ -251,8 +263,11 @@ class Parser:
         if tt==TokenType.NOT: self._adv(); return UnaryExpr(op='NOT',operand=self._expr(Precedence.NOT_PREFIX))
         if tt==TokenType.MINUS: self._adv(); return UnaryExpr(op='-',operand=self._expr(Precedence.UNARY))
         if tt==TokenType.PLUS: self._adv(); return UnaryExpr(op='+',operand=self._expr(Precedence.UNARY))
-        if tt in (TokenType.INTEGER_LIT,TokenType.FLOAT_LIT,TokenType.STRING,TokenType.TRUE,TokenType.FALSE,TokenType.NULL): return self._lit()
-        if tt==TokenType.IDENTIFIER or tt in _UNRESERVED: return self._idexpr()
+        if tt in (TokenType.INTEGER_LIT,TokenType.FLOAT_LIT,TokenType.STRING,
+                  TokenType.TRUE,TokenType.FALSE,TokenType.NULL):
+            return self._lit()
+        if tt==TokenType.IDENTIFIER or tt in _UNRESERVED:
+            return self._idexpr()
         if tt==TokenType.CASE: return self._case()
         if tt==TokenType.CAST: return self._cast()
         if tt==TokenType.EXISTS:
@@ -260,7 +275,8 @@ class Parser:
             return ExistsExpr(query=sq)
         if tt==TokenType.LPAREN:
             self._adv()
-            if self._c.type==TokenType.SELECT: sq=self._sel();self._ex(TokenType.RPAREN); return SubqueryExpr(query=sq)
+            if self._c.type==TokenType.SELECT:
+                sq=self._sel();self._ex(TokenType.RPAREN); return SubqueryExpr(query=sq)
             e=self._expr();self._ex(TokenType.RPAREN); return e
         if tt==TokenType.STAR: self._adv(); return StarExpr()
         raise ParseError(f"unexpected: {self._c.value!r}",self._c.line,self._c.col)
@@ -279,6 +295,12 @@ class Parser:
         name=self._c.value
         if self._c.type in _UNRESERVED: name=name.lower()
         self._adv()
+        # Zero-arg function keywords (CURRENT_DATE, CURRENT_TIMESTAMP, NOW)
+        if name.lower() in _NOARG_FUNCS:
+            # Allow optional parens
+            if self._c.type == TokenType.LPAREN:
+                self._adv(); self._ex(TokenType.RPAREN)
+            return FunctionCall(name=name.upper(), args=[])
         if self._c.type==TokenType.LPAREN: return self._fncall(name)
         if self._c.type==TokenType.DOT: self._adv(); return ColumnRef(table=name,column=self._aid())
         return ColumnRef(table=None,column=name)
@@ -287,12 +309,15 @@ class Parser:
         self._ex(TokenType.LPAREN); upper=name.upper()
         if upper in _AGGS:
             if self._c.type==TokenType.STAR:
-                self._adv();self._ex(TokenType.RPAREN);func=AggregateCall(name=upper,args=[StarExpr()])
+                self._adv();self._ex(TokenType.RPAREN)
+                func=AggregateCall(name=upper,args=[StarExpr()])
                 if self._c.type==TokenType.OVER: return self._window(func)
                 return func
             dist=False
             if self._c.type==TokenType.DISTINCT: dist=True; self._adv()
-            args=[self._expr()];self._ex(TokenType.RPAREN)
+            args=[self._expr()]
+            while self._c.type==TokenType.COMMA: self._adv(); args.append(self._expr())
+            self._ex(TokenType.RPAREN)
             func=AggregateCall(name=upper,args=args,distinct=dist)
             if self._c.type==TokenType.OVER: return self._window(func)
             return func
@@ -377,7 +402,8 @@ class Parser:
             if n.type==TokenType.BETWEEN: self._adv(); return self._btw(left,True)
             if n.type==TokenType.LIKE: self._adv(); return self._lk(left,True)
         prec=_INFIX[tt]; op=self._c.value; self._adv()
-        m={'AND':'AND','OR':'OR','=':'=','!=':'!=','<':'<','>':'>','<=':'<=','>=':'>=','+':'+','-':'-','*':'*','/':'/','%':'%','||':'||'}
+        m={'AND':'AND','OR':'OR','=':'=','!=':'!=','<':'<','>':'>','<=':'<=','>=':'>=',
+           '+':'+','-':'-','*':'*','/':'/','%':'%','||':'||'}
         return BinaryExpr(op=m.get(op,op),left=left,right=self._expr(prec))
 
     def _is(self, l):
@@ -387,7 +413,8 @@ class Parser:
 
     def _in(self, l, neg):
         self._ex(TokenType.IN);self._ex(TokenType.LPAREN)
-        if self._c.type==TokenType.SELECT: sq=self._sel();self._ex(TokenType.RPAREN); return InExpr(expr=l,values=[SubqueryExpr(query=sq)],negated=neg)
+        if self._c.type==TokenType.SELECT:
+            sq=self._sel();self._ex(TokenType.RPAREN); return InExpr(expr=l,values=[SubqueryExpr(query=sq)],negated=neg)
         vs=[self._expr()]
         while self._c.type==TokenType.COMMA: self._adv(); vs.append(self._expr())
         self._ex(TokenType.RPAREN); return InExpr(expr=l,values=vs,negated=neg)
