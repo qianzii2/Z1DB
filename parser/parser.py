@@ -1,402 +1,433 @@
 from __future__ import annotations
-"""Recursive-descent + Pratt expression parser."""
+"""Recursive-descent + Pratt parser — Phase 3: windows, set ops, subqueries."""
 from typing import List, Optional
-from parser.ast import (
-    AggregateCall, AliasExpr, Assignment, BetweenExpr, BinaryExpr, CaseExpr,
-    CastExpr, ColumnDef, ColumnRef, CreateTableStmt, DeleteStmt, DropTableStmt,
-    FromClause, FunctionCall, GroupByClause, InExpr, InsertStmt, IsNullExpr,
-    JoinClause, LikeExpr, Literal, SelectStmt, SortKey, StarExpr, SubqueryExpr,
-    TableRef, TypeName, UnaryExpr, UpdateStmt,
-)
+from parser.ast import *
 from parser.precedence import Precedence
 from parser.token import Token, TokenType
 from storage.types import DataType
 from utils.errors import ParseError
 
-_UNRESERVED_KW = frozenset({
-    TokenType.INT, TokenType.INTEGER, TokenType.BIGINT,
-    TokenType.FLOAT_KW, TokenType.DOUBLE, TokenType.REAL,
-    TokenType.BOOLEAN, TokenType.BOOL, TokenType.VARCHAR, TokenType.TEXT_KW,
-    TokenType.DATE_KW, TokenType.TIMESTAMP, TokenType.FIRST, TokenType.LAST,
-    TokenType.KEY,
+_UNRESERVED = frozenset({
+    TokenType.INT,TokenType.INTEGER,TokenType.BIGINT,TokenType.FLOAT_KW,
+    TokenType.DOUBLE,TokenType.REAL,TokenType.BOOLEAN,TokenType.BOOL,
+    TokenType.VARCHAR,TokenType.TEXT_KW,TokenType.DATE_KW,TokenType.TIMESTAMP,
+    TokenType.FIRST,TokenType.LAST,TokenType.KEY,TokenType.PARTITION,
+    TokenType.ROWS,TokenType.RANGE,TokenType.UNBOUNDED,TokenType.PRECEDING,
+    TokenType.FOLLOWING,TokenType.CURRENT,TokenType.ROW,TokenType.OVER,
 })
-_INFIX_PREC = {
-    TokenType.OR: Precedence.OR, TokenType.AND: Precedence.AND,
-    TokenType.EQUAL: Precedence.COMPARISON, TokenType.NOT_EQUAL: Precedence.COMPARISON,
-    TokenType.LESS: Precedence.COMPARISON, TokenType.GREATER: Precedence.COMPARISON,
-    TokenType.LESS_EQUAL: Precedence.COMPARISON, TokenType.GREATER_EQUAL: Precedence.COMPARISON,
-    TokenType.IS: Precedence.IS, TokenType.IN: Precedence.COMPARISON,
-    TokenType.BETWEEN: Precedence.COMPARISON, TokenType.LIKE: Precedence.COMPARISON,
-    TokenType.PIPE_PIPE: Precedence.CONCAT,
-    TokenType.PLUS: Precedence.ADDITION, TokenType.MINUS: Precedence.ADDITION,
-    TokenType.STAR: Precedence.MULTIPLY, TokenType.SLASH: Precedence.MULTIPLY,
-    TokenType.PERCENT: Precedence.MULTIPLY,
+_INFIX = {
+    TokenType.OR:Precedence.OR,TokenType.AND:Precedence.AND,
+    TokenType.EQUAL:Precedence.COMPARISON,TokenType.NOT_EQUAL:Precedence.COMPARISON,
+    TokenType.LESS:Precedence.COMPARISON,TokenType.GREATER:Precedence.COMPARISON,
+    TokenType.LESS_EQUAL:Precedence.COMPARISON,TokenType.GREATER_EQUAL:Precedence.COMPARISON,
+    TokenType.IS:Precedence.IS,TokenType.IN:Precedence.COMPARISON,
+    TokenType.BETWEEN:Precedence.COMPARISON,TokenType.LIKE:Precedence.COMPARISON,
+    TokenType.PIPE_PIPE:Precedence.CONCAT,
+    TokenType.PLUS:Precedence.ADDITION,TokenType.MINUS:Precedence.ADDITION,
+    TokenType.STAR:Precedence.MULTIPLY,TokenType.SLASH:Precedence.MULTIPLY,
+    TokenType.PERCENT:Precedence.MULTIPLY,
 }
-_AGG_NAMES = frozenset({'COUNT','SUM','AVG','MIN','MAX'})
+_AGGS = frozenset({'COUNT','SUM','AVG','MIN','MAX'})
+_WINFUNCS = frozenset({'ROW_NUMBER','RANK','DENSE_RANK','NTILE','PERCENT_RANK',
+                        'CUME_DIST','LAG','LEAD','FIRST_VALUE','LAST_VALUE','NTH_VALUE'})
 
 class Parser:
     def __init__(self, tokens: list[Token]) -> None:
-        self._tokens = tokens; self._pos = 0; self._current = tokens[0]
-
-    def _advance(self) -> None:
-        self._pos += 1
-        if self._pos < len(self._tokens): self._current = self._tokens[self._pos]
-
-    def _peek(self) -> Token:
-        n = self._pos + 1
-        return self._tokens[n] if n < len(self._tokens) else self._tokens[-1]
-
-    def _expect(self, tt: TokenType) -> Token:
-        if self._current.type != tt:
-            raise ParseError(f"expected {tt.value}, got {self._current.value!r}", self._current.line, self._current.col)
-        tok = self._current; self._advance(); return tok
-
-    def _expect_integer(self) -> int:
-        return int(self._expect(TokenType.INTEGER_LIT).value)
-
-    def _accept_identifier(self) -> str:
-        if self._current.type == TokenType.IDENTIFIER:
-            v = self._current.value; self._advance(); return v
-        if self._current.type in _UNRESERVED_KW:
-            v = self._current.value.lower(); self._advance(); return v
-        raise ParseError(f"expected identifier, got {self._current.value!r}", self._current.line, self._current.col)
+        self._t = tokens; self._p = 0; self._c = tokens[0]
+    def _adv(self) -> None:
+        self._p += 1
+        if self._p < len(self._t): self._c = self._t[self._p]
+    def _pk(self) -> Token:
+        n = self._p+1; return self._t[n] if n < len(self._t) else self._t[-1]
+    def _ex(self, tt: TokenType) -> Token:
+        if self._c.type != tt:
+            raise ParseError(f"expected {tt.value}, got {self._c.value!r}",self._c.line,self._c.col)
+        t = self._c; self._adv(); return t
+    def _exi(self) -> int: return int(self._ex(TokenType.INTEGER_LIT).value)
+    def _aid(self) -> str:
+        if self._c.type == TokenType.IDENTIFIER: v = self._c.value; self._adv(); return v
+        if self._c.type in _UNRESERVED: v = self._c.value.lower(); self._adv(); return v
+        raise ParseError(f"expected identifier, got {self._c.value!r}",self._c.line,self._c.col)
 
     def parse(self) -> object:
-        stmt = self._parse_statement()
-        if self._current.type == TokenType.SEMICOLON: self._advance()
-        if self._current.type != TokenType.EOF:
-            raise ParseError(f"extra tokens: {self._current.value!r}", self._current.line, self._current.col)
+        stmt = self._stmt()
+        # Check for set operations
+        while self._c.type in (TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
+            stmt = self._parse_set_op(stmt)
+        if self._c.type == TokenType.SEMICOLON: self._adv()
+        if self._c.type != TokenType.EOF:
+            raise ParseError(f"extra tokens: {self._c.value!r}",self._c.line,self._c.col)
         return stmt
 
-    def _parse_statement(self) -> object:
-        tt = self._current.type
-        if tt == TokenType.SELECT: return self._parse_select()
-        if tt == TokenType.INSERT: return self._parse_insert()
-        if tt == TokenType.UPDATE: return self._parse_update()
-        if tt == TokenType.DELETE: return self._parse_delete()
-        if tt == TokenType.CREATE: self._advance(); self._expect(TokenType.TABLE); return self._parse_create_table()
-        if tt == TokenType.DROP: self._advance(); self._expect(TokenType.TABLE); return self._parse_drop_table()
-        raise ParseError(f"unexpected: {self._current.value!r}", self._current.line, self._current.col)
+    def _parse_set_op(self, left: object) -> SetOperationStmt:
+        op = self._c.value; self._adv()
+        all_ = False
+        if self._c.type == TokenType.ALL: all_ = True; self._adv()
+        right = self._parse_select_core()
+        # Chain further set ops
+        while self._c.type in (TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
+            right = self._parse_set_op(right)
+        return SetOperationStmt(op=op, all=all_, left=left, right=right)
 
-    # -- SELECT --------------------------------------------------------
-    def _parse_select(self) -> SelectStmt:
-        self._expect(TokenType.SELECT)
-        distinct = False
-        if self._current.type == TokenType.DISTINCT: distinct = True; self._advance()
-        sl = [self._parse_select_item()]
-        while self._current.type == TokenType.COMMA: self._advance(); sl.append(self._parse_select_item())
-        fc = self._parse_from() if self._current.type == TokenType.FROM else None
+    def _stmt(self) -> object:
+        tt = self._c.type
+        if tt == TokenType.SELECT: return self._parse_select_core()
+        if tt == TokenType.INSERT: return self._ins()
+        if tt == TokenType.UPDATE: return self._upd()
+        if tt == TokenType.DELETE: return self._dlt()
+        if tt == TokenType.CREATE: self._adv(); self._ex(TokenType.TABLE); return self._crt()
+        if tt == TokenType.DROP: self._adv(); self._ex(TokenType.TABLE); return self._drp()
+        raise ParseError(f"unexpected: {self._c.value!r}",self._c.line,self._c.col)
+
+    def _parse_select_core(self) -> SelectStmt:
+        self._ex(TokenType.SELECT)
+        dist = False
+        if self._c.type == TokenType.DISTINCT: dist = True; self._adv()
+        sl = [self._si()]
+        while self._c.type == TokenType.COMMA: self._adv(); sl.append(self._si())
+        fc = self._fr() if self._c.type == TokenType.FROM else None
         w = None
-        if self._current.type == TokenType.WHERE: self._advance(); w = self._parse_expression()
-        gb = self._parse_group_by() if self._current.type == TokenType.GROUP else None
+        if self._c.type == TokenType.WHERE: self._adv(); w = self._expr()
+        gb = self._gb() if self._c.type == TokenType.GROUP else None
         hv = None
-        if self._current.type == TokenType.HAVING: self._advance(); hv = self._parse_expression()
+        if self._c.type == TokenType.HAVING: self._adv(); hv = self._expr()
         ob: list = []
-        if self._current.type == TokenType.ORDER: ob = self._parse_order_by()
+        if self._c.type == TokenType.ORDER: ob = self._ob()
         lm = None
-        if self._current.type == TokenType.LIMIT: self._advance(); lm = self._parse_expression()
+        if self._c.type == TokenType.LIMIT: self._adv(); lm = self._expr()
         of = None
-        if self._current.type == TokenType.OFFSET: self._advance(); of = self._parse_expression()
-        return SelectStmt(distinct=distinct, select_list=sl, from_clause=fc, where=w,
-                          group_by=gb, having=hv, order_by=ob, limit=lm, offset=of)
+        if self._c.type == TokenType.OFFSET: self._adv(); of = self._expr()
+        return SelectStmt(distinct=dist,select_list=sl,from_clause=fc,where=w,
+                          group_by=gb,having=hv,order_by=ob,limit=lm,offset=of)
 
-    def _parse_select_item(self) -> object:
-        expr = self._parse_expression()
-        if self._current.type == TokenType.AS:
-            self._advance(); return AliasExpr(expr=expr, alias=self._accept_identifier())
-        if self._current.type == TokenType.IDENTIFIER:
-            a = self._current.value; self._advance(); return AliasExpr(expr=expr, alias=a)
-        return expr
+    def _si(self) -> object:
+        e = self._expr()
+        if self._c.type == TokenType.AS: self._adv(); return AliasExpr(expr=e,alias=self._aid())
+        if self._c.type == TokenType.IDENTIFIER:
+            a = self._c.value; self._adv(); return AliasExpr(expr=e,alias=a)
+        return e
 
-    def _parse_from(self) -> FromClause:
-        self._expect(TokenType.FROM)
-        tref = self._parse_table_ref()
+    def _fr(self) -> FromClause:
+        self._ex(TokenType.FROM)
+        tref = self._tref()
         joins: list = []
-        while self._current.type in (TokenType.JOIN, TokenType.INNER, TokenType.LEFT,
-                                      TokenType.RIGHT, TokenType.CROSS, TokenType.FULL, TokenType.COMMA):
-            if self._current.type == TokenType.COMMA:
-                self._advance()
-                t2 = self._parse_table_ref()
-                joins.append(JoinClause(join_type='CROSS', table=t2, on=None))
-                continue
-            joins.append(self._parse_join())
-        return FromClause(table=tref, joins=joins)
+        while self._c.type in (TokenType.JOIN,TokenType.INNER,TokenType.LEFT,
+                                TokenType.RIGHT,TokenType.CROSS,TokenType.FULL,TokenType.COMMA):
+            if self._c.type == TokenType.COMMA:
+                self._adv(); joins.append(JoinClause(join_type='CROSS',table=self._tref())); continue
+            joins.append(self._jn())
+        return FromClause(table=tref,joins=joins)
 
-    def _parse_table_ref(self) -> TableRef:
-        if self._current.type == TokenType.LPAREN:
-            # Subquery — not fully supported, skip for now
-            pass
-        name = self._accept_identifier()
+    def _tref(self) -> TableRef:
+        if self._c.type == TokenType.LPAREN:
+            self._adv()
+            if self._c.type == TokenType.SELECT:
+                sq = self._parse_select_core()
+                self._ex(TokenType.RPAREN)
+                alias = None
+                if self._c.type == TokenType.AS: self._adv(); alias = self._aid()
+                elif self._c.type == TokenType.IDENTIFIER: alias = self._c.value; self._adv()
+                return TableRef(name=alias or '__subquery', alias=alias, subquery=sq)
+            # Parenthesized table ref — just parse name
+        name = self._aid()
         alias: Optional[str] = None
-        if self._current.type == TokenType.AS:
-            self._advance(); alias = self._accept_identifier()
-        elif self._current.type == TokenType.IDENTIFIER:
-            alias = self._current.value; self._advance()
+        if self._c.type == TokenType.AS: self._adv(); alias = self._aid()
+        elif self._c.type == TokenType.IDENTIFIER: alias = self._c.value; self._adv()
         return TableRef(name=name, alias=alias)
 
-    def _parse_join(self) -> JoinClause:
+    def _jn(self) -> JoinClause:
         jt = 'INNER'
-        if self._current.type == TokenType.INNER: self._advance(); jt = 'INNER'
-        elif self._current.type == TokenType.LEFT: self._advance(); jt = 'LEFT'
-        elif self._current.type == TokenType.RIGHT: self._advance(); jt = 'RIGHT'
-        elif self._current.type == TokenType.CROSS: self._advance(); jt = 'CROSS'
-        elif self._current.type == TokenType.FULL: self._advance(); jt = 'FULL'
-        if self._current.type == TokenType.OUTER: self._advance()
-        self._expect(TokenType.JOIN)
-        t = self._parse_table_ref()
-        on = None
-        if self._current.type == TokenType.ON:
-            self._advance(); on = self._parse_expression()
-        return JoinClause(join_type=jt, table=t, on=on)
+        if self._c.type == TokenType.INNER: self._adv()
+        elif self._c.type == TokenType.LEFT: self._adv(); jt = 'LEFT'
+        elif self._c.type == TokenType.RIGHT: self._adv(); jt = 'RIGHT'
+        elif self._c.type == TokenType.CROSS: self._adv(); jt = 'CROSS'
+        elif self._c.type == TokenType.FULL: self._adv(); jt = 'FULL'
+        if self._c.type == TokenType.OUTER: self._adv()
+        self._ex(TokenType.JOIN)
+        t = self._tref(); on = None
+        if self._c.type == TokenType.ON: self._adv(); on = self._expr()
+        return JoinClause(join_type=jt,table=t,on=on)
 
-    def _parse_group_by(self) -> GroupByClause:
-        self._expect(TokenType.GROUP); self._expect(TokenType.BY)
-        keys = [self._parse_expression()]
-        while self._current.type == TokenType.COMMA: self._advance(); keys.append(self._parse_expression())
-        return GroupByClause(keys=keys)
+    def _gb(self) -> GroupByClause:
+        self._ex(TokenType.GROUP);self._ex(TokenType.BY)
+        k = [self._expr()]
+        while self._c.type == TokenType.COMMA: self._adv(); k.append(self._expr())
+        return GroupByClause(keys=k)
 
-    def _parse_order_by(self) -> list:
-        self._expect(TokenType.ORDER); self._expect(TokenType.BY)
-        keys = [self._parse_sort_key()]
-        while self._current.type == TokenType.COMMA: self._advance(); keys.append(self._parse_sort_key())
-        return keys
+    def _ob(self) -> list:
+        self._ex(TokenType.ORDER);self._ex(TokenType.BY)
+        k = [self._sk()]
+        while self._c.type == TokenType.COMMA: self._adv(); k.append(self._sk())
+        return k
 
-    def _parse_sort_key(self) -> SortKey:
-        expr = self._parse_expression()
-        d = 'ASC'
-        if self._current.type == TokenType.ASC: self._advance()
-        elif self._current.type == TokenType.DESC: d = 'DESC'; self._advance()
+    def _sk(self) -> SortKey:
+        e = self._expr(); d = 'ASC'
+        if self._c.type == TokenType.ASC: self._adv()
+        elif self._c.type == TokenType.DESC: d = 'DESC'; self._adv()
         ns: Optional[str] = None
-        if self._current.type == TokenType.NULLS:
-            self._advance()
-            if self._current.type == TokenType.FIRST: ns = 'NULLS_FIRST'; self._advance()
-            elif self._current.type == TokenType.LAST: ns = 'NULLS_LAST'; self._advance()
-            else: raise ParseError(f"expected FIRST/LAST", self._current.line, self._current.col)
-        return SortKey(expr=expr, direction=d, nulls=ns)
+        if self._c.type == TokenType.NULLS:
+            self._adv()
+            if self._c.type == TokenType.FIRST: ns = 'NULLS_FIRST'; self._adv()
+            elif self._c.type == TokenType.LAST: ns = 'NULLS_LAST'; self._adv()
+        return SortKey(expr=e,direction=d,nulls=ns)
 
-    # -- INSERT --------------------------------------------------------
-    def _parse_insert(self) -> InsertStmt:
-        self._expect(TokenType.INSERT); self._expect(TokenType.INTO)
-        table = self._accept_identifier()
+    def _ins(self) -> InsertStmt:
+        self._ex(TokenType.INSERT);self._ex(TokenType.INTO); t = self._aid()
         cols: Optional[List[str]] = None
-        if self._current.type == TokenType.LPAREN:
-            self._advance(); cols = [self._accept_identifier()]
-            while self._current.type == TokenType.COMMA: self._advance(); cols.append(self._accept_identifier())
-            self._expect(TokenType.RPAREN)
-        self._expect(TokenType.VALUES)
-        rows = [self._parse_value_row()]
-        while self._current.type == TokenType.COMMA: self._advance(); rows.append(self._parse_value_row())
-        return InsertStmt(table=table, columns=cols, values=rows)
+        if self._c.type == TokenType.LPAREN:
+            self._adv(); cols = [self._aid()]
+            while self._c.type == TokenType.COMMA: self._adv(); cols.append(self._aid())
+            self._ex(TokenType.RPAREN)
+        self._ex(TokenType.VALUES)
+        rows = [self._vr()]
+        while self._c.type == TokenType.COMMA: self._adv(); rows.append(self._vr())
+        return InsertStmt(table=t,columns=cols,values=rows)
 
-    def _parse_value_row(self) -> list:
-        self._expect(TokenType.LPAREN)
-        exprs = [self._parse_expression()]
-        while self._current.type == TokenType.COMMA: self._advance(); exprs.append(self._parse_expression())
-        self._expect(TokenType.RPAREN); return exprs
+    def _vr(self) -> list:
+        self._ex(TokenType.LPAREN); e = [self._expr()]
+        while self._c.type == TokenType.COMMA: self._adv(); e.append(self._expr())
+        self._ex(TokenType.RPAREN); return e
 
-    # -- UPDATE --------------------------------------------------------
-    def _parse_update(self) -> UpdateStmt:
-        self._expect(TokenType.UPDATE)
-        table = self._accept_identifier()
-        self._expect(TokenType.SET)
-        assigns = [self._parse_assignment()]
-        while self._current.type == TokenType.COMMA: self._advance(); assigns.append(self._parse_assignment())
+    def _upd(self) -> UpdateStmt:
+        self._ex(TokenType.UPDATE); t = self._aid(); self._ex(TokenType.SET)
+        a = [self._asgn()]
+        while self._c.type == TokenType.COMMA: self._adv(); a.append(self._asgn())
         w = None
-        if self._current.type == TokenType.WHERE: self._advance(); w = self._parse_expression()
-        return UpdateStmt(table=table, assignments=assigns, where=w)
+        if self._c.type == TokenType.WHERE: self._adv(); w = self._expr()
+        return UpdateStmt(table=t,assignments=a,where=w)
 
-    def _parse_assignment(self) -> Assignment:
-        col = self._accept_identifier()
-        self._expect(TokenType.EQUAL)
-        val = self._parse_expression()
-        return Assignment(column=col, value=val)
+    def _asgn(self) -> Assignment:
+        c = self._aid(); self._ex(TokenType.EQUAL); return Assignment(column=c,value=self._expr())
 
-    # -- DELETE --------------------------------------------------------
-    def _parse_delete(self) -> DeleteStmt:
-        self._expect(TokenType.DELETE); self._expect(TokenType.FROM)
-        table = self._accept_identifier()
+    def _dlt(self) -> DeleteStmt:
+        self._ex(TokenType.DELETE);self._ex(TokenType.FROM); t = self._aid()
         w = None
-        if self._current.type == TokenType.WHERE: self._advance(); w = self._parse_expression()
-        return DeleteStmt(table=table, where=w)
+        if self._c.type == TokenType.WHERE: self._adv(); w = self._expr()
+        return DeleteStmt(table=t,where=w)
 
-    # -- CREATE / DROP -------------------------------------------------
-    def _parse_create_table(self) -> CreateTableStmt:
+    def _crt(self) -> CreateTableStmt:
         ine = False
-        if self._current.type == TokenType.IF:
-            self._advance(); self._expect(TokenType.NOT); self._expect(TokenType.EXISTS); ine = True
-        table = self._accept_identifier(); self._expect(TokenType.LPAREN)
-        cols = [self._parse_column_def()]
-        while self._current.type == TokenType.COMMA: self._advance(); cols.append(self._parse_column_def())
-        self._expect(TokenType.RPAREN)
-        return CreateTableStmt(table=table, columns=cols, if_not_exists=ine)
+        if self._c.type == TokenType.IF:
+            self._adv();self._ex(TokenType.NOT);self._ex(TokenType.EXISTS);ine = True
+        t = self._aid(); self._ex(TokenType.LPAREN)
+        cols = [self._cd()]
+        while self._c.type == TokenType.COMMA: self._adv(); cols.append(self._cd())
+        self._ex(TokenType.RPAREN); return CreateTableStmt(table=t,columns=cols,if_not_exists=ine)
 
-    def _parse_column_def(self) -> ColumnDef:
-        name = self._accept_identifier(); tn = self._parse_type_name()
-        nullable = True; pk = False
+    def _cd(self) -> ColumnDef:
+        n = self._aid(); tn = self._tn(); nl = True; pk = False
         while True:
-            if self._current.type == TokenType.NOT: self._advance(); self._expect(TokenType.NULL); nullable = False
-            elif self._current.type == TokenType.NULL: self._advance(); nullable = True
-            elif self._current.type == TokenType.PRIMARY: self._advance(); self._expect(TokenType.KEY); pk = True
+            if self._c.type == TokenType.NOT: self._adv();self._ex(TokenType.NULL); nl = False
+            elif self._c.type == TokenType.NULL: self._adv(); nl = True
+            elif self._c.type == TokenType.PRIMARY: self._adv();self._ex(TokenType.KEY); pk = True
             else: break
-        return ColumnDef(name=name, type_name=tn, nullable=nullable, primary_key=pk)
+        return ColumnDef(name=n,type_name=tn,nullable=nl,primary_key=pk)
 
-    def _parse_type_name(self) -> TypeName:
-        if self._current.type in _UNRESERVED_KW: n = self._current.value.upper(); self._advance()
-        elif self._current.type == TokenType.IDENTIFIER: n = self._current.value.upper(); self._advance()
-        else: raise ParseError(f"expected type name", self._current.line, self._current.col)
-        params: list[int] = []
-        if self._current.type == TokenType.LPAREN:
-            self._advance(); params.append(self._expect_integer()); self._expect(TokenType.RPAREN)
-        return TypeName(name=n, params=params)
+    def _tn(self) -> TypeName:
+        if self._c.type in _UNRESERVED or self._c.type == TokenType.IDENTIFIER:
+            n = self._c.value.upper(); self._adv()
+        else: raise ParseError(f"expected type",self._c.line,self._c.col)
+        p: list[int] = []
+        if self._c.type == TokenType.LPAREN: self._adv(); p.append(self._exi()); self._ex(TokenType.RPAREN)
+        return TypeName(name=n,params=p)
 
-    def _parse_drop_table(self) -> DropTableStmt:
+    def _drp(self) -> DropTableStmt:
         ie = False
-        if self._current.type == TokenType.IF: self._advance(); self._expect(TokenType.EXISTS); ie = True
-        return DropTableStmt(table=self._accept_identifier(), if_exists=ie)
+        if self._c.type == TokenType.IF: self._adv();self._ex(TokenType.EXISTS);ie = True
+        return DropTableStmt(table=self._aid(),if_exists=ie)
 
-    # ═══ Pratt expression parser ═══
-    def _parse_expression(self, min_prec: int = Precedence.LOWEST) -> object:
-        left = self._parse_prefix()
-        while self._get_infix_prec() > min_prec:
-            left = self._parse_infix(left)
-        return left
+    # ═══ Pratt ═══
+    def _expr(self, mp: int = Precedence.LOWEST) -> object:
+        l = self._prefix()
+        while self._iprec() > mp: l = self._infix(l)
+        return l
 
-    def _parse_prefix(self) -> object:
-        tt = self._current.type
-        if tt == TokenType.NOT: self._advance(); return UnaryExpr(op='NOT', operand=self._parse_expression(Precedence.NOT_PREFIX))
-        if tt == TokenType.MINUS: self._advance(); return UnaryExpr(op='-', operand=self._parse_expression(Precedence.UNARY))
-        if tt == TokenType.PLUS: self._advance(); return UnaryExpr(op='+', operand=self._parse_expression(Precedence.UNARY))
-        if tt in (TokenType.INTEGER_LIT, TokenType.FLOAT_LIT, TokenType.STRING,
-                  TokenType.TRUE, TokenType.FALSE, TokenType.NULL):
-            return self._parse_literal()
-        if tt == TokenType.IDENTIFIER or tt in _UNRESERVED_KW: return self._parse_identifier_expr()
-        if tt == TokenType.CASE: return self._parse_case()
-        if tt == TokenType.CAST: return self._parse_cast()
+    def _prefix(self) -> object:
+        tt = self._c.type
+        if tt == TokenType.NOT: self._adv(); return UnaryExpr(op='NOT',operand=self._expr(Precedence.NOT_PREFIX))
+        if tt == TokenType.MINUS: self._adv(); return UnaryExpr(op='-',operand=self._expr(Precedence.UNARY))
+        if tt == TokenType.PLUS: self._adv(); return UnaryExpr(op='+',operand=self._expr(Precedence.UNARY))
+        if tt in (TokenType.INTEGER_LIT,TokenType.FLOAT_LIT,TokenType.STRING,
+                  TokenType.TRUE,TokenType.FALSE,TokenType.NULL):
+            return self._lit()
+        if tt == TokenType.IDENTIFIER or tt in _UNRESERVED: return self._idexpr()
+        if tt == TokenType.CASE: return self._case()
+        if tt == TokenType.CAST: return self._cast()
+        if tt == TokenType.EXISTS:
+            self._adv(); self._ex(TokenType.LPAREN)
+            sq = self._parse_select_core(); self._ex(TokenType.RPAREN)
+            return ExistsExpr(query=sq)
+        if tt == TokenType.NOT:
+            self._adv()
+            if self._c.type == TokenType.EXISTS:
+                self._adv(); self._ex(TokenType.LPAREN)
+                sq = self._parse_select_core(); self._ex(TokenType.RPAREN)
+                return ExistsExpr(query=sq, negated=True)
         if tt == TokenType.LPAREN:
-            self._advance()
-            # Check for subquery
-            if self._current.type == TokenType.SELECT:
-                sq = self._parse_select()
-                self._expect(TokenType.RPAREN)
+            self._adv()
+            if self._c.type == TokenType.SELECT:
+                sq = self._parse_select_core(); self._ex(TokenType.RPAREN)
                 return SubqueryExpr(query=sq)
-            expr = self._parse_expression(); self._expect(TokenType.RPAREN); return expr
-        if tt == TokenType.STAR: self._advance(); return StarExpr()
-        raise ParseError(f"unexpected in expression: {self._current.value!r}", self._current.line, self._current.col)
+            e = self._expr(); self._ex(TokenType.RPAREN); return e
+        if tt == TokenType.STAR: self._adv(); return StarExpr()
+        raise ParseError(f"unexpected: {self._c.value!r}",self._c.line,self._c.col)
 
-    def _parse_literal(self) -> Literal:
-        tok = self._current; self._advance()
-        if tok.type == TokenType.INTEGER_LIT:
-            v = int(tok.value)
-            return Literal(value=v, inferred_type=DataType.INT if v <= 2_147_483_647 else DataType.BIGINT)
-        if tok.type == TokenType.FLOAT_LIT: return Literal(value=float(tok.value), inferred_type=DataType.DOUBLE)
-        if tok.type == TokenType.STRING: return Literal(value=tok.value, inferred_type=DataType.VARCHAR)
-        if tok.type == TokenType.TRUE: return Literal(value=True, inferred_type=DataType.BOOLEAN)
-        if tok.type == TokenType.FALSE: return Literal(value=False, inferred_type=DataType.BOOLEAN)
-        if tok.type == TokenType.NULL: return Literal(value=None, inferred_type=DataType.UNKNOWN)
-        raise ParseError(f"unexpected literal: {tok.type}", tok.line, tok.col)
+    def _lit(self) -> Literal:
+        t = self._c; self._adv()
+        if t.type == TokenType.INTEGER_LIT:
+            v = int(t.value)
+            return Literal(value=v,inferred_type=DataType.INT if v <= 2_147_483_647 else DataType.BIGINT)
+        if t.type == TokenType.FLOAT_LIT: return Literal(value=float(t.value),inferred_type=DataType.DOUBLE)
+        if t.type == TokenType.STRING: return Literal(value=t.value,inferred_type=DataType.VARCHAR)
+        if t.type == TokenType.TRUE: return Literal(value=True,inferred_type=DataType.BOOLEAN)
+        if t.type == TokenType.FALSE: return Literal(value=False,inferred_type=DataType.BOOLEAN)
+        return Literal(value=None,inferred_type=DataType.UNKNOWN)
 
-    def _parse_identifier_expr(self) -> object:
-        name = self._current.value
-        if self._current.type in _UNRESERVED_KW: name = name.lower()
-        self._advance()
-        if self._current.type == TokenType.LPAREN: return self._parse_function_call(name)
-        if self._current.type == TokenType.DOT:
-            self._advance(); col = self._accept_identifier(); return ColumnRef(table=name, column=col)
-        return ColumnRef(table=None, column=name)
+    def _idexpr(self) -> object:
+        name = self._c.value
+        if self._c.type in _UNRESERVED: name = name.lower()
+        self._adv()
+        if self._c.type == TokenType.LPAREN: return self._fncall(name)
+        if self._c.type == TokenType.DOT:
+            self._adv(); return ColumnRef(table=name,column=self._aid())
+        return ColumnRef(table=None,column=name)
 
-    def _parse_function_call(self, name: str) -> object:
-        self._expect(TokenType.LPAREN); upper = name.upper()
-        if upper in _AGG_NAMES:
-            if self._current.type == TokenType.STAR:
-                self._advance(); self._expect(TokenType.RPAREN)
-                return AggregateCall(name=upper, args=[StarExpr()])
+    def _fncall(self, name: str) -> object:
+        self._ex(TokenType.LPAREN); upper = name.upper()
+        if upper in _AGGS:
+            if self._c.type == TokenType.STAR:
+                self._adv(); self._ex(TokenType.RPAREN)
+                func = AggregateCall(name=upper,args=[StarExpr()])
+                if self._c.type == TokenType.OVER: return self._window(func)
+                return func
             dist = False
-            if self._current.type == TokenType.DISTINCT: dist = True; self._advance()
-            args = [self._parse_expression()]; self._expect(TokenType.RPAREN)
-            return AggregateCall(name=upper, args=args, distinct=dist)
-        args: list = []
-        if self._current.type != TokenType.RPAREN:
-            args.append(self._parse_expression())
-            while self._current.type == TokenType.COMMA: self._advance(); args.append(self._parse_expression())
-        self._expect(TokenType.RPAREN)
-        return FunctionCall(name=name, args=args)
+            if self._c.type == TokenType.DISTINCT: dist = True; self._adv()
+            args = [self._expr()]; self._ex(TokenType.RPAREN)
+            func = AggregateCall(name=upper,args=args,distinct=dist)
+            if self._c.type == TokenType.OVER: return self._window(func)
+            return func
+        # Window function names
+        if upper in _WINFUNCS:
+            args: list = []
+            if self._c.type != TokenType.RPAREN:
+                args.append(self._expr())
+                while self._c.type == TokenType.COMMA: self._adv(); args.append(self._expr())
+            self._ex(TokenType.RPAREN)
+            func = FunctionCall(name=upper,args=args)
+            if self._c.type == TokenType.OVER: return self._window(func)
+            return func
+        # Regular function
+        args = []
+        if self._c.type != TokenType.RPAREN:
+            args.append(self._expr())
+            while self._c.type == TokenType.COMMA: self._adv(); args.append(self._expr())
+        self._ex(TokenType.RPAREN)
+        func = FunctionCall(name=name,args=args)
+        if self._c.type == TokenType.OVER: return self._window(func)
+        return func
 
-    def _parse_case(self) -> CaseExpr:
-        self._expect(TokenType.CASE)
-        operand = None
-        if self._current.type != TokenType.WHEN:
-            operand = self._parse_expression()
-        whens: list = []
-        while self._current.type == TokenType.WHEN:
-            self._advance(); cond = self._parse_expression()
-            self._expect(TokenType.THEN); result = self._parse_expression()
-            whens.append((cond, result))
-        else_expr = None
-        if self._current.type == TokenType.ELSE:
-            self._advance(); else_expr = self._parse_expression()
-        self._expect(TokenType.END)
-        return CaseExpr(operand=operand, when_clauses=whens, else_expr=else_expr)
+    def _window(self, func: object) -> WindowCall:
+        self._ex(TokenType.OVER); self._ex(TokenType.LPAREN)
+        pb: list = []
+        if self._c.type == TokenType.PARTITION:
+            self._adv(); self._ex(TokenType.BY)
+            pb.append(self._expr())
+            while self._c.type == TokenType.COMMA: self._adv(); pb.append(self._expr())
+        oby: list = []
+        if self._c.type == TokenType.ORDER:
+            self._ex(TokenType.ORDER); self._ex(TokenType.BY)
+            oby.append(self._sk())
+            while self._c.type == TokenType.COMMA: self._adv(); oby.append(self._sk())
+        frame = None
+        if self._c.type in (TokenType.ROWS, TokenType.RANGE):
+            frame = self._parse_frame()
+        self._ex(TokenType.RPAREN)
+        return WindowCall(func=func,partition_by=pb,order_by=oby,frame=frame)
 
-    def _parse_cast(self) -> CastExpr:
-        self._expect(TokenType.CAST); self._expect(TokenType.LPAREN)
-        expr = self._parse_expression()
-        self._expect(TokenType.AS)
-        tn = self._parse_type_name()
-        self._expect(TokenType.RPAREN)
-        return CastExpr(expr=expr, type_name=tn)
+    def _parse_frame(self) -> WindowFrame:
+        mode = self._c.value; self._adv()  # ROWS or RANGE
+        if self._c.type == TokenType.BETWEEN:
+            self._adv()
+            start = self._parse_bound()
+            self._ex(TokenType.AND)
+            end = self._parse_bound()
+            return WindowFrame(mode=mode, start=start, end=end)
+        # Single bound (start only, end = CURRENT ROW)
+        start = self._parse_bound()
+        return WindowFrame(mode=mode, start=start, end=FrameBound(type='CURRENT_ROW'))
 
-    # -- infix ---------------------------------------------------------
-    def _get_infix_prec(self) -> int:
-        tt = self._current.type
-        if tt == TokenType.NOT:
-            nxt = self._peek()
-            if nxt.type in (TokenType.IN, TokenType.BETWEEN, TokenType.LIKE):
-                return Precedence.COMPARISON
+    def _parse_bound(self) -> FrameBound:
+        if self._c.type == TokenType.UNBOUNDED:
+            self._adv()
+            if self._c.type == TokenType.PRECEDING:
+                self._adv(); return FrameBound(type='UNBOUNDED_PRECEDING')
+            self._ex(TokenType.FOLLOWING); return FrameBound(type='UNBOUNDED_FOLLOWING')
+        if self._c.type == TokenType.CURRENT:
+            self._adv(); self._ex(TokenType.ROW); return FrameBound(type='CURRENT_ROW')
+        if self._c.type == TokenType.INTEGER_LIT:
+            n = int(self._c.value); self._adv()
+            if self._c.type == TokenType.PRECEDING:
+                self._adv(); return FrameBound(type='N_PRECEDING', offset=n)
+            self._ex(TokenType.FOLLOWING); return FrameBound(type='N_FOLLOWING', offset=n)
+        raise ParseError(f"expected frame bound",self._c.line,self._c.col)
+
+    def _case(self) -> CaseExpr:
+        self._ex(TokenType.CASE); op = None
+        if self._c.type != TokenType.WHEN: op = self._expr()
+        ws: list = []
+        while self._c.type == TokenType.WHEN:
+            self._adv(); c = self._expr(); self._ex(TokenType.THEN); r = self._expr()
+            ws.append((c,r))
+        el = None
+        if self._c.type == TokenType.ELSE: self._adv(); el = self._expr()
+        self._ex(TokenType.END); return CaseExpr(operand=op,when_clauses=ws,else_expr=el)
+
+    def _cast(self) -> CastExpr:
+        self._ex(TokenType.CAST);self._ex(TokenType.LPAREN)
+        e = self._expr(); self._ex(TokenType.AS); t = self._tn()
+        self._ex(TokenType.RPAREN); return CastExpr(expr=e,type_name=t)
+
+    def _iprec(self) -> int:
+        if self._c.type == TokenType.NOT:
+            n = self._pk()
+            if n.type in (TokenType.IN,TokenType.BETWEEN,TokenType.LIKE): return Precedence.COMPARISON
             return Precedence.LOWEST
-        return _INFIX_PREC.get(tt, Precedence.LOWEST)
+        return _INFIX.get(self._c.type, Precedence.LOWEST)
 
-    def _parse_infix(self, left: object) -> object:
-        tt = self._current.type
-        if tt == TokenType.IS: return self._parse_is_expr(left)
-        if tt == TokenType.IN: return self._parse_in_expr(left, False)
-        if tt == TokenType.BETWEEN: return self._parse_between_expr(left, False)
-        if tt == TokenType.LIKE: return self._parse_like_expr(left, False)
+    def _infix(self, left: object) -> object:
+        tt = self._c.type
+        if tt == TokenType.IS: return self._is(left)
+        if tt == TokenType.IN: return self._in(left,False)
+        if tt == TokenType.BETWEEN: return self._btw(left,False)
+        if tt == TokenType.LIKE: return self._lk(left,False)
         if tt == TokenType.NOT:
-            nxt = self._peek()
-            if nxt.type == TokenType.IN: self._advance(); return self._parse_in_expr(left, True)
-            if nxt.type == TokenType.BETWEEN: self._advance(); return self._parse_between_expr(left, True)
-            if nxt.type == TokenType.LIKE: self._advance(); return self._parse_like_expr(left, True)
-        prec = _INFIX_PREC[tt]
-        op = self._current.value; self._advance()
-        op_map = {'AND':'AND','OR':'OR','=':'=','!=':'!=','<':'<','>':'>','<=':'<=','>=':'>=',
-                  '+':'+','-':'-','*':'*','/':'/','%':'%','||':'||'}
-        right = self._parse_expression(prec)
-        return BinaryExpr(op=op_map.get(op, op), left=left, right=right)
+            n = self._pk()
+            if n.type == TokenType.IN: self._adv(); return self._in(left,True)
+            if n.type == TokenType.BETWEEN: self._adv(); return self._btw(left,True)
+            if n.type == TokenType.LIKE: self._adv(); return self._lk(left,True)
+        prec = _INFIX[tt]; op = self._c.value; self._adv()
+        m = {'AND':'AND','OR':'OR','=':'=','!=':'!=','<':'<','>':'>','<=':'<=','>=':'>=',
+             '+':'+','-':'-','*':'*','/':'/','%':'%','||':'||'}
+        return BinaryExpr(op=m.get(op,op),left=left,right=self._expr(prec))
 
-    def _parse_is_expr(self, left: object) -> IsNullExpr:
-        self._expect(TokenType.IS); neg = False
-        if self._current.type == TokenType.NOT: neg = True; self._advance()
-        self._expect(TokenType.NULL)
-        return IsNullExpr(expr=left, negated=neg)
+    def _is(self, l: object) -> IsNullExpr:
+        self._ex(TokenType.IS); neg = False
+        if self._c.type == TokenType.NOT: neg = True; self._adv()
+        self._ex(TokenType.NULL); return IsNullExpr(expr=l,negated=neg)
 
-    def _parse_in_expr(self, left: object, negated: bool) -> InExpr:
-        self._expect(TokenType.IN); self._expect(TokenType.LPAREN)
-        if self._current.type == TokenType.SELECT:
-            sq = self._parse_select(); self._expect(TokenType.RPAREN)
-            return InExpr(expr=left, values=[SubqueryExpr(query=sq)], negated=negated)
-        vals = [self._parse_expression()]
-        while self._current.type == TokenType.COMMA: self._advance(); vals.append(self._parse_expression())
-        self._expect(TokenType.RPAREN)
-        return InExpr(expr=left, values=vals, negated=negated)
+    def _in(self, l: object, neg: bool) -> InExpr:
+        self._ex(TokenType.IN); self._ex(TokenType.LPAREN)
+        if self._c.type == TokenType.SELECT:
+            sq = self._parse_select_core(); self._ex(TokenType.RPAREN)
+            return InExpr(expr=l,values=[SubqueryExpr(query=sq)],negated=neg)
+        vs = [self._expr()]
+        while self._c.type == TokenType.COMMA: self._adv(); vs.append(self._expr())
+        self._ex(TokenType.RPAREN); return InExpr(expr=l,values=vs,negated=neg)
 
-    def _parse_between_expr(self, left: object, negated: bool) -> BetweenExpr:
-        self._expect(TokenType.BETWEEN)
-        low = self._parse_expression(Precedence.COMPARISON)
-        self._expect(TokenType.AND)
-        high = self._parse_expression(Precedence.COMPARISON)
-        return BetweenExpr(expr=left, low=low, high=high, negated=negated)
+    def _btw(self, l: object, neg: bool) -> BetweenExpr:
+        self._ex(TokenType.BETWEEN); lo = self._expr(Precedence.COMPARISON)
+        self._ex(TokenType.AND); hi = self._expr(Precedence.COMPARISON)
+        return BetweenExpr(expr=l,low=lo,high=hi,negated=neg)
 
-    def _parse_like_expr(self, left: object, negated: bool) -> LikeExpr:
-        self._expect(TokenType.LIKE)
-        pattern = self._parse_expression(Precedence.COMPARISON)
-        return LikeExpr(expr=left, pattern=pattern, negated=negated)
+    def _lk(self, l: object, neg: bool) -> LikeExpr:
+        self._ex(TokenType.LIKE); return LikeExpr(expr=l,pattern=self._expr(Precedence.COMPARISON),negated=neg)

@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Token types and the Token dataclass."""
+"""Token types and Token dataclass."""
 from dataclasses import dataclass
 from enum import Enum
 
@@ -21,19 +21,18 @@ class TokenType(Enum):
     CASE='CASE';WHEN='WHEN';THEN='THEN';ELSE='ELSE';END='END'
     CAST='CAST';IN='IN';BETWEEN='BETWEEN';LIKE='LIKE';ESCAPE='ESCAPE'
     UNION='UNION';INTERSECT='INTERSECT';EXCEPT='EXCEPT';ALL='ALL'
-    # type-name keywords (unreserved)
+    OVER='OVER';PARTITION='PARTITION';ROWS='ROWS';RANGE='RANGE'
+    UNBOUNDED='UNBOUNDED';PRECEDING='PRECEDING';FOLLOWING='FOLLOWING'
+    CURRENT='CURRENT';ROW='ROW'
     INT='INT';INTEGER='INTEGER';BIGINT='BIGINT'
     FLOAT_KW='FLOAT';DOUBLE='DOUBLE';REAL='REAL'
     BOOLEAN='BOOLEAN';BOOL='BOOL'
     VARCHAR='VARCHAR';TEXT_KW='TEXT'
     DATE_KW='DATE';TIMESTAMP='TIMESTAMP'
-    # literals
     INTEGER_LIT='INTEGER_LIT';FLOAT_LIT='FLOAT_LIT';STRING='STRING';IDENTIFIER='IDENTIFIER'
-    # operators
     PLUS='+';MINUS='-';STAR='*';SLASH='/';PERCENT='%'
     EQUAL='=';NOT_EQUAL='!=';LESS='<';GREATER='>';LESS_EQUAL='<=';GREATER_EQUAL='>='
     PIPE_PIPE='||'
-    # delimiters
     LPAREN='(';RPAREN=')';COMMA=',';DOT='.';SEMICOLON=';'
     EOF='EOF'
 

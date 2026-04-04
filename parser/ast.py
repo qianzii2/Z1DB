@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional
 from storage.types import DataType
 
-# ═══ Statements ═══
 @dataclass
 class SelectStmt:
     distinct: bool = False
@@ -21,66 +20,73 @@ class SelectStmt:
     sample: Optional[Any] = None
 
 @dataclass
+class SetOperationStmt:
+    op: str = 'UNION'  # UNION, INTERSECT, EXCEPT
+    all: bool = False
+    left: Any = None
+    right: Any = None
+
+@dataclass
 class InsertStmt:
-    table: str
+    table: str = ''
     columns: Optional[List[str]] = None
     values: list = field(default_factory=list)
 
 @dataclass
 class UpdateStmt:
-    table: str
-    assignments: list = field(default_factory=list)  # list[Assignment]
+    table: str = ''
+    assignments: list = field(default_factory=list)
     where: Optional[Any] = None
 
 @dataclass
 class DeleteStmt:
-    table: str
+    table: str = ''
     where: Optional[Any] = None
 
 @dataclass
 class CreateTableStmt:
-    table: str
+    table: str = ''
     columns: List[ColumnDef] = field(default_factory=list)
     if_not_exists: bool = False
 
 @dataclass
 class DropTableStmt:
-    table: str
+    table: str = ''
     if_exists: bool = False
 
-# ═══ Clauses ═══
 @dataclass
 class FromClause:
-    table: TableRef
-    joins: list = field(default_factory=list)  # list[JoinClause]
+    table: TableRef = None  # type: ignore
+    joins: list = field(default_factory=list)
 
 @dataclass
 class TableRef:
-    name: str
+    name: str = ''
     alias: Optional[str] = None
+    subquery: Optional[Any] = None  # SelectStmt for derived table
 
 @dataclass
 class JoinClause:
-    join_type: str = 'INNER'  # INNER, LEFT, RIGHT, CROSS
+    join_type: str = 'INNER'
     table: Optional[TableRef] = None
     on: Optional[Any] = None
 
 @dataclass
 class SortKey:
-    expr: Any
+    expr: Any = None
     direction: str = 'ASC'
     nulls: Optional[str] = None
 
 @dataclass
 class ColumnDef:
-    name: str
-    type_name: TypeName
+    name: str = ''
+    type_name: Optional[TypeName] = None
     nullable: bool = True
     primary_key: bool = False
 
 @dataclass
 class TypeName:
-    name: str
+    name: str = ''
     params: List[int] = field(default_factory=list)
 
 @dataclass
@@ -95,7 +101,7 @@ class Assignment:
 # ═══ Expressions ═══
 @dataclass
 class Literal:
-    value: Any
+    value: Any = None
     inferred_type: DataType = DataType.UNKNOWN
 
 @dataclass
@@ -141,9 +147,27 @@ class FunctionCall:
     args: list = field(default_factory=list)
 
 @dataclass
+class WindowCall:
+    func: Any = None  # AggregateCall or FunctionCall
+    partition_by: list = field(default_factory=list)
+    order_by: list = field(default_factory=list)  # list[SortKey]
+    frame: Optional[WindowFrame] = None
+
+@dataclass
+class WindowFrame:
+    mode: str = 'ROWS'  # ROWS or RANGE
+    start: Optional[FrameBound] = None
+    end: Optional[FrameBound] = None
+
+@dataclass
+class FrameBound:
+    type: str = 'CURRENT_ROW'  # UNBOUNDED_PRECEDING, N_PRECEDING, CURRENT_ROW, N_FOLLOWING, UNBOUNDED_FOLLOWING
+    offset: Optional[int] = None
+
+@dataclass
 class CaseExpr:
     operand: Optional[Any] = None
-    when_clauses: list = field(default_factory=list)  # list[(condition, result)]
+    when_clauses: list = field(default_factory=list)
     else_expr: Optional[Any] = None
 
 @dataclass
@@ -173,3 +197,8 @@ class LikeExpr:
 @dataclass
 class SubqueryExpr:
     query: Any = None
+
+@dataclass
+class ExistsExpr:
+    query: Any = None
+    negated: bool = False

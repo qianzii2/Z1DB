@@ -1,58 +1,51 @@
 from __future__ import annotations
-"""AST → SQL text formatter."""
-from parser.ast import (AggregateCall, AliasExpr, BetweenExpr, BinaryExpr, CaseExpr,
-                         CastExpr, ColumnRef, FunctionCall, InExpr, IsNullExpr,
-                         LikeExpr, Literal, StarExpr, UnaryExpr)
+"""AST → SQL text."""
+from parser.ast import *
 from parser.precedence import Precedence
-
-_OP_PREC = {'OR':1,'AND':2,'=':4,'!=':4,'<':4,'>':4,'<=':4,'>=':4,
-            '||':5,'+':6,'-':6,'*':7,'/':7,'%':7}
+_P = {'OR':1,'AND':2,'=':4,'!=':4,'<':4,'>':4,'<=':4,'>=':4,'||':5,'+':6,'-':6,'*':7,'/':7,'%':7}
 
 class Formatter:
     @staticmethod
-    def expr_to_sql(expr: object) -> str:
-        return Formatter._fmt(expr, 0)
-
+    def expr_to_sql(e: object) -> str: return Formatter._f(e,0)
     @staticmethod
-    def _fmt(n: object, pp: int) -> str:
-        if isinstance(n, ColumnRef):
-            return f"{n.table}.{n.column}" if n.table else n.column
+    def _f(n: object, pp: int) -> str:
+        if isinstance(n, ColumnRef): return f"{n.table}.{n.column}" if n.table else n.column
         if isinstance(n, Literal):
             if n.value is None: return 'NULL'
             if isinstance(n.value, bool): return 'TRUE' if n.value else 'FALSE'
             if isinstance(n.value, str): return f"'{n.value}'"
             return str(n.value)
         if isinstance(n, BinaryExpr):
-            p = _OP_PREC.get(n.op, 0)
-            s = f"{Formatter._fmt(n.left, p)} {n.op} {Formatter._fmt(n.right, p)}"
+            p = _P.get(n.op,0); s = f"{Formatter._f(n.left,p)} {n.op} {Formatter._f(n.right,p)}"
             return f"({s})" if p < pp else s
         if isinstance(n, UnaryExpr):
-            o = Formatter._fmt(n.operand, Precedence.UNARY)
+            o = Formatter._f(n.operand, Precedence.UNARY)
             return f"NOT {o}" if n.op == 'NOT' else f"{n.op}{o}"
         if isinstance(n, AggregateCall):
             if n.args and isinstance(n.args[0], StarExpr): return f"{n.name}(*)"
-            a = ', '.join(Formatter._fmt(x, 0) for x in n.args)
-            d = 'DISTINCT ' if n.distinct else ''
-            return f"{n.name}({d}{a})"
+            a = ', '.join(Formatter._f(x,0) for x in n.args)
+            return f"{n.name}({'DISTINCT ' if n.distinct else ''}{a})"
         if isinstance(n, FunctionCall):
-            a = ', '.join(Formatter._fmt(x, 0) for x in n.args)
-            return f"{n.name}({a})"
+            return f"{n.name}({', '.join(Formatter._f(x,0) for x in n.args)})"
+        if isinstance(n, WindowCall):
+            fn = Formatter._f(n.func, 0)
+            parts = []
+            if n.partition_by: parts.append('PARTITION BY ' + ', '.join(Formatter._f(x,0) for x in n.partition_by))
+            if n.order_by: parts.append('ORDER BY ' + ', '.join(Formatter._f(sk.expr,0) for sk in n.order_by))
+            return f"{fn} OVER ({' '.join(parts)})"
         if isinstance(n, IsNullExpr):
-            i = Formatter._fmt(n.expr, 0)
-            return f"{i} IS NOT NULL" if n.negated else f"{i} IS NULL"
-        if isinstance(n, AliasExpr): return Formatter._fmt(n.expr, pp)
+            return f"{Formatter._f(n.expr,0)} IS {'NOT ' if n.negated else ''}NULL"
+        if isinstance(n, AliasExpr): return Formatter._f(n.expr, pp)
         if isinstance(n, StarExpr): return f"{n.table}.*" if n.table else '*'
         if isinstance(n, CaseExpr): return 'CASE ... END'
         if isinstance(n, CastExpr):
-            return f"CAST({Formatter._fmt(n.expr, 0)} AS {n.type_name.name if n.type_name else '?'})"
+            return f"CAST({Formatter._f(n.expr,0)} AS {n.type_name.name if n.type_name else '?'})"
         if isinstance(n, InExpr):
-            vs = ', '.join(Formatter._fmt(v, 0) for v in n.values)
-            neg = ' NOT' if n.negated else ''
-            return f"{Formatter._fmt(n.expr, 0)}{neg} IN ({vs})"
+            return f"{Formatter._f(n.expr,0)}{' NOT' if n.negated else ''} IN (...)"
         if isinstance(n, BetweenExpr):
-            neg = ' NOT' if n.negated else ''
-            return f"{Formatter._fmt(n.expr, 0)}{neg} BETWEEN {Formatter._fmt(n.low, 0)} AND {Formatter._fmt(n.high, 0)}"
+            return f"{Formatter._f(n.expr,0)}{' NOT' if n.negated else ''} BETWEEN ..."
         if isinstance(n, LikeExpr):
-            neg = ' NOT' if n.negated else ''
-            return f"{Formatter._fmt(n.expr, 0)}{neg} LIKE {Formatter._fmt(n.pattern, 0)}"
+            return f"{Formatter._f(n.expr,0)}{' NOT' if n.negated else ''} LIKE ..."
+        if isinstance(n, ExistsExpr): return f"{'NOT ' if n.negated else ''}EXISTS (...)"
+        if isinstance(n, SubqueryExpr): return '(SELECT ...)'
         return str(n)

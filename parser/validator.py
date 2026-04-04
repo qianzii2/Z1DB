@@ -6,6 +6,12 @@ from parser.ast import (AggregateCall, AliasExpr, ColumnRef, CreateTableStmt,
                          DeleteStmt, InsertStmt, SelectStmt, StarExpr, UpdateStmt)
 from utils.errors import ColumnNotFoundError, SemanticError, TableNotFoundError
 
+# Import WindowCall for skipping
+try:
+    from parser.ast import WindowCall
+except ImportError:
+    WindowCall = None  # type: ignore
+
 class CatalogInfo(Protocol):
     def get_table_columns(self, table: str) -> list[str]: ...
     def table_exists(self, table: str) -> bool: ...
@@ -58,6 +64,8 @@ class Validator:
 
     def _contains_agg(self, node: Any) -> bool:
         if isinstance(node, AggregateCall): return True
+        # WindowCall wraps aggregates but is NOT an aggregate context
+        if WindowCall is not None and isinstance(node, WindowCall): return False
         if isinstance(node, AliasExpr): return self._contains_agg(node.expr)
         if node is None or not dataclasses.is_dataclass(node) or isinstance(node, type): return False
         for f in dataclasses.fields(node):
@@ -69,6 +77,8 @@ class Validator:
 
     def _check_bare_col(self, node: Any) -> None:
         if isinstance(node, AggregateCall): return
+        # WindowCall is allowed to contain bare columns
+        if WindowCall is not None and isinstance(node, WindowCall): return
         if isinstance(node, ColumnRef):
             raise SemanticError(f"column '{node.column}' must appear in GROUP BY or aggregate")
         if isinstance(node, AliasExpr): self._check_bare_col(node.expr); return
@@ -84,6 +94,7 @@ class Validator:
             if depth > 0: raise SemanticError(f"nested aggregate: {node.name}")
             for a in node.args: self._check_nested_agg(a, depth + 1)
             return
+        if WindowCall is not None and isinstance(node, WindowCall): return
         if isinstance(node, AliasExpr): self._check_nested_agg(node.expr, depth); return
         if node is None or not dataclasses.is_dataclass(node) or isinstance(node, type): return
         for f in dataclasses.fields(node):

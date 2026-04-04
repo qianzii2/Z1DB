@@ -1,5 +1,6 @@
 from __future__ import annotations
 """Expression evaluator — vectorised evaluation over DataVectors."""
+import datetime
 import operator as _op
 import re as _re
 from typing import Any, Dict, List, Optional
@@ -445,6 +446,91 @@ class ExpressionEvaluator:
     # ==================================================================
     # Scalar functions
     # ==================================================================
+    def _eval_date_part(self, part: str, vec: DataVector, n: int) -> DataVector:
+        """Extract date/time part from an integer epoch-days or epoch-microseconds value."""
+        import datetime as _dt
+        results: list = [None] * n
+        for i in range(n):
+            if vec.is_null(i):
+                continue
+            v = vec.get(i)
+            try:
+                if isinstance(v, int) and abs(v) < 1_000_000:
+                    # Treat as epoch days
+                    d = _dt.date(1970, 1, 1) + _dt.timedelta(days=v)
+                    results[i] = self._extract_part(part, d, None)
+                elif isinstance(v, int):
+                    # Treat as epoch microseconds
+                    dt = _dt.datetime(1970, 1, 1) + _dt.timedelta(microseconds=v)
+                    results[i] = self._extract_part(part, dt.date(), dt.time())
+                else:
+                    results[i] = None
+            except Exception:
+                results[i] = None
+        return self._list_to_vector(results, DataType.INT, n)
+
+    def _extract_part(self, part: str, d: Any, t: Any) -> Optional[int]:
+        import datetime as _dt
+        if part == 'YEAR':
+            return d.year
+        if part == 'MONTH':
+            return d.month
+        if part == 'DAY':
+            return d.day
+        if part == 'HOUR':
+            return t.hour if t else 0
+        if part == 'MINUTE':
+            return t.minute if t else 0
+        if part == 'SECOND':
+            return t.second if t else 0
+        if part == 'DAY_OF_WEEK':
+            return d.isoweekday()
+        if part == 'DAY_OF_YEAR':
+            return d.timetuple().tm_yday
+        if part == 'WEEK_OF_YEAR':
+            return d.isocalendar()[1]
+        if part == 'QUARTER':
+            return (d.month - 1) // 3 + 1
+        return None
+
+    def _eval_lpad_rpad(self, args: list, n: int, left: bool) -> DataVector:
+        sv, lv = args[0], args[1]
+        pad_char = ' '
+        rd: list = []
+        rn = Bitmap(n)
+        for i in range(n):
+            if sv.is_null(i) or lv.is_null(i):
+                rn.set_bit(i)
+                rd.append('')
+            else:
+                s = str(sv.get(i))
+                width = int(lv.get(i))
+                if len(args) >= 3 and not args[2].is_null(i):
+                    pad_char = str(args[2].get(i))
+                if left:
+                    rd.append(s.rjust(width, pad_char[0] if pad_char else ' '))
+                else:
+                    rd.append(s.ljust(width, pad_char[0] if pad_char else ' '))
+        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
+
+    def _eval_split_part(self, args: list, n: int) -> DataVector:
+        rd: list = []
+        rn = Bitmap(n)
+        for i in range(n):
+            if args[0].is_null(i) or args[1].is_null(i) or args[2].is_null(i):
+                rn.set_bit(i)
+                rd.append('')
+            else:
+                s = str(args[0].get(i))
+                delim = str(args[1].get(i))
+                idx = int(args[2].get(i))
+                parts = s.split(delim)
+                if 1 <= idx <= len(parts):
+                    rd.append(parts[idx - 1])
+                else:
+                    rd.append('')
+        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
+
     def _eval_function(self, expr: FunctionCall, batch: VectorBatch) -> DataVector:
         name = expr.name.upper()
         args = [self.evaluate(a, batch) for a in expr.args]
@@ -538,6 +624,61 @@ class ExpressionEvaluator:
             return self._eval_nullif(args[0], args[1], n)
         if name == 'IF' and len(args) >= 3:
             return self._eval_if_func(args[0], args[1], args[2], n)
+
+        # Date/Time functions
+        if name in ('NOW', 'CURRENT_TIMESTAMP'):
+            import time
+            ts = int(time.time() * 1_000_000)
+            return self._list_to_vector([ts] * n, DataType.BIGINT, n)
+        if name == 'CURRENT_DATE':
+            d = datetime.date.today()
+            days = (d - datetime.date(1970, 1, 1)).days
+            return self._list_to_vector([days] * n, DataType.INT, n)
+        if name in ('YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND',
+                     'DAY_OF_WEEK', 'DAY_OF_YEAR', 'WEEK_OF_YEAR', 'QUARTER'):
+            return self._eval_date_part(name, args[0], n)
+        if name == 'EXTRACT' and len(args) >= 2:
+            # EXTRACT(part FROM date) — part is a string literal
+            part_name = str(args[0].get(0)).upper() if not args[0].is_null(0) else ''
+            return self._eval_date_part(part_name, args[1], n)
+        if name == 'EPOCH' and args:
+            return self._apply_num1(args[0], n, lambda x: x, DataType.BIGINT)
+
+        # More string functions
+        if name == 'LPAD' and len(args) >= 2:
+            return self._eval_lpad_rpad(args, n, left=True)
+        if name == 'RPAD' and len(args) >= 2:
+            return self._eval_lpad_rpad(args, n, left=False)
+        if name == 'INITCAP':
+            return self._apply_str1(args[0], n, lambda s: s.title())
+        if name == 'ASCII' and args:
+            return self._apply_num1(args[0], n, lambda s: ord(str(s)[0]) if str(s) else 0, DataType.INT)
+        if name == 'CHR' and args:
+            return self._apply_str1(args[0], n, lambda x: chr(int(x)) if isinstance(x, (int, float)) else '')
+        if name == 'SPLIT' and len(args) >= 2:
+            return self._apply_str1(args[0], n, lambda s: str(s))  # simplified
+        if name == 'SPLIT_PART' and len(args) >= 3:
+            return self._eval_split_part(args, n)
+        if name == 'REGEXP_REPLACE' and len(args) >= 3:
+            import re
+            return self._apply_str3(args[0], args[1], args[2], n,
+                                    lambda s, p, r: re.sub(p, r, s))
+
+        # TYPEOF
+        if name == 'TYPEOF' and args:
+            rd: list = []
+            rn_bm = Bitmap(n)
+            for i in range(n):
+                if args[0].is_null(i):
+                    rd.append('NULL')
+                else:
+                    rd.append(args[0].dtype.name)
+            return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn_bm, _length=n)
+
+        # RANDOM
+        if name == 'RANDOM':
+            import random
+            return self._list_to_vector([random.random() for _ in range(n)], DataType.DOUBLE, n)
 
         raise ExecutionError(f"unknown function: {expr.name}")
 
