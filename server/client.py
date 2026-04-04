@@ -9,7 +9,7 @@ class REPL:
         self._engine = engine
 
     def run(self) -> None:
-        print("Z1DB v0.3 — Type .help for commands, .quit to exit")
+        print("Z1DB v0.4 — Type .help for commands, .quit to exit")
         buffer = ''
         while True:
             prompt = 'z1db> ' if not buffer else '  ...> '
@@ -28,17 +28,17 @@ class REPL:
             if self._is_complete(buffer):
                 sql = buffer.strip()
                 buffer = ''
-                # Execute each semicolon-terminated statement separately
                 self._execute_statements(sql)
 
     def _execute_statements(self, sql: str) -> None:
-        """Split on top-level semicolons and execute each statement."""
         stmts = self._split_statements(sql)
         for stmt in stmts:
             stmt = stmt.strip()
             if not stmt:
                 continue
-            # Ensure trailing semicolon for parser
+            # Skip comment-only statements
+            if not self._has_real_content(stmt):
+                continue
             if not stmt.endswith(';'):
                 stmt += ';'
             try:
@@ -47,26 +47,88 @@ class REPL:
             except Z1Error as e:
                 print(f"Error: {e.message}")
 
+    @staticmethod
+    def _has_real_content(stmt: str) -> bool:
+        """Check if statement has content beyond comments, whitespace, and semicolons."""
+        i = 0
+        while i < len(stmt):
+            ch = stmt[i]
+            if ch.isspace() or ch == ';':
+                i += 1
+                continue
+            if ch == '-' and i + 1 < len(stmt) and stmt[i + 1] == '-':
+                # Skip to end of line
+                while i < len(stmt) and stmt[i] != '\n':
+                    i += 1
+                continue
+            if ch == '/' and i + 1 < len(stmt) and stmt[i + 1] == '*':
+                # Skip block comment
+                i += 2
+                depth = 1
+                while i < len(stmt) and depth > 0:
+                    if stmt[i] == '/' and i + 1 < len(stmt) and stmt[i + 1] == '*':
+                        depth += 1
+                        i += 1
+                    elif stmt[i] == '*' and i + 1 < len(stmt) and stmt[i + 1] == '/':
+                        depth -= 1
+                        i += 1
+                    i += 1
+                continue
+            # Found a real character
+            return True
+        return False
+
     def _split_statements(self, sql: str) -> list:
-        """Split SQL text into individual statements on top-level semicolons."""
         stmts: list = []
         current: list = []
         in_string = False
         in_line_comment = False
+        in_block_comment = False
+        block_depth = 0
         i = 0
         while i < len(sql):
             ch = sql[i]
-            if not in_string and not in_line_comment and ch == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
-                in_line_comment = True
-                current.append(ch)
-                i += 1
-                continue
+            # Block comment
+            if not in_string and not in_line_comment:
+                if not in_block_comment and ch == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+                    in_block_comment = True
+                    block_depth = 1
+                    current.append(ch)
+                    current.append(sql[i + 1])
+                    i += 2
+                    continue
+                if in_block_comment:
+                    if ch == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+                        block_depth += 1
+                        current.append(ch)
+                        current.append(sql[i + 1])
+                        i += 2
+                        continue
+                    if ch == '*' and i + 1 < len(sql) and sql[i + 1] == '/':
+                        block_depth -= 1
+                        current.append(ch)
+                        current.append(sql[i + 1])
+                        i += 2
+                        if block_depth == 0:
+                            in_block_comment = False
+                        continue
+                    current.append(ch)
+                    i += 1
+                    continue
+            # Line comment
+            if not in_string and not in_block_comment and not in_line_comment:
+                if ch == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+                    in_line_comment = True
+                    current.append(ch)
+                    i += 1
+                    continue
             if in_line_comment:
                 if ch == '\n':
                     in_line_comment = False
                 current.append(ch)
                 i += 1
                 continue
+            # String
             if in_string:
                 current.append(ch)
                 if ch == "'" and i + 1 < len(sql) and sql[i + 1] == "'":
@@ -82,6 +144,7 @@ class REPL:
                 current.append(ch)
                 i += 1
                 continue
+            # Semicolon — statement boundary
             if ch == ';':
                 current.append(ch)
                 stmts.append(''.join(current))
@@ -104,12 +167,33 @@ class REPL:
         depth = 0
         in_str = False
         in_lc = False
+        in_bc = False
+        bc_depth = 0
         i = 0
         while i < len(s):
             ch = s[i]
-            if not in_str and not in_lc and ch == '-' and i + 1 < len(s) and s[i + 1] == '-':
-                in_lc = True
-                i += 2
+            if not in_str and not in_lc and not in_bc:
+                if ch == '-' and i + 1 < len(s) and s[i + 1] == '-':
+                    in_lc = True
+                    i += 2
+                    continue
+                if ch == '/' and i + 1 < len(s) and s[i + 1] == '*':
+                    in_bc = True
+                    bc_depth = 1
+                    i += 2
+                    continue
+            if in_bc:
+                if ch == '/' and i + 1 < len(s) and s[i + 1] == '*':
+                    bc_depth += 1
+                    i += 2
+                    continue
+                if ch == '*' and i + 1 < len(s) and s[i + 1] == '/':
+                    bc_depth -= 1
+                    i += 2
+                    if bc_depth == 0:
+                        in_bc = False
+                    continue
+                i += 1
                 continue
             if in_lc:
                 if ch == '\n':
@@ -130,7 +214,7 @@ class REPL:
                 elif ch == ')':
                     depth -= 1
             i += 1
-        return depth == 0 and not in_str
+        return depth == 0 and not in_str and not in_bc
 
     def _handle_meta(self, cmd: str) -> None:
         parts = cmd.split()

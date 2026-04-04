@@ -26,7 +26,15 @@ class Engine:
             ast = Validator().validate(ast, self._catalog)
             result = self._planner.execute(ast, self._catalog)
         result.timing = t.elapsed
+        # Persist after every mutation
+        if self._catalog.is_persistent:
+            if result.affected_rows > 0 or result.message == 'OK':
+                self._catalog.persist()
         return result
+
+    @property
+    def data_dir(self) -> str:
+        return self._catalog.data_dir
 
     def get_table_names(self) -> list[str]:
         return self._catalog.list_tables()

@@ -21,7 +21,7 @@ class SelectStmt:
 
 @dataclass
 class SetOperationStmt:
-    op: str = 'UNION'  # UNION, INTERSECT, EXCEPT
+    op: str = 'UNION'
     all: bool = False
     left: Any = None
     right: Any = None
@@ -55,6 +55,18 @@ class DropTableStmt:
     if_exists: bool = False
 
 @dataclass
+class ExplainStmt:
+    statement: Any = None
+
+@dataclass
+class AlterTableStmt:
+    table: str = ''
+    action: str = ''       # ADD_COLUMN, DROP_COLUMN, RENAME_COLUMN
+    column_def: Optional[ColumnDef] = None
+    column_name: str = ''
+    new_name: str = ''
+
+@dataclass
 class FromClause:
     table: TableRef = None  # type: ignore
     joins: list = field(default_factory=list)
@@ -63,7 +75,7 @@ class FromClause:
 class TableRef:
     name: str = ''
     alias: Optional[str] = None
-    subquery: Optional[Any] = None  # SelectStmt for derived table
+    subquery: Optional[Any] = None
 
 @dataclass
 class JoinClause:
@@ -98,7 +110,6 @@ class Assignment:
     column: str = ''
     value: Any = None
 
-# ═══ Expressions ═══
 @dataclass
 class Literal:
     value: Any = None
@@ -148,20 +159,20 @@ class FunctionCall:
 
 @dataclass
 class WindowCall:
-    func: Any = None  # AggregateCall or FunctionCall
+    func: Any = None
     partition_by: list = field(default_factory=list)
-    order_by: list = field(default_factory=list)  # list[SortKey]
+    order_by: list = field(default_factory=list)
     frame: Optional[WindowFrame] = None
 
 @dataclass
 class WindowFrame:
-    mode: str = 'ROWS'  # ROWS or RANGE
+    mode: str = 'ROWS'
     start: Optional[FrameBound] = None
     end: Optional[FrameBound] = None
 
 @dataclass
 class FrameBound:
-    type: str = 'CURRENT_ROW'  # UNBOUNDED_PRECEDING, N_PRECEDING, CURRENT_ROW, N_FOLLOWING, UNBOUNDED_FOLLOWING
+    type: str = 'CURRENT_ROW'
     offset: Optional[int] = None
 
 @dataclass

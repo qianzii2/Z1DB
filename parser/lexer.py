@@ -30,6 +30,8 @@ KEYWORDS: Dict[str, TokenType] = {
     'RANGE':TokenType.RANGE,'UNBOUNDED':TokenType.UNBOUNDED,
     'PRECEDING':TokenType.PRECEDING,'FOLLOWING':TokenType.FOLLOWING,
     'CURRENT':TokenType.CURRENT,'ROW':TokenType.ROW,
+    'EXPLAIN':TokenType.EXPLAIN,'ALTER':TokenType.ALTER,'ADD':TokenType.ADD,
+    'COLUMN':TokenType.COLUMN,'RENAME':TokenType.RENAME,'TO':TokenType.TO,
     'INT':TokenType.INT,'INTEGER':TokenType.INTEGER,'BIGINT':TokenType.BIGINT,
     'FLOAT':TokenType.FLOAT_KW,'DOUBLE':TokenType.DOUBLE,'REAL':TokenType.REAL,
     'BOOLEAN':TokenType.BOOLEAN,'BOOL':TokenType.BOOL,

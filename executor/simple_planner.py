@@ -60,6 +60,12 @@ class SimplePlanner:
         self._evaluator = ExpressionEvaluator(function_registry)
 
     def execute(self, ast: Any, catalog: Catalog) -> ExecutionResult:
+        # EXPLAIN
+        if isinstance(ast, ExplainStmt):
+            return self._exec_explain(ast, catalog)
+        # ALTER TABLE
+        if isinstance(ast, AlterTableStmt):
+            return self._exec_alter(ast, catalog)
         if isinstance(ast, SetOperationStmt):
             return self._exec_set_op(ast, catalog)
         if isinstance(ast, CreateTableStmt):
@@ -75,6 +81,46 @@ class SimplePlanner:
         if isinstance(ast, SelectStmt):
             return self._exec_select(ast, catalog)
         raise ExecutionError(f"unsupported: {type(ast).__name__}")
+
+    def _exec_explain(self, ast: ExplainStmt, catalog: Catalog) -> ExecutionResult:
+        """Build the plan tree and return its textual representation."""
+        inner = ast.statement
+        if isinstance(inner, SelectStmt):
+            inner = self._resolve_subqueries(inner, catalog)
+            has_agg = any(self._contains_agg(e) for e in inner.select_list)
+            has_win = any(self._contains_window(e) for e in inner.select_list)
+            if has_agg or inner.group_by:
+                op = self._plan_grouped(inner, catalog)
+            elif has_win:
+                op = self._plan_windowed(inner, catalog)
+            else:
+                op = self._plan_select(inner, catalog)
+        elif isinstance(inner, SetOperationStmt):
+            op = self._plan_any(inner, catalog)
+        else:
+            return ExecutionResult(message=f"EXPLAIN not supported for {type(inner).__name__}")
+        text = op.explain()
+        rows = [[line] for line in text.split('\n') if line.strip()]
+        return ExecutionResult(columns=['Plan'], column_types=[DataType.VARCHAR],
+                               rows=rows, row_count=len(rows))
+
+    def _exec_alter(self, ast: AlterTableStmt, catalog: Catalog) -> ExecutionResult:
+        if ast.action == 'ADD_COLUMN':
+            assert ast.column_def is not None
+            from storage.types import resolve_type_name
+            dt, ml = resolve_type_name(ast.column_def.type_name.name, ast.column_def.type_name.params)
+            col = ColumnSchema(name=ast.column_def.name, dtype=dt,
+                               nullable=ast.column_def.nullable,
+                               primary_key=ast.column_def.primary_key, max_length=ml)
+            catalog.alter_add_column(ast.table, col)
+            return ExecutionResult(message='OK')
+        if ast.action == 'DROP_COLUMN':
+            catalog.alter_drop_column(ast.table, ast.column_name)
+            return ExecutionResult(message='OK')
+        if ast.action == 'RENAME_COLUMN':
+            catalog.alter_rename_column(ast.table, ast.column_name, ast.new_name)
+            return ExecutionResult(message='OK')
+        raise ExecutionError(f"unsupported ALTER action: {ast.action}")
 
     # ═══ Set operations ═══
     def _exec_set_op(self, ast: SetOperationStmt, catalog: Catalog) -> ExecutionResult:
