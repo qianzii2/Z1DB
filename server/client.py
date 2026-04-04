@@ -9,38 +9,28 @@ class REPL:
         self._engine = engine
 
     def run(self) -> None:
-        print("Z1DB v0.4 — Type .help for commands, .quit to exit")
+        print("Z1DB v0.6 — Type .help for commands, .quit to exit")
         buffer = ''
         while True:
             prompt = 'z1db> ' if not buffer else '  ...> '
             try:
                 line = input(prompt)
             except (EOFError, KeyboardInterrupt):
-                print('\nBye')
-                break
+                print('\nBye'); break
             stripped = line.strip()
-            if not stripped and not buffer:
-                continue
+            if not stripped and not buffer: continue
             if not buffer and stripped.startswith('.'):
-                self._handle_meta(stripped)
-                continue
+                self._handle_meta(stripped); continue
             buffer += line + '\n'
             if self._is_complete(buffer):
-                sql = buffer.strip()
-                buffer = ''
+                sql = buffer.strip(); buffer = ''
                 self._execute_statements(sql)
 
     def _execute_statements(self, sql: str) -> None:
-        stmts = self._split_statements(sql)
-        for stmt in stmts:
+        for stmt in self._split_statements(sql):
             stmt = stmt.strip()
-            if not stmt:
-                continue
-            # Skip comment-only statements
-            if not self._has_real_content(stmt):
-                continue
-            if not stmt.endswith(';'):
-                stmt += ';'
+            if not stmt or not self._has_real_content(stmt): continue
+            if not stmt.endswith(';'): stmt += ';'
             try:
                 result = self._engine.execute(stmt)  # type: ignore
                 print_result(result)
@@ -49,222 +39,144 @@ class REPL:
 
     @staticmethod
     def _has_real_content(stmt: str) -> bool:
-        """Check if statement has content beyond comments, whitespace, and semicolons."""
         i = 0
         while i < len(stmt):
             ch = stmt[i]
-            if ch.isspace() or ch == ';':
-                i += 1
+            if ch.isspace() or ch == ';': i += 1; continue
+            if ch == '-' and i+1 < len(stmt) and stmt[i+1] == '-':
+                while i < len(stmt) and stmt[i] != '\n': i += 1
                 continue
-            if ch == '-' and i + 1 < len(stmt) and stmt[i + 1] == '-':
-                # Skip to end of line
-                while i < len(stmt) and stmt[i] != '\n':
+            if ch == '/' and i+1 < len(stmt) and stmt[i+1] == '*':
+                i += 2; d = 1
+                while i < len(stmt) and d > 0:
+                    if stmt[i] == '/' and i+1 < len(stmt) and stmt[i+1] == '*': d += 1; i += 1
+                    elif stmt[i] == '*' and i+1 < len(stmt) and stmt[i+1] == '/': d -= 1; i += 1
                     i += 1
                 continue
-            if ch == '/' and i + 1 < len(stmt) and stmt[i + 1] == '*':
-                # Skip block comment
-                i += 2
-                depth = 1
-                while i < len(stmt) and depth > 0:
-                    if stmt[i] == '/' and i + 1 < len(stmt) and stmt[i + 1] == '*':
-                        depth += 1
-                        i += 1
-                    elif stmt[i] == '*' and i + 1 < len(stmt) and stmt[i + 1] == '/':
-                        depth -= 1
-                        i += 1
-                    i += 1
-                continue
-            # Found a real character
             return True
         return False
 
     def _split_statements(self, sql: str) -> list:
-        stmts: list = []
-        current: list = []
-        in_string = False
-        in_line_comment = False
-        in_block_comment = False
-        block_depth = 0
+        stmts: list = []; cur: list = []; in_str = False; in_lc = False; in_bc = False; bcd = 0
         i = 0
         while i < len(sql):
             ch = sql[i]
-            # Block comment
-            if not in_string and not in_line_comment:
-                if not in_block_comment and ch == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
-                    in_block_comment = True
-                    block_depth = 1
-                    current.append(ch)
-                    current.append(sql[i + 1])
-                    i += 2
+            if not in_str and not in_lc and not in_bc:
+                if ch == '/' and i+1 < len(sql) and sql[i+1] == '*':
+                    in_bc = True; bcd = 1; cur.append(ch); cur.append(sql[i+1]); i += 2; continue
+            if in_bc:
+                if ch == '/' and i+1 < len(sql) and sql[i+1] == '*': bcd += 1; cur.append(ch); cur.append(sql[i+1]); i += 2; continue
+                if ch == '*' and i+1 < len(sql) and sql[i+1] == '/':
+                    bcd -= 1; cur.append(ch); cur.append(sql[i+1]); i += 2
+                    if bcd == 0: in_bc = False
                     continue
-                if in_block_comment:
-                    if ch == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
-                        block_depth += 1
-                        current.append(ch)
-                        current.append(sql[i + 1])
-                        i += 2
-                        continue
-                    if ch == '*' and i + 1 < len(sql) and sql[i + 1] == '/':
-                        block_depth -= 1
-                        current.append(ch)
-                        current.append(sql[i + 1])
-                        i += 2
-                        if block_depth == 0:
-                            in_block_comment = False
-                        continue
-                    current.append(ch)
-                    i += 1
-                    continue
-            # Line comment
-            if not in_string and not in_block_comment and not in_line_comment:
-                if ch == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
-                    in_line_comment = True
-                    current.append(ch)
-                    i += 1
-                    continue
-            if in_line_comment:
-                if ch == '\n':
-                    in_line_comment = False
-                current.append(ch)
-                i += 1
-                continue
-            # String
-            if in_string:
-                current.append(ch)
-                if ch == "'" and i + 1 < len(sql) and sql[i + 1] == "'":
-                    current.append(sql[i + 1])
-                    i += 2
-                    continue
-                if ch == "'":
-                    in_string = False
-                i += 1
-                continue
-            if ch == "'":
-                in_string = True
-                current.append(ch)
-                i += 1
-                continue
-            # Semicolon — statement boundary
-            if ch == ';':
-                current.append(ch)
-                stmts.append(''.join(current))
-                current = []
-                i += 1
-                continue
-            current.append(ch)
-            i += 1
-        remainder = ''.join(current).strip()
-        if remainder:
-            stmts.append(remainder)
+                cur.append(ch); i += 1; continue
+            if not in_str and not in_lc and ch == '-' and i+1 < len(sql) and sql[i+1] == '-':
+                in_lc = True; cur.append(ch); i += 1; continue
+            if in_lc:
+                if ch == '\n': in_lc = False
+                cur.append(ch); i += 1; continue
+            if in_str:
+                cur.append(ch)
+                if ch == "'" and i+1 < len(sql) and sql[i+1] == "'": cur.append(sql[i+1]); i += 2; continue
+                if ch == "'": in_str = False
+                i += 1; continue
+            if ch == "'": in_str = True; cur.append(ch); i += 1; continue
+            if ch == ';': cur.append(ch); stmts.append(''.join(cur)); cur = []; i += 1; continue
+            cur.append(ch); i += 1
+        rem = ''.join(cur).strip()
+        if rem: stmts.append(rem)
         return stmts
 
     def _is_complete(self, buf: str) -> bool:
         s = buf.strip()
-        if not s:
-            return False
-        if not s.endswith(';'):
-            return False
-        depth = 0
-        in_str = False
-        in_lc = False
-        in_bc = False
-        bc_depth = 0
-        i = 0
+        if not s or not s.endswith(';'): return False
+        depth = 0; in_str = False; in_lc = False; in_bc = False; bcd = 0; i = 0
         while i < len(s):
             ch = s[i]
             if not in_str and not in_lc and not in_bc:
-                if ch == '-' and i + 1 < len(s) and s[i + 1] == '-':
-                    in_lc = True
-                    i += 2
-                    continue
-                if ch == '/' and i + 1 < len(s) and s[i + 1] == '*':
-                    in_bc = True
-                    bc_depth = 1
-                    i += 2
-                    continue
+                if ch == '-' and i+1 < len(s) and s[i+1] == '-': in_lc = True; i += 2; continue
+                if ch == '/' and i+1 < len(s) and s[i+1] == '*': in_bc = True; bcd = 1; i += 2; continue
             if in_bc:
-                if ch == '/' and i + 1 < len(s) and s[i + 1] == '*':
-                    bc_depth += 1
-                    i += 2
+                if ch == '/' and i+1 < len(s) and s[i+1] == '*': bcd += 1; i += 2; continue
+                if ch == '*' and i+1 < len(s) and s[i+1] == '/':
+                    bcd -= 1; i += 2
+                    if bcd == 0: in_bc = False
                     continue
-                if ch == '*' and i + 1 < len(s) and s[i + 1] == '/':
-                    bc_depth -= 1
-                    i += 2
-                    if bc_depth == 0:
-                        in_bc = False
-                    continue
-                i += 1
-                continue
+                i += 1; continue
             if in_lc:
-                if ch == '\n':
-                    in_lc = False
-                i += 1
-                continue
+                if ch == '\n': in_lc = False
+                i += 1; continue
             if in_str:
-                if ch == "'" and i + 1 < len(s) and s[i + 1] == "'":
-                    i += 2
-                    continue
-                if ch == "'":
-                    in_str = False
+                if ch == "'" and i+1 < len(s) and s[i+1] == "'": i += 2; continue
+                if ch == "'": in_str = False
             else:
-                if ch == "'":
-                    in_str = True
-                elif ch == '(':
-                    depth += 1
-                elif ch == ')':
-                    depth -= 1
+                if ch == "'": in_str = True
+                elif ch == '(': depth += 1
+                elif ch == ')': depth -= 1
             i += 1
         return depth == 0 and not in_str and not in_bc
 
     def _handle_meta(self, cmd: str) -> None:
-        parts = cmd.split()
-        name = parts[0].lower()
-        if name == '.quit':
-            print('Bye')
-            raise SystemExit
+        parts = cmd.split(); name = parts[0].lower()
+        if name == '.quit': print('Bye'); raise SystemExit
         if name == '.help':
             print("  .tables          List tables")
             print("  .schema <table>  Show schema")
+            print("  .analyze <table> Compute statistics")
+            print("  .stats <table>   Show statistics")
             print("  .quit            Exit")
-            print("  .help            Help")
-            return
+            print("  .help            Help"); return
         if name == '.tables':
             tables = self._engine.get_table_names()  # type: ignore
-            if not tables:
-                print("No tables.")
-                return
+            if not tables: print("No tables."); return
             rows = [(t, str(self._engine.get_table_row_count(t))) for t in tables]  # type: ignore
-            self._draw(['Table', 'Rows'], rows)
-            return
+            self._draw(['Table','Rows'], rows); return
         if name == '.schema':
-            if len(parts) < 2:
-                print("Usage: .schema <table>")
-                return
+            if len(parts) < 2: print("Usage: .schema <table>"); return
             try:
                 schema = self._engine.get_table_schema(parts[1])  # type: ignore
-            except Z1Error as e:
-                print(f"Error: {e.message}")
-                return
+            except Z1Error as e: print(f"Error: {e.message}"); return
             rows = []
             for c in schema.columns:
                 ts = c.dtype.name + (f'({c.max_length})' if c.max_length else '')
                 rows.append((c.name, ts, 'YES' if c.nullable else 'NO'))
-            self._draw(['Column', 'Type', 'Nullable'], rows)
+            self._draw(['Column','Type','Nullable'], rows); return
+        if name == '.analyze':
+            if len(parts) < 2: print("Usage: .analyze <table>"); return
+            try:
+                stats = self._engine.analyze_table(parts[1])  # type: ignore
+                print(f"Analyzed {parts[1]}: {stats.row_count} rows")
+            except Z1Error as e: print(f"Error: {e.message}")
+            except Exception as e: print(f"Error: {e}"); return
+            return
+        if name == '.stats':
+            if len(parts) < 2: print("Usage: .stats <table>"); return
+            try:
+                stats = self._engine.get_table_stats(parts[1])  # type: ignore
+                if stats is None:
+                    print(f"No statistics for '{parts[1]}'. Run .analyze {parts[1]} first.")
+                    return
+                rows = []
+                for cn, cs in stats.column_stats.items():
+                    rows.append((cn, str(cs.ndv), str(cs.null_count),
+                                 str(cs.min_val) if cs.min_val is not None else 'NULL',
+                                 str(cs.max_val) if cs.max_val is not None else 'NULL'))
+                self._draw(['Column','NDV','Nulls','Min','Max'], rows)
+            except Z1Error as e: print(f"Error: {e.message}")
+            except Exception as e: print(f"Error: {e}"); return
             return
         print(f"Unknown command: {name}")
 
     @staticmethod
     def _draw(headers: list, rows: list) -> None:
-        nc = len(headers)
-        w = [len(h) for h in headers]
+        nc = len(headers); w = [len(h) for h in headers]
         for r in rows:
-            for ci in range(nc):
-                w[ci] = max(w[ci], len(str(r[ci])))
-        def ln(l: str, m: str, r: str) -> str:
-            return l + m.join('─' * (x + 2) for x in w) + r
-        print(ln('┌', '┬', '┐'))
-        print('│' + '│'.join(f' {headers[i]:<{w[i]}} ' for i in range(nc)) + '│')
-        print(ln('├', '┼', '┤'))
+            for ci in range(nc): w[ci] = max(w[ci], len(str(r[ci])))
+        def ln(l,m,r): return l + m.join('─'*(x+2) for x in w) + r
+        print(ln('┌','┬','┐'))
+        print('│'+'│'.join(f' {headers[i]:<{w[i]}} ' for i in range(nc))+'│')
+        print(ln('├','┼','┤'))
         for r in rows:
-            print('│' + '│'.join(f' {str(r[i]):<{w[i]}} ' for i in range(nc)) + '│')
-        print(ln('└', '┴', '┘'))
+            print('│'+'│'.join(f' {str(r[i]):<{w[i]}} ' for i in range(nc))+'│')
+        print(ln('└','┴','┘'))
