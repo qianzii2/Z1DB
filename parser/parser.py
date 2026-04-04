@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Recursive-descent + Pratt parser — Phase 5 fix."""
+"""Recursive-descent + Pratt parser — Phase 7: CTE, complete."""
 from typing import List, Optional
 from parser.ast import *
 from parser.precedence import Precedence
@@ -31,17 +31,13 @@ _INFIX = {
 _AGGS = frozenset({
     'COUNT','SUM','AVG','MIN','MAX',
     'STDDEV','STDDEV_POP','VARIANCE','VAR_POP',
-    'MEDIAN','MODE','ARRAY_AGG','STRING_AGG',
-    'COUNT_DISTINCT',
+    'MEDIAN','MODE','ARRAY_AGG','STRING_AGG','COUNT_DISTINCT',
 })
 _WINFUNCS = frozenset({
     'ROW_NUMBER','RANK','DENSE_RANK','NTILE','PERCENT_RANK',
     'CUME_DIST','LAG','LEAD','FIRST_VALUE','LAST_VALUE','NTH_VALUE',
 })
-# Zero-arg keywords that act as functions (no parens needed)
-_NOARG_FUNCS = frozenset({
-    'current_date','current_timestamp','now',
-})
+_NOARG_FUNCS = frozenset({'current_date','current_timestamp','now'})
 
 
 class Parser:
@@ -77,6 +73,9 @@ class Parser:
 
     def _stmt(self):
         tt=self._c.type
+        # WITH ... AS (CTE)
+        if tt==TokenType.IDENTIFIER and self._c.value == 'with':
+            return self._with_cte()
         if tt==TokenType.SELECT: return self._sel()
         if tt==TokenType.INSERT: return self._ins()
         if tt==TokenType.UPDATE: return self._upd()
@@ -86,6 +85,26 @@ class Parser:
         if tt==TokenType.EXPLAIN: return self._explain()
         if tt==TokenType.ALTER: return self._alter()
         raise ParseError(f"unexpected: {self._c.value!r}",self._c.line,self._c.col)
+
+    def _with_cte(self):
+        """Parse WITH name AS (SELECT ...) [, ...] SELECT ..."""
+        self._adv()  # consume 'with'
+        ctes = []
+        while True:
+            cte_name = self._aid()
+            self._ex(TokenType.AS)
+            self._ex(TokenType.LPAREN)
+            cte_query = self._sel()
+            self._ex(TokenType.RPAREN)
+            ctes.append((cte_name, cte_query))
+            if self._c.type == TokenType.COMMA:
+                self._adv()
+            else:
+                break
+        # Now parse the main SELECT
+        main = self._sel()
+        import dataclasses
+        return dataclasses.replace(main, ctes=ctes)
 
     def _explain(self):
         self._ex(TokenType.EXPLAIN); inner = self._stmt()
@@ -266,8 +285,7 @@ class Parser:
         if tt in (TokenType.INTEGER_LIT,TokenType.FLOAT_LIT,TokenType.STRING,
                   TokenType.TRUE,TokenType.FALSE,TokenType.NULL):
             return self._lit()
-        if tt==TokenType.IDENTIFIER or tt in _UNRESERVED:
-            return self._idexpr()
+        if tt==TokenType.IDENTIFIER or tt in _UNRESERVED: return self._idexpr()
         if tt==TokenType.CASE: return self._case()
         if tt==TokenType.CAST: return self._cast()
         if tt==TokenType.EXISTS:
@@ -275,8 +293,7 @@ class Parser:
             return ExistsExpr(query=sq)
         if tt==TokenType.LPAREN:
             self._adv()
-            if self._c.type==TokenType.SELECT:
-                sq=self._sel();self._ex(TokenType.RPAREN); return SubqueryExpr(query=sq)
+            if self._c.type==TokenType.SELECT: sq=self._sel();self._ex(TokenType.RPAREN); return SubqueryExpr(query=sq)
             e=self._expr();self._ex(TokenType.RPAREN); return e
         if tt==TokenType.STAR: self._adv(); return StarExpr()
         raise ParseError(f"unexpected: {self._c.value!r}",self._c.line,self._c.col)
@@ -295,11 +312,8 @@ class Parser:
         name=self._c.value
         if self._c.type in _UNRESERVED: name=name.lower()
         self._adv()
-        # Zero-arg function keywords (CURRENT_DATE, CURRENT_TIMESTAMP, NOW)
         if name.lower() in _NOARG_FUNCS:
-            # Allow optional parens
-            if self._c.type == TokenType.LPAREN:
-                self._adv(); self._ex(TokenType.RPAREN)
+            if self._c.type == TokenType.LPAREN: self._adv(); self._ex(TokenType.RPAREN)
             return FunctionCall(name=name.upper(), args=[])
         if self._c.type==TokenType.LPAREN: return self._fncall(name)
         if self._c.type==TokenType.DOT: self._adv(); return ColumnRef(table=name,column=self._aid())
@@ -413,8 +427,7 @@ class Parser:
 
     def _in(self, l, neg):
         self._ex(TokenType.IN);self._ex(TokenType.LPAREN)
-        if self._c.type==TokenType.SELECT:
-            sq=self._sel();self._ex(TokenType.RPAREN); return InExpr(expr=l,values=[SubqueryExpr(query=sq)],negated=neg)
+        if self._c.type==TokenType.SELECT: sq=self._sel();self._ex(TokenType.RPAREN); return InExpr(expr=l,values=[SubqueryExpr(query=sq)],negated=neg)
         vs=[self._expr()]
         while self._c.type==TokenType.COMMA: self._adv(); vs.append(self._expr())
         self._ex(TokenType.RPAREN); return InExpr(expr=l,values=vs,negated=neg)

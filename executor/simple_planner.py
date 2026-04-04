@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Simple planner — Phase 3: windows, set ops, subqueries, COUNT DISTINCT."""
+"""Simple planner — Phase 7: no CTE handling (moved to engine)."""
 import dataclasses
 from typing import Any, Dict, List, Optional, Set, Tuple
 from catalog.catalog import Catalog, ColumnSchema, TableSchema
@@ -27,12 +27,8 @@ from storage.types import DataType, resolve_type_name
 from utils.errors import (ColumnNotFoundError, ExecutionError, NumericOverflowError)
 
 
-# ======================================================================
-# ScalarAggOperator: wraps scalar aggregate as a proper Operator
-# ======================================================================
 class _ScalarAggOperator(Operator):
-    """Wraps a scalar aggregate result as an Operator producing one batch."""
-
+    """Wraps a single-row VectorBatch as a proper Operator."""
     def __init__(self, batch: VectorBatch) -> None:
         super().__init__()
         self._batch = batch
@@ -59,11 +55,12 @@ class SimplePlanner:
         self._registry = function_registry
         self._evaluator = ExpressionEvaluator(function_registry)
 
+    # ══════════════════════════════════════════════════════════════
+    # Entry point — CTE handling is in engine.py
+    # ══════════════════════════════════════════════════════════════
     def execute(self, ast: Any, catalog: Catalog) -> ExecutionResult:
-        # EXPLAIN
         if isinstance(ast, ExplainStmt):
             return self._exec_explain(ast, catalog)
-        # ALTER TABLE
         if isinstance(ast, AlterTableStmt):
             return self._exec_alter(ast, catalog)
         if isinstance(ast, SetOperationStmt):
@@ -82,9 +79,12 @@ class SimplePlanner:
             return self._exec_select(ast, catalog)
         raise ExecutionError(f"unsupported: {type(ast).__name__}")
 
+    # ══════════════════════════════════════════════════════════════
+    # EXPLAIN
+    # ══════════════════════════════════════════════════════════════
     def _exec_explain(self, ast: ExplainStmt, catalog: Catalog) -> ExecutionResult:
-        """Build the plan tree and return its textual representation."""
         inner = ast.statement
+        op: Optional[Operator] = None
         if isinstance(inner, SelectStmt):
             inner = self._resolve_subqueries(inner, catalog)
             has_agg = any(self._contains_agg(e) for e in inner.select_list)
@@ -97,18 +97,21 @@ class SimplePlanner:
                 op = self._plan_select(inner, catalog)
         elif isinstance(inner, SetOperationStmt):
             op = self._plan_any(inner, catalog)
-        else:
+        if op is None:
             return ExecutionResult(message=f"EXPLAIN not supported for {type(inner).__name__}")
         text = op.explain()
         rows = [[line] for line in text.split('\n') if line.strip()]
         return ExecutionResult(columns=['Plan'], column_types=[DataType.VARCHAR],
                                rows=rows, row_count=len(rows))
 
+    # ══════════════════════════════════════════════════════════════
+    # ALTER TABLE
+    # ══════════════════════════════════════════════════════════════
     def _exec_alter(self, ast: AlterTableStmt, catalog: Catalog) -> ExecutionResult:
         if ast.action == 'ADD_COLUMN':
             assert ast.column_def is not None
-            from storage.types import resolve_type_name
-            dt, ml = resolve_type_name(ast.column_def.type_name.name, ast.column_def.type_name.params)
+            dt, ml = resolve_type_name(ast.column_def.type_name.name,
+                                       ast.column_def.type_name.params)
             col = ColumnSchema(name=ast.column_def.name, dtype=dt,
                                nullable=ast.column_def.nullable,
                                primary_key=ast.column_def.primary_key, max_length=ml)
@@ -122,7 +125,9 @@ class SimplePlanner:
             return ExecutionResult(message='OK')
         raise ExecutionError(f"unsupported ALTER action: {ast.action}")
 
-    # ═══ Set operations ═══
+    # ══════════════════════════════════════════════════════════════
+    # Set operations
+    # ══════════════════════════════════════════════════════════════
     def _exec_set_op(self, ast: SetOperationStmt, catalog: Catalog) -> ExecutionResult:
         left_op = self._plan_any(ast.left, catalog)
         right_op = self._plan_any(ast.right, catalog)
@@ -138,7 +143,6 @@ class SimplePlanner:
         return self._drain(op)
 
     def _plan_any(self, ast: Any, catalog: Catalog) -> Operator:
-        """Plan any statement subtree, always returning an Operator."""
         if isinstance(ast, SetOperationStmt):
             left = self._plan_any(ast.left, catalog)
             right = self._plan_any(ast.right, catalog)
@@ -148,7 +152,6 @@ class SimplePlanner:
                 return IntersectOperator(left, right, ast.all)
             return ExceptOperator(left, right, ast.all)
         if isinstance(ast, SelectStmt):
-            # Pre-process subqueries
             ast = self._resolve_subqueries(ast, catalog)
             has_agg = any(self._contains_agg(e) for e in ast.select_list)
             has_win = any(self._contains_window(e) for e in ast.select_list)
@@ -159,7 +162,9 @@ class SimplePlanner:
             return self._plan_select(ast, catalog)
         raise ExecutionError(f"unsupported in set op: {type(ast).__name__}")
 
-    # ═══ DDL ═══
+    # ══════════════════════════════════════════════════════════════
+    # DDL
+    # ══════════════════════════════════════════════════════════════
     def _exec_create(self, ast: CreateTableStmt, catalog: Catalog) -> ExecutionResult:
         cols = []
         for cd in ast.columns:
@@ -173,7 +178,9 @@ class SimplePlanner:
         catalog.drop_table(ast.table, ast.if_exists)
         return ExecutionResult(message='OK')
 
-    # ═══ DML ═══
+    # ══════════════════════════════════════════════════════════════
+    # DML
+    # ══════════════════════════════════════════════════════════════
     def _exec_insert(self, ast: InsertStmt, catalog: Catalog) -> ExecutionResult:
         schema = catalog.get_table(ast.table)
         store = catalog.get_store(ast.table)
@@ -194,7 +201,8 @@ class SimplePlanner:
                 full = self._reorder(pv, ast.columns, schema)
             else:
                 if len(pv) != len(schema.columns):
-                    raise ExecutionError(f"expected {len(schema.columns)} values, got {len(pv)}")
+                    raise ExecutionError(
+                        f"expected {len(schema.columns)} values, got {len(pv)}")
                 full = pv
             store.append_row(self._validate_row(full, schema))
             count += 1
@@ -260,7 +268,8 @@ class SimplePlanner:
                 if not self._evaluator.evaluate_predicate(ast.where, b).get_bit(0):
                     continue
             for a in ast.assignments:
-                ci = next((i for i, c in enumerate(schema.columns) if c.name == a.column), None)
+                ci = next((i for i, c in enumerate(schema.columns)
+                           if c.name == a.column), None)
                 if ci is None:
                     raise ColumnNotFoundError(a.column)
                 b = VectorBatch.from_rows([row], cn, ct)
@@ -297,7 +306,9 @@ class SimplePlanner:
         return ExecutionResult(affected_rows=count,
                                message=f"Deleted {count} {'row' if count == 1 else 'rows'}")
 
-    # ═══ SELECT ═══
+    # ══════════════════════════════════════════════════════════════
+    # SELECT
+    # ══════════════════════════════════════════════════════════════
     def _exec_select(self, ast: SelectStmt, catalog: Catalog) -> ExecutionResult:
         ast = self._resolve_subqueries(ast, catalog)
         has_agg = any(self._contains_agg(e) for e in ast.select_list)
@@ -310,18 +321,19 @@ class SimplePlanner:
 
     def _resolve_subqueries(self, ast: SelectStmt, catalog: Catalog) -> SelectStmt:
         if ast.where:
-            ast = dataclasses.replace(ast, where=self._resolve_sq_node(ast.where, catalog))
-        new_sl = [self._resolve_sq_node(e, catalog) for e in ast.select_list]
+            ast = dataclasses.replace(ast, where=self._resolve_sq(ast.where, catalog))
+        new_sl = [self._resolve_sq(e, catalog) for e in ast.select_list]
         return dataclasses.replace(ast, select_list=new_sl)
 
-    def _resolve_sq_node(self, node: Any, catalog: Catalog) -> Any:
+    def _resolve_sq(self, node: Any, catalog: Catalog) -> Any:
         if node is None:
             return None
         if isinstance(node, SubqueryExpr):
             result = self.execute(node.query, catalog)
             if result.rows and result.columns:
-                return Literal(value=result.rows[0][0],
-                               inferred_type=result.column_types[0] if result.column_types else DataType.INT)
+                return Literal(
+                    value=result.rows[0][0],
+                    inferred_type=result.column_types[0] if result.column_types else DataType.INT)
             return Literal(value=None, inferred_type=DataType.UNKNOWN)
         if isinstance(node, InExpr):
             new_vals = []
@@ -329,40 +341,42 @@ class SimplePlanner:
                 if isinstance(v, SubqueryExpr):
                     result = self.execute(v.query, catalog)
                     for row in result.rows:
-                        val = row[0]
                         dt = result.column_types[0] if result.column_types else DataType.INT
-                        new_vals.append(Literal(value=val, inferred_type=dt))
+                        new_vals.append(Literal(value=row[0], inferred_type=dt))
                 else:
                     new_vals.append(v)
-            return dataclasses.replace(node, values=new_vals,
-                                       expr=self._resolve_sq_node(node.expr, catalog))
+            return dataclasses.replace(
+                node, values=new_vals, expr=self._resolve_sq(node.expr, catalog))
         if isinstance(node, ExistsExpr):
             result = self.execute(node.query, catalog)
             exists = len(result.rows) > 0
             val = not exists if node.negated else exists
             return Literal(value=val, inferred_type=DataType.BOOLEAN)
         if isinstance(node, tuple):
-            return tuple(self._resolve_sq_node(i, catalog) for i in node)
+            return tuple(self._resolve_sq(i, catalog) for i in node)
         if not dataclasses.is_dataclass(node) or isinstance(node, type):
             return node
         changes: dict = {}
         for f in dataclasses.fields(node):
             child = getattr(node, f.name)
             if isinstance(child, list):
-                changes[f.name] = [self._resolve_sq_node(i, catalog) for i in child]
+                changes[f.name] = [self._resolve_sq(i, catalog) for i in child]
             elif isinstance(child, tuple):
-                changes[f.name] = tuple(self._resolve_sq_node(i, catalog) for i in child)
+                changes[f.name] = tuple(self._resolve_sq(i, catalog) for i in child)
             elif dataclasses.is_dataclass(child) and not isinstance(child, type):
-                changes[f.name] = self._resolve_sq_node(child, catalog)
+                changes[f.name] = self._resolve_sq(child, catalog)
         return dataclasses.replace(node, **changes) if changes else node
 
-    # ═══ Plan builders ═══
+    # ══════════════════════════════════════════════════════════════
+    # Plan builders
+    # ══════════════════════════════════════════════════════════════
     def _plan_select(self, ast: SelectStmt, catalog: Catalog) -> Operator:
         c = self._build_source(ast, catalog)
         if ast.where:
             c = FilterOperator(c, ast.where)
         if ast.order_by:
-            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
+            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls)
+                                  for sk in ast.order_by])
         c = ProjectOperator(c, self._build_proj(ast))
         if ast.distinct:
             c = DistinctOperator(c)
@@ -385,7 +399,8 @@ class SimplePlanner:
             inner = subst.expr if isinstance(subst, AliasExpr) else subst
             proj.append((name, inner))
         if ast.order_by:
-            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
+            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls)
+                                  for sk in ast.order_by])
         c = ProjectOperator(c, proj)
         if ast.distinct:
             c = DistinctOperator(c)
@@ -395,7 +410,6 @@ class SimplePlanner:
         return c
 
     def _plan_grouped(self, ast: SelectStmt, catalog: Catalog) -> Operator:
-        """Always returns an Operator (never ExecutionResult)."""
         source = self._build_source(ast, catalog)
         if ast.where:
             source = FilterOperator(source, ast.where)
@@ -414,25 +428,27 @@ class SimplePlanner:
         if not ge and not ae:
             return self._plan_select(ast, catalog)
 
-        # Scalar aggregate (no GROUP BY) — wrap as Operator
+        # Scalar aggregate (no GROUP BY)
         if not ge:
-            batch = self._compute_scalar_agg(source, scan_schema, agg_map, substituted, ast)
-            c: Operator = _ScalarAggOperator(batch)
-            return c
+            batch = self._compute_scalar_agg(source, scan_schema, agg_map,
+                                             substituted, ast)
+            return _ScalarAggOperator(batch)
 
         # Handle COUNT(DISTINCT)
         final_ae = []
         for temp, ac in ae:
             if ac.distinct and ac.name.upper() == 'COUNT':
-                final_ae.append((temp, AggregateCall(name='COUNT_DISTINCT', args=ac.args)))
+                final_ae.append((temp, AggregateCall(name='COUNT_DISTINCT',
+                                                      args=ac.args)))
             else:
                 final_ae.append((temp, ac))
 
-        c = HashAggOperator(source, ge, final_ae, self._registry)
+        c: Operator = HashAggOperator(source, ge, final_ae, self._registry)
         if having_subst is not None:
             c = FilterOperator(c, having_subst)
         if ast.order_by:
-            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
+            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls)
+                                  for sk in ast.order_by])
         fp = [(self._out_name(o), (s.expr if isinstance(s, AliasExpr) else s))
               for o, s in zip(ast.select_list, substituted)]
         c = ProjectOperator(c, fp)
@@ -443,10 +459,10 @@ class SimplePlanner:
                               self._eval_const(ast.offset) or 0)
         return c
 
-    def _compute_scalar_agg(self, source: Operator, scan_schema: Dict[str, DataType],
-                            agg_map: Dict[str, AggregateCall], substituted: list,
-                            ast: Any) -> VectorBatch:
-        """Run scalar aggregate and return a single-row VectorBatch."""
+    def _compute_scalar_agg(self, source: Operator,
+                            scan_schema: Dict[str, DataType],
+                            agg_map: Dict[str, AggregateCall],
+                            substituted: list, ast: Any) -> VectorBatch:
         agg_states: Dict[str, tuple] = {}
         for temp, ac in agg_map.items():
             name = ac.name.upper()
@@ -465,8 +481,10 @@ class SimplePlanner:
                 if ac.args and isinstance(ac.args[0], StarExpr):
                     state = func.update(state, None, batch.row_count)
                 else:
-                    state = func.update(state, self._evaluator.evaluate(ac.args[0], batch),
-                                        batch.row_count)
+                    state = func.update(
+                        state,
+                        self._evaluator.evaluate(ac.args[0], batch),
+                        batch.row_count)
                 agg_states[temp] = (func, state)
         source.close()
 
@@ -487,20 +505,16 @@ class SimplePlanner:
             name = self._out_name(orig)
             rc[name] = self._evaluator.evaluate(subst, sb)
             on.append(name)
-
         return VectorBatch(columns=rc, _column_order=on, _row_count=1)
 
-    # ═══ Source ═══
+    # ══════════════════════════════════════════════════════════════
+    # Source
+    # ══════════════════════════════════════════════════════════════
     def _build_source(self, ast: SelectStmt, catalog: Catalog) -> Operator:
         if ast.from_clause is None:
             return DualScan()
-        # Check for GENERATE_SERIES table function
         fc = ast.from_clause
         tref = fc.table
-        if tref.name == 'generate_series' and tref.subquery is None:
-            # Parse args from the select context — treat as special table
-            # For now, detect via FunctionCall in FROM (not standard SQL)
-            pass
         if tref.subquery:
             return self._plan_any(tref.subquery, catalog)
         has_join = bool(fc.joins)
@@ -517,16 +531,18 @@ class SimplePlanner:
                     right_op = self._plan_any(jc.table.subquery, catalog)
                     rq = jc.table.alias or '__sub'
                     rs = right_op.output_schema()
-                    right_proj = [(f"{rq}.{n}", ColumnRef(table=None, column=n))
-                                  for n, _ in rs]
-                    right_op = ProjectOperator(right_op, right_proj)
+                    right_op = ProjectOperator(
+                        right_op,
+                        [(f"{rq}.{n}", ColumnRef(table=None, column=n))
+                         for n, _ in rs])
                 else:
                     rq = jc.table.alias or jc.table.name
                     r_store = catalog.get_store(jc.table.name)
                     r_cols = [c.name for c in r_store.schema.columns]
                     right_op = ProjectOperator(
                         SeqScan(jc.table.name, r_store, r_cols),
-                        [(f"{rq}.{c}", ColumnRef(table=None, column=c)) for c in r_cols])
+                        [(f"{rq}.{c}", ColumnRef(table=None, column=c))
+                         for c in r_cols])
                 if jc.join_type == 'CROSS':
                     cur = CrossJoinOperator(cur, right_op)
                 else:
@@ -540,7 +556,9 @@ class SimplePlanner:
                 ordered = [st.schema.columns[0].name]
             return SeqScan(tref.name, st, ordered)
 
-    # ═══ Extraction helpers ═══
+    # ══════════════════════════════════════════════════════════════
+    # Extraction helpers
+    # ══════════════════════════════════════════════════════════════
     def _extract_aggs(self, expr: Any, agg_map: Dict[str, AggregateCall]) -> Any:
         if expr is None:
             return None
@@ -549,7 +567,8 @@ class SimplePlanner:
             agg_map[t] = expr
             return ColumnRef(table=None, column=t)
         if isinstance(expr, AliasExpr):
-            return AliasExpr(expr=self._extract_aggs(expr.expr, agg_map), alias=expr.alias)
+            return AliasExpr(
+                expr=self._extract_aggs(expr.expr, agg_map), alias=expr.alias)
         return self._rec_extract(expr, agg_map)
 
     def _rec_extract(self, node: Any, agg_map: Dict) -> Any:
@@ -572,7 +591,8 @@ class SimplePlanner:
                     if isinstance(item, AggregateCall):
                         new_list.append(self._extract_aggs(item, agg_map))
                     elif isinstance(item, tuple):
-                        new_list.append(tuple(self._rec_extract(x, agg_map) for x in item))
+                        new_list.append(
+                            tuple(self._rec_extract(x, agg_map) for x in item))
                     elif dataclasses.is_dataclass(item) and not isinstance(item, type):
                         new_list.append(self._rec_extract(item, agg_map))
                     else:
@@ -584,13 +604,16 @@ class SimplePlanner:
                 ch[f.name] = self._rec_extract(c, agg_map)
         return dataclasses.replace(node, **ch) if ch else node
 
-    def _extract_windows(self, expr: Any, win_map: Dict[str, WindowCall]) -> Any:
+    def _extract_windows(self, expr: Any,
+                         win_map: Dict[str, WindowCall]) -> Any:
         if isinstance(expr, WindowCall):
             t = f'__win_{len(win_map)}'
             win_map[t] = expr
             return ColumnRef(table=None, column=t)
         if isinstance(expr, AliasExpr):
-            return AliasExpr(expr=self._extract_windows(expr.expr, win_map), alias=expr.alias)
+            return AliasExpr(
+                expr=self._extract_windows(expr.expr, win_map),
+                alias=expr.alias)
         if not dataclasses.is_dataclass(expr) or isinstance(expr, type):
             return expr
         ch: dict = {}
@@ -727,4 +750,5 @@ class SimplePlanner:
                 break
             rows.extend(b.to_rows())
         op.close()
-        return ExecutionResult(columns=cn, column_types=ct, rows=rows, row_count=len(rows))
+        return ExecutionResult(columns=cn, column_types=ct,
+                               rows=rows, row_count=len(rows))
