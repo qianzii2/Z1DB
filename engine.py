@@ -1,6 +1,5 @@
 from __future__ import annotations
-"""Z1DB engine — the top-level façade that ties every layer together."""
-
+"""Z1DB engine — top-level façade."""
 from catalog.catalog import Catalog, TableSchema
 from executor.core.result import ExecutionResult
 from executor.functions.registry import FunctionRegistry
@@ -13,8 +12,6 @@ from utils.timer import Timer
 
 
 class Engine:
-    """Public API for the Z1DB database engine."""
-
     def __init__(self, data_dir: str = ':memory:') -> None:
         self._catalog = Catalog(data_dir)
         self._registry = FunctionRegistry()

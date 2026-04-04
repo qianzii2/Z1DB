@@ -1,16 +1,10 @@
 from __future__ import annotations
-"""Abstract Syntax Tree node definitions."""
-
+"""AST node definitions."""
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
-
 from storage.types import DataType
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Statements
-# ═══════════════════════════════════════════════════════════════════════
-
+# ═══ Statements ═══
 @dataclass
 class SelectStmt:
     distinct: bool = False
@@ -26,13 +20,22 @@ class SelectStmt:
     ctes: list = field(default_factory=list)
     sample: Optional[Any] = None
 
-
 @dataclass
 class InsertStmt:
     table: str
     columns: Optional[List[str]] = None
     values: list = field(default_factory=list)
 
+@dataclass
+class UpdateStmt:
+    table: str
+    assignments: list = field(default_factory=list)  # list[Assignment]
+    where: Optional[Any] = None
+
+@dataclass
+class DeleteStmt:
+    table: str
+    where: Optional[Any] = None
 
 @dataclass
 class CreateTableStmt:
@@ -40,35 +43,33 @@ class CreateTableStmt:
     columns: List[ColumnDef] = field(default_factory=list)
     if_not_exists: bool = False
 
-
 @dataclass
 class DropTableStmt:
     table: str
     if_exists: bool = False
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Clauses
-# ═══════════════════════════════════════════════════════════════════════
-
+# ═══ Clauses ═══
 @dataclass
 class FromClause:
     table: TableRef
-    joins: list = field(default_factory=list)
-
+    joins: list = field(default_factory=list)  # list[JoinClause]
 
 @dataclass
 class TableRef:
     name: str
     alias: Optional[str] = None
 
+@dataclass
+class JoinClause:
+    join_type: str = 'INNER'  # INNER, LEFT, RIGHT, CROSS
+    table: Optional[TableRef] = None
+    on: Optional[Any] = None
 
 @dataclass
 class SortKey:
     expr: Any
     direction: str = 'ASC'
     nulls: Optional[str] = None
-
 
 @dataclass
 class ColumnDef:
@@ -77,38 +78,34 @@ class ColumnDef:
     nullable: bool = True
     primary_key: bool = False
 
-
 @dataclass
 class TypeName:
     name: str
     params: List[int] = field(default_factory=list)
 
-
 @dataclass
 class GroupByClause:
     keys: list = field(default_factory=list)
 
+@dataclass
+class Assignment:
+    column: str = ''
+    value: Any = None
 
-# ═══════════════════════════════════════════════════════════════════════
-# Expressions
-# ═══════════════════════════════════════════════════════════════════════
-
+# ═══ Expressions ═══
 @dataclass
 class Literal:
     value: Any
     inferred_type: DataType = DataType.UNKNOWN
-
 
 @dataclass
 class ColumnRef:
     table: Optional[str] = None
     column: str = ''
 
-
 @dataclass
 class StarExpr:
     table: Optional[str] = None
-
 
 @dataclass
 class BinaryExpr:
@@ -116,24 +113,20 @@ class BinaryExpr:
     left: Any = None
     right: Any = None
 
-
 @dataclass
 class UnaryExpr:
     op: str = ''
     operand: Any = None
-
 
 @dataclass
 class IsNullExpr:
     expr: Any = None
     negated: bool = False
 
-
 @dataclass
 class AliasExpr:
     expr: Any = None
     alias: str = ''
-
 
 @dataclass
 class AggregateCall:
@@ -142,8 +135,41 @@ class AggregateCall:
     distinct: bool = False
     filter_clause: Optional[Any] = None
 
-
 @dataclass
 class FunctionCall:
     name: str = ''
     args: list = field(default_factory=list)
+
+@dataclass
+class CaseExpr:
+    operand: Optional[Any] = None
+    when_clauses: list = field(default_factory=list)  # list[(condition, result)]
+    else_expr: Optional[Any] = None
+
+@dataclass
+class CastExpr:
+    expr: Any = None
+    type_name: Optional[TypeName] = None
+
+@dataclass
+class InExpr:
+    expr: Any = None
+    values: list = field(default_factory=list)
+    negated: bool = False
+
+@dataclass
+class BetweenExpr:
+    expr: Any = None
+    low: Any = None
+    high: Any = None
+    negated: bool = False
+
+@dataclass
+class LikeExpr:
+    expr: Any = None
+    pattern: Any = None
+    negated: bool = False
+
+@dataclass
+class SubqueryExpr:
+    query: Any = None

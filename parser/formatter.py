@@ -1,86 +1,58 @@
 from __future__ import annotations
-"""AST expression → SQL text formatter (used for default column names)."""
-
-from parser.ast import (
-    AggregateCall, AliasExpr, BinaryExpr, ColumnRef, FunctionCall,
-    IsNullExpr, Literal, StarExpr, UnaryExpr,
-)
+"""AST → SQL text formatter."""
+from parser.ast import (AggregateCall, AliasExpr, BetweenExpr, BinaryExpr, CaseExpr,
+                         CastExpr, ColumnRef, FunctionCall, InExpr, IsNullExpr,
+                         LikeExpr, Literal, StarExpr, UnaryExpr)
 from parser.precedence import Precedence
 
-# Precedence of binary operators for parenthesisation
-_OP_PREC = {
-    'OR': Precedence.OR, 'AND': Precedence.AND,
-    '=': Precedence.COMPARISON, '!=': Precedence.COMPARISON,
-    '<': Precedence.COMPARISON, '>': Precedence.COMPARISON,
-    '<=': Precedence.COMPARISON, '>=': Precedence.COMPARISON,
-    '||': Precedence.CONCAT,
-    '+': Precedence.ADDITION, '-': Precedence.ADDITION,
-    '*': Precedence.MULTIPLY, '/': Precedence.MULTIPLY, '%': Precedence.MULTIPLY,
-}
-
+_OP_PREC = {'OR':1,'AND':2,'=':4,'!=':4,'<':4,'>':4,'<=':4,'>=':4,
+            '||':5,'+':6,'-':6,'*':7,'/':7,'%':7}
 
 class Formatter:
-    """Converts AST expression nodes back into SQL text."""
-
     @staticmethod
     def expr_to_sql(expr: object) -> str:
         return Formatter._fmt(expr, 0)
 
     @staticmethod
-    def _fmt(node: object, parent_prec: int) -> str:
-        if isinstance(node, ColumnRef):
-            if node.table:
-                return f"{node.table}.{node.column}"
-            return node.column
-
-        if isinstance(node, Literal):
-            if node.value is None:
-                return 'NULL'
-            if isinstance(node.value, bool):
-                return 'TRUE' if node.value else 'FALSE'
-            if isinstance(node.value, str):
-                escaped = node.value.replace("'", "''")
-                return f"'{escaped}'"
-            return str(node.value)
-
-        if isinstance(node, BinaryExpr):
-            prec = _OP_PREC.get(node.op, 0)
-            left_s = Formatter._fmt(node.left, prec)
-            right_s = Formatter._fmt(node.right, prec)
-            result = f"{left_s} {node.op} {right_s}"
-            if prec < parent_prec:
-                result = f"({result})"
-            return result
-
-        if isinstance(node, UnaryExpr):
-            operand_s = Formatter._fmt(node.operand, Precedence.UNARY)
-            if node.op == 'NOT':
-                return f"NOT {operand_s}"
-            return f"{node.op}{operand_s}"
-
-        if isinstance(node, AggregateCall):
-            if node.args and isinstance(node.args[0], StarExpr):
-                return f"{node.name}(*)"
-            args_s = ', '.join(Formatter._fmt(a, 0) for a in node.args)
-            distinct_s = 'DISTINCT ' if node.distinct else ''
-            return f"{node.name}({distinct_s}{args_s})"
-
-        if isinstance(node, FunctionCall):
-            args_s = ', '.join(Formatter._fmt(a, 0) for a in node.args)
-            return f"{node.name}({args_s})"
-
-        if isinstance(node, IsNullExpr):
-            inner = Formatter._fmt(node.expr, 0)
-            if node.negated:
-                return f"{inner} IS NOT NULL"
-            return f"{inner} IS NULL"
-
-        if isinstance(node, AliasExpr):
-            return Formatter._fmt(node.expr, parent_prec)
-
-        if isinstance(node, StarExpr):
-            if node.table:
-                return f"{node.table}.*"
-            return '*'
-
-        return str(node)
+    def _fmt(n: object, pp: int) -> str:
+        if isinstance(n, ColumnRef):
+            return f"{n.table}.{n.column}" if n.table else n.column
+        if isinstance(n, Literal):
+            if n.value is None: return 'NULL'
+            if isinstance(n.value, bool): return 'TRUE' if n.value else 'FALSE'
+            if isinstance(n.value, str): return f"'{n.value}'"
+            return str(n.value)
+        if isinstance(n, BinaryExpr):
+            p = _OP_PREC.get(n.op, 0)
+            s = f"{Formatter._fmt(n.left, p)} {n.op} {Formatter._fmt(n.right, p)}"
+            return f"({s})" if p < pp else s
+        if isinstance(n, UnaryExpr):
+            o = Formatter._fmt(n.operand, Precedence.UNARY)
+            return f"NOT {o}" if n.op == 'NOT' else f"{n.op}{o}"
+        if isinstance(n, AggregateCall):
+            if n.args and isinstance(n.args[0], StarExpr): return f"{n.name}(*)"
+            a = ', '.join(Formatter._fmt(x, 0) for x in n.args)
+            d = 'DISTINCT ' if n.distinct else ''
+            return f"{n.name}({d}{a})"
+        if isinstance(n, FunctionCall):
+            a = ', '.join(Formatter._fmt(x, 0) for x in n.args)
+            return f"{n.name}({a})"
+        if isinstance(n, IsNullExpr):
+            i = Formatter._fmt(n.expr, 0)
+            return f"{i} IS NOT NULL" if n.negated else f"{i} IS NULL"
+        if isinstance(n, AliasExpr): return Formatter._fmt(n.expr, pp)
+        if isinstance(n, StarExpr): return f"{n.table}.*" if n.table else '*'
+        if isinstance(n, CaseExpr): return 'CASE ... END'
+        if isinstance(n, CastExpr):
+            return f"CAST({Formatter._fmt(n.expr, 0)} AS {n.type_name.name if n.type_name else '?'})"
+        if isinstance(n, InExpr):
+            vs = ', '.join(Formatter._fmt(v, 0) for v in n.values)
+            neg = ' NOT' if n.negated else ''
+            return f"{Formatter._fmt(n.expr, 0)}{neg} IN ({vs})"
+        if isinstance(n, BetweenExpr):
+            neg = ' NOT' if n.negated else ''
+            return f"{Formatter._fmt(n.expr, 0)}{neg} BETWEEN {Formatter._fmt(n.low, 0)} AND {Formatter._fmt(n.high, 0)}"
+        if isinstance(n, LikeExpr):
+            neg = ' NOT' if n.negated else ''
+            return f"{Formatter._fmt(n.expr, 0)}{neg} LIKE {Formatter._fmt(n.pattern, 0)}"
+        return str(n)
