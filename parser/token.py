@@ -1,7 +1,8 @@
 from __future__ import annotations
-"""Token types and Token dataclass."""
+"""Token类型和Token数据类。"""
 from dataclasses import dataclass
 from enum import Enum
+
 
 class TokenType(Enum):
     SELECT='SELECT';FROM='FROM';WHERE='WHERE'
@@ -15,7 +16,7 @@ class TokenType(Enum):
     NULLS='NULLS';FIRST='FIRST';LAST='LAST'
     PRIMARY='PRIMARY';KEY='KEY'
     GROUP='GROUP';HAVING='HAVING';DISTINCT='DISTINCT'
-    JOIN='JOIN';ON='ON'
+    JOIN='JOIN';ON='ON';USING='USING';NATURAL='NATURAL'
     INNER='INNER';LEFT='LEFT';RIGHT='RIGHT';FULL='FULL';OUTER='OUTER';CROSS='CROSS'
     UPDATE='UPDATE';DELETE='DELETE';SET='SET'
     CASE='CASE';WHEN='WHEN';THEN='THEN';ELSE='ELSE';END='END'
@@ -25,6 +26,7 @@ class TokenType(Enum):
     UNBOUNDED='UNBOUNDED';PRECEDING='PRECEDING';FOLLOWING='FOLLOWING'
     CURRENT='CURRENT';ROW='ROW'
     EXPLAIN='EXPLAIN';ALTER='ALTER';ADD='ADD';COLUMN='COLUMN';RENAME='RENAME';TO='TO'
+    INDEX='INDEX';UNIQUE='UNIQUE'
     INT='INT';INTEGER='INTEGER';BIGINT='BIGINT'
     FLOAT_KW='FLOAT';DOUBLE='DOUBLE';REAL='REAL'
     BOOLEAN='BOOLEAN';BOOL='BOOL'
@@ -36,6 +38,7 @@ class TokenType(Enum):
     PIPE_PIPE='||'
     LPAREN='(';RPAREN=')';COMMA=',';DOT='.';SEMICOLON=';'
     EOF='EOF'
+
 
 @dataclass
 class Token:

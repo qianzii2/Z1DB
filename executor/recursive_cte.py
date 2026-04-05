@@ -1,22 +1,6 @@
 from __future__ import annotations
-
-"""Recursive CTE engine — iterative fixpoint with cycle detection.
-
-Algorithm (based on SQL:1999 standard):
-  1. Execute base query → working_table
-  2. Loop:
-     a. Execute recursive query with working_table as CTE reference → new_rows
-     b. If new_rows empty → STOP (fixpoint reached)
-     c. Cycle detection: remove rows already seen (hash-based)
-     d. Append new_rows to result_table
-     e. working_table = new_rows (for next iteration)
-  3. Return result_table
-
-Cycle detection uses Zobrist incremental hashing for O(1) per-row checks.
-Recursion limit prevents infinite loops (default 1000 iterations, 1M rows).
-
-Paper reference: Ghazal et al., "Equivalent Rewriting of Recursive SQL Queries", 2006
-"""
+"""递归CTE引擎 — 不动点迭代+环检测。
+用truncate+重填替代drop+create，避免每次迭代重建表。"""
 from typing import Any, Dict, List, Optional, Set, Tuple
 from catalog.catalog import Catalog, ColumnSchema, TableSchema
 from executor.core.result import ExecutionResult
@@ -28,7 +12,7 @@ MAX_ROWS = 1_000_000
 
 
 class RecursiveCTEExecutor:
-    """Executes recursive CTEs with fixpoint iteration and cycle detection."""
+    """执行递归CTE，支持不动点迭代和环检测。"""
 
     def __init__(self, planner: Any, catalog: Catalog) -> None:
         self._planner = planner
@@ -37,36 +21,41 @@ class RecursiveCTEExecutor:
     def execute(self, cte_name: str, base_query: Any, recursive_query: Any,
                 union_all: bool = True,
                 column_names: Optional[List[str]] = None) -> ExecutionResult:
-        # Step 1: Execute base query
+        # 步骤1：执行基础查询
         base_result = self._execute_query(base_query)
         if not base_result.columns:
             return base_result
 
-        # Apply CTE column aliases
+        # 应用CTE列别名
         columns = list(base_result.columns)
         col_types = list(base_result.column_types)
         if column_names and len(column_names) == len(columns):
             columns = list(column_names)
 
-        # Initialize
+        # 初始化
         result_rows: List[list] = [list(r) for r in base_result.rows]
         working_rows: List[list] = [list(r) for r in base_result.rows]
 
-        # Cycle detection
+        # 环检测
         seen_hashes: Set[int] = set()
         if not union_all:
             for row in result_rows:
                 seen_hashes.add(self._row_hash(row))
 
-        # Step 2: Iterative fixpoint
+        # 步骤2：不动点迭代
         iteration = 0
+        table_created = False
         while working_rows and iteration < MAX_ITERATIONS:
             iteration += 1
             if len(result_rows) > MAX_ROWS:
                 raise RecursionLimitError(
-                    f"Recursive CTE exceeded {MAX_ROWS} rows after {iteration} iterations")
+                    f"Recursive CTE exceeded {MAX_ROWS} rows "
+                    f"after {iteration} iterations")
 
-            self._materialize_working_table(cte_name, columns, col_types, working_rows)
+            # 物化工作表（首次create，后续truncate+重填）
+            self._materialize_working_table(
+                cte_name, columns, col_types, working_rows, table_created)
+            table_created = True
 
             try:
                 new_result = self._execute_query(recursive_query)
@@ -92,6 +81,7 @@ class RecursiveCTEExecutor:
             result_rows.extend(new_rows)
             working_rows = new_rows
 
+        # 清理
         self._cleanup(cte_name)
 
         return ExecutionResult(
@@ -101,7 +91,7 @@ class RecursiveCTEExecutor:
             row_count=len(result_rows))
 
     def _execute_query(self, query: Any) -> ExecutionResult:
-        """Execute a query AST through the planner."""
+        """通过planner执行查询AST。"""
         from parser.resolver import Resolver
         from parser.validator import Validator
         try:
@@ -112,15 +102,23 @@ class RecursiveCTEExecutor:
             raise ExecutionError(f"Recursive CTE execution failed: {e}")
 
     def _materialize_working_table(self, name: str, columns: List[str],
-                                   col_types: list, rows: List[list]) -> None:
-        """Create/replace a temporary table with the working set."""
-        if self._catalog.table_exists(name):
-            self._catalog.drop_table(name)
-        cols = [ColumnSchema(name=cn, dtype=ct, nullable=True)
-                for cn, ct in zip(columns, col_types)]
-        schema = TableSchema(name=name, columns=cols)
-        self._catalog.create_table(schema)
-        store = self._catalog.get_store(name)
+                                   col_types: list, rows: List[list],
+                                   already_exists: bool) -> None:
+        """物化工作表。已存在时truncate重填，不存在时create。"""
+        if already_exists and self._catalog.table_exists(name):
+            # 直接清空重填，避免drop+create开销
+            store = self._catalog.get_store(name)
+            store.truncate()
+        else:
+            # 首次创建
+            if self._catalog.table_exists(name):
+                self._catalog.drop_table(name)
+            cols = [ColumnSchema(name=cn, dtype=ct, nullable=True)
+                    for cn, ct in zip(columns, col_types)]
+            schema = TableSchema(name=name, columns=cols)
+            self._catalog.create_table(schema)
+            store = self._catalog.get_store(name)
+        # 填充数据
         for row in rows:
             store.append_row(list(row))
 
@@ -133,18 +131,22 @@ class RecursiveCTEExecutor:
 
     @staticmethod
     def _row_hash(row: list) -> int:
-        """Hash a row for cycle detection. Uses murmur3 for speed."""
+        """行哈希，用于环检测。使用长度前缀编码避免分隔符碰撞。"""
+        import struct
         parts = []
         for val in row:
             if val is None:
-                parts.append(b'\x00')
+                parts.append(b'\x00\x00\x00\x00')  # 4字节NULL标记
             elif isinstance(val, int):
-                parts.append(val.to_bytes(8, 'little', signed=True))
+                parts.append(b'\x01' + val.to_bytes(8, 'little', signed=True))
             elif isinstance(val, float):
-                import struct
-                parts.append(struct.pack('d', val))
+                parts.append(b'\x02' + struct.pack('d', val))
             elif isinstance(val, str):
-                parts.append(val.encode('utf-8'))
+                encoded = val.encode('utf-8')
+                parts.append(b'\x03' + len(encoded).to_bytes(4, 'little')
+                             + encoded)
             else:
-                parts.append(str(val).encode('utf-8'))
-        return murmur3_64(b'|'.join(parts))
+                encoded = str(val).encode('utf-8')
+                parts.append(b'\x04' + len(encoded).to_bytes(4, 'little')
+                             + encoded)
+        return murmur3_64(b''.join(parts))

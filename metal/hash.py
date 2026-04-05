@@ -1,45 +1,41 @@
 from __future__ import annotations
-"""Hash functions: murmur3, fibonacci, combiners."""
-
+"""哈希函数：高质量blake2b替代伪MurmurHash，fibonacci，combiners。"""
+import hashlib
+import struct
 from metal.config import NULL_HASH_SENTINEL
 
 
-def _to_bytes(key: bytes) -> bytes:
-    if isinstance(key, (bytearray, memoryview)):
-        return bytes(key)
-    return key
-
-
 def murmur3_64(key: bytes, seed: int = 0) -> int:
-    """MurmurHash3 finalizer-style 64-bit hash."""
-    key = _to_bytes(key)
-    h = seed & 0xFFFFFFFFFFFFFFFF
-    for b in key:
-        h ^= b
-        h = (h * 0x5bd1e9955bd1e995) & 0xFFFFFFFFFFFFFFFF
-        h ^= h >> 47
-    h = (h * 0x5bd1e9955bd1e995) & 0xFFFFFFFFFFFFFFFF
-    h ^= h >> 47
-    return h
+    """高质量64位哈希。使用blake2b（比手写逐字节MurmurHash快且分布更好）。"""
+    if isinstance(key, (bytearray, memoryview)):
+        key = bytes(key)
+    seed_bytes = (seed & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little')
+    h = hashlib.blake2b(key, digest_size=8, key=seed_bytes).digest()
+    return int.from_bytes(h, 'little')
 
 
 def murmur3_128(key: bytes, seed: int = 0) -> tuple[int, int]:
-    h1 = murmur3_64(key, seed)
-    h2 = murmur3_64(key, seed ^ 0x9E3779B97F4A7C15)
-    return (h1, h2)
+    """128位哈希，返回(h1, h2)。"""
+    if isinstance(key, (bytearray, memoryview)):
+        key = bytes(key)
+    seed_bytes = (seed & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little')
+    h = hashlib.blake2b(key, digest_size=16, key=seed_bytes).digest()
+    return (int.from_bytes(h[:8], 'little'), int.from_bytes(h[8:], 'little'))
 
 
 def fibonacci_hash(key: int, shift: int) -> int:
+    """Fibonacci哈希（乘法哈希）。"""
     return ((key * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF) >> shift
 
 
 def hash_combine(h1: int, h2: int) -> int:
+    """组合两个哈希值。"""
     h1 ^= h2 + 0x9E3779B97F4A7C15 + (h1 << 6) + (h1 >> 2)
     return h1 & 0xFFFFFFFFFFFFFFFF
 
 
-def hash_value(val: object, dtype_code: str) -> int:
-    """Hash a typed value. None → NULL_HASH_SENTINEL."""
+def hash_value(val: object, dtype_code: str = '') -> int:
+    """对类型值做哈希。None → NULL_HASH_SENTINEL。"""
     if val is None:
         return NULL_HASH_SENTINEL
     if isinstance(val, bool):
@@ -47,8 +43,9 @@ def hash_value(val: object, dtype_code: str) -> int:
     if isinstance(val, int):
         return murmur3_64(val.to_bytes(8, 'little', signed=True))
     if isinstance(val, float):
-        import struct
         return murmur3_64(struct.pack('<d', val))
     if isinstance(val, str):
         return murmur3_64(val.encode('utf-8'))
+    if isinstance(val, bytes):
+        return murmur3_64(val)
     return murmur3_64(str(val).encode('utf-8'))

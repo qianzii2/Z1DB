@@ -1,14 +1,12 @@
 from __future__ import annotations
-"""Loser Tree — K-way merge in O(n log K). Better branch prediction than heap.
-Used for External Sort K-way merge and UNION ALL ordered merge."""
+"""败者树 — K路归并O(n log K)。修正_replay为真正的O(log K)沿树上行。"""
 from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 _SENTINEL = object()
 
 
 class LoserTree:
-    """K-way merge using a tournament (loser) tree.
-    Each pop_winner() costs O(log K) comparisons."""
+    """K路归并败者树。每次pop_winner()代价O(log K)。"""
 
     __slots__ = ('_k', '_tree', '_leaves', '_sources', '_key_fn',
                  '_exhausted', '_winner')
@@ -18,81 +16,92 @@ class LoserTree:
         self._k = len(sources)
         self._sources = sources
         self._key_fn = key_fn
-        self._tree = [0] * self._k  # internal nodes store loser index
+        self._tree: List[int] = [0] * self._k
         self._leaves: List[Any] = [_SENTINEL] * self._k
         self._exhausted = [False] * self._k
         self._winner = 0
         self._init()
 
     def _init(self) -> None:
-        # Fill leaves from sources
+        # 从每个源读取首元素
         for i in range(self._k):
             val = next(self._sources[i], _SENTINEL)
             self._leaves[i] = val
             if val is _SENTINEL:
                 self._exhausted[i] = True
-        # Build tree from leaves
+
         if self._k <= 1:
             self._winner = 0
             return
-        # Initialize all internal nodes to 0
+
+        # 初始化内部节点（全设为0）
         self._tree = [0] * self._k
-        # Play initial tournament
+
+        # 逐个"比赛"建树
         winner = 0
         for i in range(1, self._k):
             if self._is_less(i, winner):
-                self._tree[self._parent(i)] = winner
+                self._tree[i] = winner  # loser存入树节点
                 winner = i
             else:
-                self._tree[self._parent(i)] = i
+                self._tree[i] = i
+        # 最终winner不存入树，单独记录
         self._winner = winner
 
-    def _parent(self, i: int) -> int:
-        return (i + self._k) // 2 if self._k > 1 else 0
-
     def _is_less(self, i: int, j: int) -> bool:
-        """True if leaf i should come before leaf j."""
+        """i是否应排在j前面。"""
         if self._exhausted[i]:
             return False
         if self._exhausted[j]:
             return True
-        return self._key_fn(self._leaves[i]) <= self._key_fn(self._leaves[j])
+        try:
+            return self._key_fn(self._leaves[i]) <= self._key_fn(
+                self._leaves[j])
+        except TypeError:
+            return str(self._leaves[i]) <= str(self._leaves[j])
 
     def pop_winner(self) -> Optional[Tuple[Any, int]]:
-        """Pop the current minimum value. Returns (value, source_index) or None."""
+        """弹出当前最小值。返回(value, source_index)或None。"""
         wi = self._winner
         if self._exhausted[wi]:
             return None
         value = self._leaves[wi]
         source_idx = wi
 
-        # Advance the winner's source
+        # 推进winner的源
         next_val = next(self._sources[wi], _SENTINEL)
         if next_val is _SENTINEL:
             self._exhausted[wi] = True
         self._leaves[wi] = next_val
 
-        # Replay from winner leaf to root
+        # 沿树上行重赛 — 真正的O(log K)
         self._replay(wi)
         return (value, source_idx)
 
     def _replay(self, idx: int) -> None:
-        """Replay tournament from leaf idx upward. O(log K)."""
+        """从叶子idx向上重赛。O(log K)。"""
+        if self._k <= 1:
+            self._winner = 0
+            return
+
         winner = idx
-        # Simple replay: re-find winner among all
-        # For small K this is efficient enough
-        best = -1
-        for i in range(self._k):
-            if not self._exhausted[i]:
-                if best == -1 or self._is_less(i, best):
-                    best = i
-        self._winner = best if best != -1 else 0
+        # 从叶子位置向根遍历
+        pos = (idx + self._k) // 2  # 父节点位置
+        while pos > 0 and pos < self._k:
+            loser_idx = self._tree[pos]
+            if self._is_less(loser_idx, winner):
+                # loser赢了当前winner → 交换
+                self._tree[pos] = winner
+                winner = loser_idx
+            pos //= 2
+
+        self._winner = winner
 
     def is_exhausted(self) -> bool:
         return all(self._exhausted)
 
     def merge_all(self) -> List[Any]:
-        """Drain all sources into a sorted list."""
+        """排空所有源到有序列表。"""
         result = []
         while True:
             item = self.pop_winner()

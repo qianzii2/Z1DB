@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""AST node definitions."""
+"""AST节点定义。"""
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 from storage.types import DataType
@@ -21,38 +21,37 @@ class SelectStmt:
 
 @dataclass
 class SetOperationStmt:
-    op: str = 'UNION'
-    all: bool = False
-    left: Any = None
-    right: Any = None
+    op: str = 'UNION'; all: bool = False; left: Any = None; right: Any = None
 
 @dataclass
 class InsertStmt:
-    table: str = ''
-    columns: Optional[List[str]] = None
-    values: list = field(default_factory=list)
+    table: str = ''; columns: Optional[List[str]] = None
+    values: list = field(default_factory=list); query: Optional[Any] = None
 
 @dataclass
 class UpdateStmt:
-    table: str = ''
-    assignments: list = field(default_factory=list)
-    where: Optional[Any] = None
+    table: str = ''; assignments: list = field(default_factory=list); where: Optional[Any] = None
 
 @dataclass
 class DeleteStmt:
-    table: str = ''
-    where: Optional[Any] = None
+    table: str = ''; where: Optional[Any] = None
 
 @dataclass
 class CreateTableStmt:
-    table: str = ''
-    columns: List[ColumnDef] = field(default_factory=list)
-    if_not_exists: bool = False
+    table: str = ''; columns: List[ColumnDef] = field(default_factory=list); if_not_exists: bool = False
 
 @dataclass
 class DropTableStmt:
-    table: str = ''
-    if_exists: bool = False
+    table: str = ''; if_exists: bool = False
+
+@dataclass
+class CreateIndexStmt:
+    index_name: str = ''; table: str = ''; columns: List[str] = field(default_factory=list)
+    unique: bool = False; if_not_exists: bool = False
+
+@dataclass
+class DropIndexStmt:
+    index_name: str = ''; if_exists: bool = False
 
 @dataclass
 class ExplainStmt:
@@ -60,11 +59,8 @@ class ExplainStmt:
 
 @dataclass
 class AlterTableStmt:
-    table: str = ''
-    action: str = ''       # ADD_COLUMN, DROP_COLUMN, RENAME_COLUMN
-    column_def: Optional[ColumnDef] = None
-    column_name: str = ''
-    new_name: str = ''
+    table: str = ''; action: str = ''; column_def: Optional[ColumnDef] = None
+    column_name: str = ''; new_name: str = ''
 
 @dataclass
 class FromClause:
@@ -73,33 +69,25 @@ class FromClause:
 
 @dataclass
 class TableRef:
-    name: str = ''
-    alias: Optional[str] = None
-    subquery: Optional[Any] = None
+    name: str = ''; alias: Optional[str] = None; subquery: Optional[Any] = None
 
 @dataclass
 class JoinClause:
-    join_type: str = 'INNER'
-    table: Optional[TableRef] = None
-    on: Optional[Any] = None
+    join_type: str = 'INNER'; table: Optional[TableRef] = None
+    on: Optional[Any] = None; using: Optional[List[str]] = None
+    natural: bool = False
 
 @dataclass
 class SortKey:
-    expr: Any = None
-    direction: str = 'ASC'
-    nulls: Optional[str] = None
+    expr: Any = None; direction: str = 'ASC'; nulls: Optional[str] = None
 
 @dataclass
 class ColumnDef:
-    name: str = ''
-    type_name: Optional[TypeName] = None
-    nullable: bool = True
-    primary_key: bool = False
+    name: str = ''; type_name: Optional[TypeName] = None; nullable: bool = True; primary_key: bool = False
 
 @dataclass
 class TypeName:
-    name: str = ''
-    params: List[int] = field(default_factory=list)
+    name: str = ''; params: List[int] = field(default_factory=list)
 
 @dataclass
 class GroupByClause:
@@ -107,18 +95,15 @@ class GroupByClause:
 
 @dataclass
 class Assignment:
-    column: str = ''
-    value: Any = None
+    column: str = ''; value: Any = None
 
 @dataclass
 class Literal:
-    value: Any = None
-    inferred_type: DataType = DataType.UNKNOWN
+    value: Any = None; inferred_type: DataType = DataType.UNKNOWN
 
 @dataclass
 class ColumnRef:
-    table: Optional[str] = None
-    column: str = ''
+    table: Optional[str] = None; column: str = ''
 
 @dataclass
 class StarExpr:
@@ -126,84 +111,62 @@ class StarExpr:
 
 @dataclass
 class BinaryExpr:
-    op: str = ''
-    left: Any = None
-    right: Any = None
+    op: str = ''; left: Any = None; right: Any = None
 
 @dataclass
 class UnaryExpr:
-    op: str = ''
-    operand: Any = None
+    op: str = ''; operand: Any = None
 
 @dataclass
 class IsNullExpr:
-    expr: Any = None
-    negated: bool = False
+    expr: Any = None; negated: bool = False
 
 @dataclass
 class AliasExpr:
-    expr: Any = None
-    alias: str = ''
+    expr: Any = None; alias: str = ''
 
 @dataclass
 class AggregateCall:
-    name: str = ''
-    args: list = field(default_factory=list)
-    distinct: bool = False
-    filter_clause: Optional[Any] = None
+    name: str = ''; args: list = field(default_factory=list)
+    distinct: bool = False; filter_clause: Optional[Any] = None
 
 @dataclass
 class FunctionCall:
-    name: str = ''
-    args: list = field(default_factory=list)
+    name: str = ''; args: list = field(default_factory=list)
 
 @dataclass
 class WindowCall:
-    func: Any = None
-    partition_by: list = field(default_factory=list)
-    order_by: list = field(default_factory=list)
-    frame: Optional[WindowFrame] = None
+    func: Any = None; partition_by: list = field(default_factory=list)
+    order_by: list = field(default_factory=list); frame: Optional[WindowFrame] = None
 
 @dataclass
 class WindowFrame:
-    mode: str = 'ROWS'
-    start: Optional[FrameBound] = None
-    end: Optional[FrameBound] = None
+    mode: str = 'ROWS'; start: Optional[FrameBound] = None; end: Optional[FrameBound] = None
 
 @dataclass
 class FrameBound:
-    type: str = 'CURRENT_ROW'
-    offset: Optional[int] = None
+    type: str = 'CURRENT_ROW'; offset: Optional[int] = None
 
 @dataclass
 class CaseExpr:
-    operand: Optional[Any] = None
-    when_clauses: list = field(default_factory=list)
+    operand: Optional[Any] = None; when_clauses: list = field(default_factory=list)
     else_expr: Optional[Any] = None
 
 @dataclass
 class CastExpr:
-    expr: Any = None
-    type_name: Optional[TypeName] = None
+    expr: Any = None; type_name: Optional[TypeName] = None
 
 @dataclass
 class InExpr:
-    expr: Any = None
-    values: list = field(default_factory=list)
-    negated: bool = False
+    expr: Any = None; values: list = field(default_factory=list); negated: bool = False
 
 @dataclass
 class BetweenExpr:
-    expr: Any = None
-    low: Any = None
-    high: Any = None
-    negated: bool = False
+    expr: Any = None; low: Any = None; high: Any = None; negated: bool = False
 
 @dataclass
 class LikeExpr:
-    expr: Any = None
-    pattern: Any = None
-    negated: bool = False
+    expr: Any = None; pattern: Any = None; negated: bool = False
 
 @dataclass
 class SubqueryExpr:
@@ -211,5 +174,4 @@ class SubqueryExpr:
 
 @dataclass
 class ExistsExpr:
-    query: Any = None
-    negated: bool = False
+    query: Any = None; negated: bool = False

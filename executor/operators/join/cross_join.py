@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Cross join operator."""
+"""笛卡尔积连接。"""
 from typing import Any, Dict, List, Optional, Tuple
 from executor.core.batch import VectorBatch
 from executor.core.operator import Operator
@@ -7,7 +7,7 @@ from storage.types import DataType
 
 
 class CrossJoinOperator(Operator):
-    """Cartesian product of left × right."""
+    """左表 × 右表的笛卡尔积。"""
 
     def __init__(self, left: Operator, right: Operator) -> None:
         super().__init__()
@@ -23,19 +23,22 @@ class CrossJoinOperator(Operator):
     def open(self) -> None:
         self.left.open()
         self.right.open()
+
+        # 物化右表
         right_rows: list = []
-        r_names = [n for n, _ in self.right.output_schema()]
         while True:
-            b = self.right.next_batch()
+            b = self._ensure_batch(self.right.next_batch())
             if b is None:
                 break
             for i in range(b.row_count):
-                right_rows.append([b.columns[n].get(i) for n in b.column_names])
+                right_rows.append(
+                    [b.columns[n].get(i) for n in b.column_names])
         self.right.close()
 
+        # 逐左行 × 全部右行
         self._result_rows = []
         while True:
-            lb = self.left.next_batch()
+            lb = self._ensure_batch(self.left.next_batch())
             if lb is None:
                 break
             for li in range(lb.row_count):

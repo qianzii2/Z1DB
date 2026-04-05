@@ -1,8 +1,8 @@
 from __future__ import annotations
-
-"""Integrated planner — bridges ALL components into the execution path.
-This is the brain of Z1DB. Every optimization decision flows through here."""
+"""集成规划器 — 全部组件接入执行路径。
+DPccp多表JOIN + MicroAdaptive策略 + Pipeline Fuser + Morsel并行 + RuntimeOptimizer。"""
 import dataclasses
+import functools
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -14,13 +14,11 @@ from executor.core.vector import DataVector
 from executor.expression.evaluator import ExpressionEvaluator
 from executor.functions.registry import FunctionRegistry
 from executor.simple_planner import SimplePlanner, _ScalarAggOperator
-
-# Operators
 from executor.operators.agg.hash_agg import HashAggOperator
 from executor.operators.distinct import DistinctOperator
 from executor.operators.filter import FilterOperator
 from executor.operators.join.cross_join import CrossJoinOperator
-from executor.operators.join.hash_join import HashJoinOperator
+from executor.operators.join.hash_join import HashJoinOperator, extract_equi_keys
 from executor.operators.limit import LimitOperator
 from executor.operators.project import ProjectOperator
 from executor.operators.scan.seq_scan import SeqScan
@@ -29,458 +27,455 @@ from executor.operators.set_ops import UnionOperator, IntersectOperator, ExceptO
 from executor.operators.sort.in_memory_sort import SortOperator
 from executor.operators.window.window_op import WindowOperator
 
-# Advanced operators
 try:
     from executor.operators.sort.top_n import TopNOperator
-
     _HAS_TOPN = True
 except ImportError:
     _HAS_TOPN = False
-
 try:
     from executor.operators.join.nested_loop_join import NestedLoopJoinOperator
-
     _HAS_NL = True
 except ImportError:
     _HAS_NL = False
-
-try:
-    from executor.operators.join.sort_merge_join import SortMergeJoinOperator
-
-    _HAS_SMJ = True
-except ImportError:
-    _HAS_SMJ = False
-
 try:
     from executor.operators.join.radix_join import RadixJoinOperator
-
     _HAS_RADIX = True
 except ImportError:
     _HAS_RADIX = False
-
 try:
     from executor.operators.join.grace_join import GraceHashJoinOperator
-
     _HAS_GRACE = True
 except ImportError:
     _HAS_GRACE = False
-
 try:
     from executor.operators.scan.parallel_scan import ParallelScanOperator
-
     _HAS_PARALLEL = True
 except ImportError:
     _HAS_PARALLEL = False
-
 try:
     from executor.operators.scan.zone_map_scan import ZoneMapScanOperator
-
     _HAS_ZONEMAP_SCAN = True
 except ImportError:
     _HAS_ZONEMAP_SCAN = False
-
 try:
     from executor.codegen.compiler import ExprCompiler
     from executor.codegen.cache import CompileCache
-
     _HAS_JIT = True
 except ImportError:
     _HAS_JIT = False
-
 try:
-    from executor.adaptive.micro_engine import MicroAdaptiveEngine
-
-    _HAS_ADAPTIVE = True
-except ImportError:
-    _HAS_ADAPTIVE = False
-
-try:
-    from planner.cost_model import CostModel
+    from planner.cost_model import CostModel, CostEstimate
     from planner.cardinality import CardinalityEstimator
-    from planner.rules import PredicateReorder, TopNPushdown
-
+    from planner.rules import PredicateReorder, PredicatePushdown, TopNPushdown
     _HAS_PLANNER = True
 except ImportError:
     _HAS_PLANNER = False
+try:
+    from planner.join_reorder import JoinGraph, DPccp
+    _HAS_DPCCP = True
+except ImportError:
+    _HAS_DPCCP = False
+try:
+    from executor.adaptive.micro_engine import MicroAdaptiveEngine
+    from executor.adaptive.strategy import StrategySelector
+    _HAS_ADAPTIVE = True
+except ImportError:
+    _HAS_ADAPTIVE = False
+try:
+    from executor.pipeline.fuser import try_fuse
+    _HAS_FUSER = True
+except ImportError:
+    _HAS_FUSER = False
+try:
+    from planner.runtime_optimizer import RuntimeOptimizer
+    _HAS_RUNTIME_OPT = True
+except ImportError:
+    _HAS_RUNTIME_OPT = False
 
 from parser.ast import *
-from parser.formatter import Formatter
 from storage.types import DataType, resolve_type_name
 from metal.config import NANO_THRESHOLD, MICRO_THRESHOLD, STANDARD_THRESHOLD
-from utils.errors import (ColumnNotFoundError, ExecutionError, NumericOverflowError)
+from utils.errors import ExecutionError
 
 
 class IntegratedPlanner:
-    """The unified execution engine that uses ALL available optimizations.
-
-    Decision flow:
-    1. Analyze query shape + table sizes
-    2. Select execution tier (NANO/MICRO/STD/TURBO)
-    3. For STD+: apply cost-based optimization
-    4. Build operator tree with best algorithms
-    5. Enable JIT for hot paths
-    6. Monitor runtime, adapt if needed
-    """
-
     def __init__(self, function_registry: FunctionRegistry) -> None:
         self._registry = function_registry
         self._evaluator = ExpressionEvaluator(function_registry)
-        self._simple = SimplePlanner(function_registry)  # Fallback
+        self._simple = SimplePlanner(function_registry)
         self._compile_cache = CompileCache() if _HAS_JIT else None
-        self._execution_count: Dict[str, int] = {}  # query_hash → count
-        self._stats: Dict[str, Any] = {}  # table → TableStatistics
+        self._execution_count: Dict[str, int] = {}
+        self._stats: Dict[str, Any] = {}
+        self._rt_opt = RuntimeOptimizer() if _HAS_RUNTIME_OPT else None
 
     def execute(self, ast: Any, catalog: Catalog) -> ExecutionResult:
-        """Main entry point — routes to optimal execution path."""
-        # Non-SELECT: delegate to simple planner
         if not isinstance(ast, SelectStmt):
             return self._simple.execute(ast, catalog)
 
-        # Determine data scale
         row_count = self._estimate_total_rows(ast, catalog)
         tier = self._select_tier(row_count)
-
-        # Track query for JIT decisions
         query_key = repr(ast)[:200]
         self._execution_count[query_key] = self._execution_count.get(query_key, 0) + 1
         exec_count = self._execution_count[query_key]
 
-        # NANO path: skip all overhead
+        # NANO路径
         if tier == 'NANO' and not self._has_complex_features(ast):
             return self._exec_nano(ast, catalog)
 
-        # Apply AST-level optimizations
+        # AST级优化
         if _HAS_PLANNER:
+            ast = PredicatePushdown.apply(ast)
             ast = PredicateReorder.apply(ast)
 
-        # Build optimized operator tree
+        # MICRO路径：尝试Pipeline Fuser
+        if tier == 'MICRO' and _HAS_FUSER:
+            fused = self._try_fuse(ast, catalog)
+            if fused is not None:
+                return self._drain(fused)
+
         try:
             op = self._build_optimized_plan(ast, catalog, tier, exec_count)
             return self._drain_with_monitoring(op, tier)
         except Exception:
-            # Fallback to simple planner
             return self._simple.execute(ast, catalog)
 
-    # ══════════════════════════════════════════════════════════════
-    # Tier selection
-    # ══════════════════════════════════════════════════════════════
-
+    # ══════════════════════════════════════════════════════════
     def _estimate_total_rows(self, ast: SelectStmt, catalog: Catalog) -> int:
         if ast.from_clause is None:
             return 1
         tname = ast.from_clause.table.name
         if catalog.table_exists(tname):
             return catalog.get_store(tname).row_count
-        return 1000  # Unknown
+        return 1000
 
     def _select_tier(self, row_count: int) -> str:
-        if row_count < NANO_THRESHOLD:
-            return 'NANO'
-        if row_count < MICRO_THRESHOLD:
-            return 'MICRO'
-        if row_count < STANDARD_THRESHOLD:
-            return 'STD'
+        if _HAS_ADAPTIVE:
+            return MicroAdaptiveEngine.tier_name(row_count)
+        if row_count < NANO_THRESHOLD: return 'NANO'
+        if row_count < MICRO_THRESHOLD: return 'MICRO'
+        if row_count < STANDARD_THRESHOLD: return 'STD'
         return 'TURBO'
 
     def _has_complex_features(self, ast: SelectStmt) -> bool:
-        return bool(ast.from_clause and ast.from_clause.joins) or \
-            any(self._simple._contains_agg(e) for e in ast.select_list) or \
-            any(self._simple._contains_window(e) for e in ast.select_list)
+        return (bool(ast.from_clause and ast.from_clause.joins)
+                or any(self._simple._contains_agg(e) for e in ast.select_list)
+                or any(self._simple._contains_window(e) for e in ast.select_list))
 
-    # ══════════════════════════════════════════════════════════════
-    # NANO path: zero overhead
-    # ══════════════════════════════════════════════════════════════
-
-    def _exec_nano(self, ast: SelectStmt, catalog: Catalog) -> ExecutionResult:
-        """Direct list processing. No Operator tree, no batching."""
+    # ══════════════════════════════════════════════════════════
+    # NANO路径
+    # ══════════════════════════════════════════════════════════
+    def _exec_nano(self, ast, catalog):
         ast = self._simple._resolve_subqueries(ast, catalog)
         if ast.from_clause is None:
             return self._simple._exec_select(ast, catalog)
-
         store = catalog.get_store(ast.from_clause.table.name)
         schema = catalog.get_table(ast.from_clause.table.name)
         all_rows = store.read_all_rows()
-        col_names = schema.column_names
-        col_types = [c.dtype for c in schema.columns]
+        cn = schema.column_names
+        ct = [c.dtype for c in schema.columns]
 
-        # Filter
         if ast.where:
             filtered = []
             for row in all_rows:
-                batch = VectorBatch.from_rows([row], col_names, col_types)
-                if self._evaluator.evaluate_predicate(ast.where, batch).get_bit(0):
+                b = VectorBatch.from_rows([row], cn, ct)
+                if self._evaluator.evaluate_predicate(ast.where, b).get_bit(0):
                     filtered.append(row)
             all_rows = filtered
 
-        # Sort
-        if ast.order_by:
-            import functools
-            def cmp(a, b):
-                for sk in ast.order_by:
-                    ba = VectorBatch.from_rows([a], col_names, col_types)
-                    bb = VectorBatch.from_rows([b], col_names, col_types)
-                    va = self._evaluator.evaluate(sk.expr, ba).get(0)
-                    vb = self._evaluator.evaluate(sk.expr, bb).get(0)
-                    if va is None and vb is None: continue
-                    if va is None:
-                        return 1 if (sk.nulls or 'NULLS_LAST') == 'NULLS_LAST' else -1
-                    if vb is None:
-                        return -1 if (sk.nulls or 'NULLS_LAST') == 'NULLS_LAST' else 1
-                    if va < vb: return 1 if sk.direction == 'DESC' else -1
-                    if va > vb: return -1 if sk.direction == 'DESC' else 1
-                return 0
+        if ast.order_by and all_rows:
+            fb = VectorBatch.from_rows(all_rows, cn, ct)
+            kc = []
+            for sk in ast.order_by:
+                np = sk.nulls or ('NULLS_LAST' if sk.direction == 'ASC' else 'NULLS_FIRST')
+                kc.append((self._evaluator.evaluate(sk.expr, fb).to_python_list(), sk.direction, np))
+            indices = list(range(len(all_rows)))
+            indices.sort(key=functools.cmp_to_key(lambda i, j: _cmp(i, j, kc)))
+            all_rows = [all_rows[i] for i in indices]
 
-            all_rows.sort(key=functools.cmp_to_key(cmp))
-
-        # Project first (so DISTINCT sees projected values)
-        proj_names = []
-        proj_exprs = []
+        pn, pe = [], []
         for expr in ast.select_list:
-            name = self._simple._out_name(expr)
-            inner = expr.expr if isinstance(expr, AliasExpr) else expr
-            proj_names.append(name)
-            proj_exprs.append(inner)
-
-        result_rows = []
+            pn.append(self._simple._out_name(expr))
+            pe.append(expr.expr if isinstance(expr, AliasExpr) else expr)
+        rr = []
         for row in all_rows:
-            batch = VectorBatch.from_rows([row], col_names, col_types)
-            result_row = []
-            for expr in proj_exprs:
-                result_row.append(self._evaluator.evaluate(expr, batch).get(0))
-            result_rows.append(result_row)
+            b = VectorBatch.from_rows([row], cn, ct)
+            rr.append([self._evaluator.evaluate(e, b).get(0) for e in pe])
 
-        # DISTINCT
         if ast.distinct:
-            seen = set()
-            unique = []
-            for row in result_rows:
-                key = tuple(row)
-                if key not in seen:
-                    seen.add(key)
-                    unique.append(row)
-            result_rows = unique
+            seen, unique = set(), []
+            for r in rr:
+                k = tuple(r)
+                if k not in seen: seen.add(k); unique.append(r)
+            rr = unique
 
-        # Limit/Offset — handle LIMIT 0 correctly
-        offset = 0
-        if ast.offset:
-            offset = self._simple._eval_const(ast.offset) or 0
-        limit_val = self._simple._eval_const(ast.limit) if ast.limit else None
-        if limit_val is not None:
-            result_rows = result_rows[offset:offset + limit_val]
-        elif offset > 0:
-            result_rows = result_rows[offset:]
+        off = self._simple._eval_const(ast.offset) or 0
+        lim = self._simple._eval_const(ast.limit) if ast.limit else None
+        if lim is not None: rr = rr[off:off + lim]
+        elif off > 0: rr = rr[off:]
 
-        # Output types
-        if result_rows:
-            out_types = []
-            for i, expr in enumerate(proj_exprs):
-                child_schema = dict(zip(col_names, col_types))
-                out_types.append(ExpressionEvaluator.infer_type(expr, child_schema))
-        else:
-            out_types = [DataType.VARCHAR] * len(proj_names)
+        ot = [ExpressionEvaluator.infer_type(e, dict(zip(cn, ct))) for e in pe] if rr else [DataType.VARCHAR] * len(pn)
+        return ExecutionResult(columns=pn, column_types=ot, rows=rr, row_count=len(rr))
 
-        return ExecutionResult(
-            columns=proj_names, column_types=out_types,
-            rows=result_rows, row_count=len(result_rows))
+    # ══════════════════════════════════════════════════════════
+    # Pipeline Fuser (MICRO路径)
+    # ══════════════════════════════════════════════════════════
+    def _try_fuse(self, ast, catalog):
+        if not _HAS_FUSER: return None
+        if ast.from_clause is None or ast.from_clause.joins: return None
+        has_agg = any(self._simple._contains_agg(e) for e in ast.select_list)
+        has_win = any(self._simple._contains_window(e) for e in ast.select_list)
+        if has_agg or has_win: return None
+        tref = ast.from_clause.table
+        if tref.subquery: return None
+        store = catalog.get_store(tref.name)
+        proj = self._simple._build_proj(ast)
+        cs = dict(self._simple._build_source(ast, catalog).output_schema())
+        ot = [ExpressionEvaluator.infer_type(e, cs) for _, e in proj]
+        lim = self._simple._eval_const(ast.limit)
+        fused = try_fuse(None, ast.where, proj, lim, store, ot)
+        if fused is None: return None
+        op = fused
+        if ast.order_by:
+            op = SortOperator(op, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
+        if ast.distinct: op = DistinctOperator(op)
+        return op
 
-    # ══════════════════════════════════════════════════════════════
-    # Optimized plan building
-    # ══════════════════════════════════════════════════════════════
-
-    def _build_optimized_plan(self, ast: SelectStmt, catalog: Catalog,
-                              tier: str, exec_count: int) -> Operator:
-        """Build operator tree with tier-appropriate optimizations."""
+    # ══════════════════════════════════════════════════════════
+    # 优化计划构建
+    # ══════════════════════════════════════════════════════════
+    def _build_optimized_plan(self, ast, catalog, tier, exec_count):
         ast = self._simple._resolve_subqueries(ast, catalog)
         has_agg = any(self._simple._contains_agg(e) for e in ast.select_list)
         has_win = any(self._simple._contains_window(e) for e in ast.select_list)
+        if has_agg or ast.group_by: return self._simple._plan_grouped(ast, catalog)
+        if has_win: return self._simple._plan_windowed(ast, catalog)
 
-        if has_agg or ast.group_by:
-            return self._simple._plan_grouped(ast, catalog)
-        if has_win:
-            return self._simple._plan_windowed(ast, catalog)
-
-        # Build source with optimized scan
         source = self._build_optimized_source(ast, catalog, tier)
-
-        # Filter with JIT
-        if ast.where:
-            source = self._build_optimized_filter(source, ast.where, tier, exec_count)
-
-        # Sort with algorithm selection
+        if ast.where: source = FilterOperator(source, ast.where)
         if ast.order_by:
-            use_topn = (ast.limit is not None and _HAS_TOPN and
-                        _HAS_PLANNER and TopNPushdown.should_use_top_n(ast))
+            use_topn = ast.limit is not None and _HAS_TOPN and _HAS_PLANNER and TopNPushdown.should_use_top_n(ast)
             if use_topn:
-                limit_val = self._simple._eval_const(ast.limit) or 10
-                keys = [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by]
-                source = TopNOperator(source, keys, limit_val)
+                source = TopNOperator(source, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by], TopNPushdown.get_limit_value(ast))
             else:
-                keys = [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by]
-                source = SortOperator(source, keys)
-
-        # Project
-        projections = self._simple._build_proj(ast)
-        source = ProjectOperator(source, projections)
-
-        if ast.distinct:
-            source = DistinctOperator(source)
-
-        # Limit (skip if already handled by TopN)
-        has_topn = ast.order_by and ast.limit is not None and _HAS_TOPN
+                source = SortOperator(source, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
+        source = ProjectOperator(source, self._simple._build_proj(ast))
+        if ast.distinct: source = DistinctOperator(source)
+        has_topn = ast.order_by and ast.limit is not None and _HAS_TOPN and _HAS_PLANNER and TopNPushdown.should_use_top_n(ast)
         if not has_topn and (ast.limit is not None or ast.offset is not None):
-            lv = self._simple._eval_const(ast.limit)
-            ov = self._simple._eval_const(ast.offset) or 0
-            source = LimitOperator(source, lv, ov)
-
+            source = LimitOperator(source, self._simple._eval_const(ast.limit), self._simple._eval_const(ast.offset) or 0)
         return source
 
-    def _build_optimized_source(self, ast: SelectStmt, catalog: Catalog,
-                                tier: str) -> Operator:
-        """Select best scan operator based on tier and data characteristics."""
-        if ast.from_clause is None:
-            return DualScan()
-
-        fc = ast.from_clause
-        tref = fc.table
-
-        if tref.subquery:
-            return self._simple._plan_any(tref.subquery, catalog)
-
-        if fc.joins:
-            return self._build_optimized_joins(ast, catalog, tier)
-
+    def _build_optimized_source(self, ast, catalog, tier):
+        if ast.from_clause is None: return DualScan()
+        fc = ast.from_clause; tref = fc.table
+        if tref.subquery: return self._simple._plan_any(tref.subquery, catalog)
+        if fc.joins: return self._build_optimized_joins(ast, catalog, tier)
         store = catalog.get_store(tref.name)
         needed = self._simple._collect_all_cols(ast)
         ordered = [c.name for c in store.schema.columns if c.name in needed]
-        if not ordered:
-            ordered = [store.schema.columns[0].name]
+        if not ordered: ordered = [store.schema.columns[0].name]
+        rc = store.row_count
 
-        row_count = store.row_count
+        # TURBO: Morsel并行扫描
+        if tier == 'TURBO' and rc > STANDARD_THRESHOLD:
+            try:
+                from executor.pipeline.morsel import MorselDriver
+                import os
+                driver = MorselDriver(min(os.cpu_count() or 2, 4))
+                total = store.get_chunk_count()
+                cis = [ci for ci in range(total) if store.get_column_chunks(ordered[0])[ci].row_count > 0]
+                def scan_chunk(ci):
+                    cols = {}
+                    for name in ordered:
+                        cl = store.get_column_chunks(name)
+                        if ci < len(cl): cols[name] = DataVector.from_column_chunk(cl[ci])
+                    return VectorBatch(columns=cols, _column_order=list(ordered)) if cols else None
+                results = driver.execute(cis, scan_chunk)
+                batches = [r for r in results if r is not None]
+                if batches: return _PrecomputedOperator(batches, ordered, store)
+            except Exception:
+                pass
 
-        # ZoneMap scan
-        if (_HAS_ZONEMAP_SCAN and ast.where and row_count > MICRO_THRESHOLD):
+        if _HAS_ZONEMAP_SCAN and ast.where and rc > MICRO_THRESHOLD:
             return ZoneMapScanOperator(tref.name, store, ordered, ast.where)
-
-        # Parallel scan
-        if (_HAS_PARALLEL and row_count > STANDARD_THRESHOLD and not ast.where):
+        if _HAS_PARALLEL and rc > STANDARD_THRESHOLD:
             import os
-            workers = min(os.cpu_count() or 2, 4)
-            return ParallelScanOperator(tref.name, store, ordered, workers)
-
+            return ParallelScanOperator(tref.name, store, ordered, min(os.cpu_count() or 2, 4))
         return SeqScan(tref.name, store, ordered)
 
-    def _build_optimized_joins(self, ast: SelectStmt, catalog: Catalog,
-                               tier: str) -> Operator:
-        """Select JOIN algorithm based on table sizes."""
+    def _build_optimized_joins(self, ast, catalog, tier):
         fc = ast.from_clause
-        tref = fc.table
-        lq = tref.alias or tref.name
+        num_tables = 1 + len(fc.joins)
+
+        # DPccp: 3表以上时使用最优连接排序
+        if num_tables >= 3 and _HAS_DPCCP:
+            result = self._try_dpccp(ast, catalog)
+            if result is not None: return result
+
+        # 线性构建
+        tref = fc.table; lq = tref.alias or tref.name
         store = catalog.get_store(tref.name)
         lc = [c.name for c in store.schema.columns]
-        left_rows = store.row_count
-
-        cur: Operator = ProjectOperator(
-            SeqScan(tref.name, store, lc),
+        lr = store.row_count
+        cur: Operator = ProjectOperator(SeqScan(tref.name, store, lc),
             [(f"{lq}.{c}", ColumnRef(table=None, column=c)) for c in lc])
-
         for jc in fc.joins:
             assert jc.table is not None
             rq = jc.table.alias or jc.table.name
-
             if jc.table.subquery:
-                right_op = self._simple._plan_any(jc.table.subquery, catalog)
-                rs = right_op.output_schema()
-                right_op = ProjectOperator(right_op,
-                                           [(f"{rq}.{n}", ColumnRef(table=None, column=n)) for n, _ in rs])
-                right_rows = 1000  # Unknown
+                rop = self._simple._plan_any(jc.table.subquery, catalog)
+                rs = rop.output_schema()
+                rop = ProjectOperator(rop, [(f"{rq}.{n}", ColumnRef(table=None, column=n)) for n, _ in rs])
+                rr = 1000
             else:
-                r_store = catalog.get_store(jc.table.name)
-                r_cols = [c.name for c in r_store.schema.columns]
-                right_op = ProjectOperator(
-                    SeqScan(jc.table.name, r_store, r_cols),
-                    [(f"{rq}.{c}", ColumnRef(table=None, column=c)) for c in r_cols])
-                right_rows = r_store.row_count
-
-            if jc.join_type == 'CROSS':
-                cur = CrossJoinOperator(cur, right_op)
-            else:
-                # Select best JOIN algorithm
-                cur = self._select_join_operator(
-                    cur, right_op, jc.join_type, jc.on,
-                    left_rows, right_rows, tier)
-            left_rows = max(left_rows, right_rows)  # Rough estimate
-
+                rs = catalog.get_store(jc.table.name)
+                rc = [c.name for c in rs.schema.columns]
+                rop = ProjectOperator(SeqScan(jc.table.name, rs, rc),
+                    [(f"{rq}.{c}", ColumnRef(table=None, column=c)) for c in rc])
+                rr = rs.row_count
+            if jc.join_type == 'CROSS': cur = CrossJoinOperator(cur, rop)
+            else: cur = self._select_join_op(cur, rop, jc.join_type, jc.on, lr, rr, tier)
+            lr = max(lr, rr)
         return cur
 
-    def _select_join_operator(self, left: Operator, right: Operator,
-                              join_type: str, on_expr: Any,
-                              left_rows: int, right_rows: int,
-                              tier: str) -> Operator:
-        """Cost-based JOIN algorithm selection."""
-        # Ensure smaller table on build side
-        build_rows = min(left_rows, right_rows)
+    def _try_dpccp(self, ast, catalog):
+        """DPccp最优连接排序。"""
+        fc = ast.from_clause
+        graph = JoinGraph()
+        base = fc.table.alias or fc.table.name
+        graph.add_table(base, catalog.get_store(fc.table.name).row_count)
+        for jc in fc.joins:
+            if jc.table:
+                t = jc.table.alias or jc.table.name
+                if catalog.table_exists(jc.table.name):
+                    graph.add_table(t, catalog.get_store(jc.table.name).row_count)
+                else:
+                    graph.add_table(t, 1000)
+                if jc.on:
+                    lk, rk = extract_equi_keys(jc.on)
+                    if lk and rk:
+                        lt = lk.split('.')[0] if '.' in lk else base
+                        rt = rk.split('.')[0] if '.' in rk else t
+                        graph.add_edge(lt, rt, jc.on)
+        try:
+            estimator = CardinalityEstimator(self._stats) if _HAS_PLANNER else None
+            optimal = DPccp(graph, estimator).optimize()
+            return self._dpccp_plan_to_operator(optimal.plan, ast, catalog)
+        except Exception:
+            return None
 
-        if build_rows < NANO_THRESHOLD and _HAS_NL:
-            return NestedLoopJoinOperator(left, right, join_type, on_expr)
+    def _dpccp_plan_to_operator(self, plan, ast, catalog):
+        """将DPccp计划树转为算子树。"""
+        if plan is None: return None
+        if isinstance(plan, tuple):
+            if plan[0] == 'SCAN':
+                tname = plan[1]
+                if not catalog.table_exists(tname): return None
+                store = catalog.get_store(tname)
+                cols = [c.name for c in store.schema.columns]
+                scan = SeqScan(tname, store, cols)
+                return ProjectOperator(scan, [(f"{tname}.{c}", ColumnRef(table=None, column=c)) for c in cols])
+            algo = plan[0]
+            left_op = self._dpccp_plan_to_operator(plan[1], ast, catalog)
+            right_op = self._dpccp_plan_to_operator(plan[2], ast, catalog)
+            if left_op is None or right_op is None: return None
+            # 查找对应的ON条件
+            on_expr = self._find_join_condition(ast, left_op, right_op)
+            if algo == 'CROSS_JOIN': return CrossJoinOperator(left_op, right_op)
+            return HashJoinOperator(left_op, right_op, 'INNER', on_expr)
+        return None
 
-        if build_rows > 10_000_000 and _HAS_GRACE:
-            return GraceHashJoinOperator(left, right, join_type, on_expr)
+    def _find_join_condition(self, ast, left_op, right_op):
+        """从原始AST查找适用的JOIN条件。"""
+        if ast.from_clause:
+            for jc in ast.from_clause.joins:
+                if jc.on: return jc.on
+        return None
 
-        if build_rows > STANDARD_THRESHOLD and _HAS_RADIX:
-            return RadixJoinOperator(left, right, join_type, on_expr)
+    def _select_join_op(self, left, right, jt, on, lr, rr, tier):
+        build = min(lr, rr)
+        if _HAS_PLANNER:
+            lc = CostEstimate(rows=lr, width=100)
+            rc = CostEstimate(rows=rr, width=100)
+            algo, _ = CostModel.select_join_algorithm(lc, rc, 0.1)
+            if algo == 'NESTED_LOOP' and _HAS_NL:
+                return NestedLoopJoinOperator(left, right, jt, on)
+        if build < NANO_THRESHOLD and _HAS_NL:
+            return NestedLoopJoinOperator(left, right, jt, on)
+        if build > 10_000_000 and _HAS_GRACE:
+            return GraceHashJoinOperator(left, right, jt, on)
+        if build > STANDARD_THRESHOLD and _HAS_RADIX:
+            return RadixJoinOperator(left, right, jt, on)
+        return HashJoinOperator(left, right, jt, on)
 
-        # Default: Hash Join (with Bloom filter integrated)
-        return HashJoinOperator(left, right, join_type, on_expr)
-
-    def _build_optimized_filter(self, source: Operator, predicate: Any,
-                                tier: str, exec_count: int) -> Operator:
-        """Filter with optional JIT compilation."""
-        # Try JIT for hot queries
-        if _HAS_JIT and exec_count >= 2 and tier in ('STD', 'TURBO'):
-            cache_key = CompileCache.hash_expr(predicate)
-            cached_fn = self._compile_cache.get(cache_key) if self._compile_cache else None
-            if cached_fn is None:
-                compiled = ExprCompiler.compile_predicate(predicate)
-                if compiled and self._compile_cache:
-                    self._compile_cache.put(cache_key, compiled)
-            # Even if JIT succeeds, still use FilterOperator
-            # (JIT integration into FilterOperator is in the operator itself)
-
-        return FilterOperator(source, predicate)
-
-    # ══════════════════════════════════════════════════════════════
-    # Execution with monitoring
-    # ══════════════════════════════════════════════════════════════
-
-    def _drain_with_monitoring(self, op: Operator, tier: str) -> ExecutionResult:
-        """Execute and collect runtime stats."""
+    # ══════════════════════════════════════════════════════════
+    # 执行与监控
+    # ══════════════════════════════════════════════════════════
+    def _drain(self, op):
         schema = op.output_schema()
-        cn = [n for n, _ in schema]
-        ct = [t for _, t in schema]
-
-        start = time.perf_counter()
-        op.open()
-        rows: list = []
+        cn = [n for n, _ in schema]; ct = [t for _, t in schema]
+        op.open(); rows = []
         while True:
             b = op.next_batch()
-            if b is None:
-                break
+            if b is None: break
+            b = Operator._ensure_batch(b)
+            if b is None: break
+            rows.extend(b.to_rows())
+        op.close()
+        return ExecutionResult(columns=cn, column_types=ct, rows=rows, row_count=len(rows))
+
+    def _drain_with_monitoring(self, op, tier):
+        """执行并收集运行时统计。"""
+        schema = op.output_schema()
+        cn = [n for n, _ in schema]; ct = [t for _, t in schema]
+        start = time.perf_counter()
+        op.open(); rows = []
+        while True:
+            b = op.next_batch()
+            if b is None: break
+            b = Operator._ensure_batch(b)
+            if b is None: break
             rows.extend(b.to_rows())
         op.close()
         elapsed = time.perf_counter() - start
+        result = ExecutionResult(columns=cn, column_types=ct, rows=rows, row_count=len(rows))
 
-        result = ExecutionResult(columns=cn, column_types=ct,
-                                 rows=rows, row_count=len(rows))
-
-        # Add execution stats to result message for TURBO+ queries
-        if tier in ('TURBO', 'NUCLEAR') and elapsed > 0.1:
-            result.message = f"[{tier}] {elapsed:.3f}s"
-
+        # 运行时监控反馈
+        if self._rt_opt and tier in ('STD', 'TURBO'):
+            self._rt_opt.record(type(op).__name__, estimated_rows=1000,
+                               actual_rows=len(rows), elapsed_ms=elapsed * 1000)
+            if self._rt_opt.should_reoptimize() and elapsed > 0.1:
+                result.message = f"[{tier}] {elapsed:.3f}s ⚠️ cardinality off"
         return result
-
-    # ══════════════════════════════════════════════════════════════
-    # Statistics management
-    # ══════════════════════════════════════════════════════════════
 
     def update_stats(self, table_name: str, stats: Any) -> None:
         self._stats[table_name] = stats
+
+
+class _PrecomputedOperator(Operator):
+    """包装预计算的batch列表。"""
+    def __init__(self, batches, columns, store):
+        super().__init__()
+        self._batches = batches; self._idx = 0
+        self._columns = columns; self._store = store
+    def output_schema(self):
+        cm = {c.name: c.dtype for c in self._store.schema.columns}
+        return [(n, cm[n]) for n in self._columns]
+    def open(self): self._idx = 0
+    def next_batch(self):
+        if self._idx >= len(self._batches): return None
+        b = self._batches[self._idx]; self._idx += 1; return b
+    def close(self): pass
+
+
+def _cmp(i, j, kc):
+    for vals, d, np in kc:
+        a, b = vals[i], vals[j]
+        if a is None and b is None: continue
+        if a is None: c = 1 if np == 'NULLS_LAST' else -1; return -c if d == 'DESC' else c
+        if b is None: c = -1 if np == 'NULLS_LAST' else 1; return -c if d == 'DESC' else c
+        if a < b: c = -1
+        elif a > b: c = 1
+        else: continue
+        return -c if d == 'DESC' else c
+    return 0

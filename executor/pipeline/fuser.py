@@ -1,7 +1,6 @@
 from __future__ import annotations
-
-"""Pipeline fusion — merge Scan+Filter+Project into a single loop.
-Eliminates 2/3 of per-row Python function calls."""
+"""Pipeline 融合 — 合并 Scan+Filter+Project 为单循环。
+修复：使用列存 chunk 扫描替代 read_all_rows()。"""
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from executor.core.batch import VectorBatch
 from executor.core.operator import Operator
@@ -13,15 +12,7 @@ from storage.types import DTYPE_TO_ARRAY_CODE, DataType
 
 
 class FusedScanFilterProject(Operator):
-    """Fused Scan → Filter → Project in a single pass.
-
-    Instead of:
-      scan.next_batch() → filter.evaluate_predicate() → project.evaluate()
-    We do:
-      for each row: if filter(row): emit(project(row))
-
-    3 Python loops → 1 Python loop.
-    """
+    """融合 Scan → Filter → Project 为单次遍历。"""
 
     def __init__(self, store: Any, columns: List[str],
                  filter_fn: Optional[Callable],
@@ -46,29 +37,49 @@ class FusedScanFilterProject(Operator):
     def open(self) -> None:
         self._result_rows = []
         self._emitted = False
-        all_rows = self._store.read_all_rows()
         col_names = [c.name for c in self._store.schema.columns]
         count = 0
 
-        for row in all_rows:
+        # 修复：使用列存 chunk 逐 chunk 扫描
+        chunk_count = self._store.get_chunk_count()
+        for ci in range(chunk_count):
             if self._limit is not None and count >= self._limit:
                 break
-            # Build row dict
-            row_dict = {col_names[i]: row[i] for i in range(len(col_names))}
 
-            # Apply filter
-            if self._filter_fn is not None:
-                if not self._filter_fn(row_dict):
-                    continue
+            # 读取当前 chunk 的行数
+            first_col = self._store.schema.columns[0].name
+            chunks = self._store.get_column_chunks(first_col)
+            if ci >= len(chunks) or chunks[ci].row_count == 0:
+                continue
 
-            # Apply projection
-            if self._project_fn is not None:
-                projected = self._project_fn(row_dict)
-            else:
-                projected = [row_dict.get(n) for n in self._output_names]
+            n_rows = chunks[ci].row_count
+            for ri in range(n_rows):
+                if self._limit is not None and count >= self._limit:
+                    break
 
-            self._result_rows.append(projected)
-            count += 1
+                # 构建行字典（从各列 chunk 读取）
+                row_dict = {}
+                for cn in col_names:
+                    col_chunks = self._store.get_column_chunks(cn)
+                    if ci < len(col_chunks):
+                        row_dict[cn] = col_chunks[ci].get(ri)
+                    else:
+                        row_dict[cn] = None
+
+                # 过滤
+                if self._filter_fn is not None:
+                    if not self._filter_fn(row_dict):
+                        continue
+
+                # 投影
+                if self._project_fn is not None:
+                    projected = self._project_fn(row_dict)
+                else:
+                    projected = [row_dict.get(n)
+                                 for n in self._output_names]
+
+                self._result_rows.append(projected)
+                count += 1
 
     def next_batch(self) -> Optional[VectorBatch]:
         if self._emitted:
@@ -83,17 +94,17 @@ class FusedScanFilterProject(Operator):
         pass
 
 
-def try_fuse(scan_op: Any, filter_expr: Any, project_exprs: List[Tuple[str, Any]],
-             limit: Optional[int], store: Any, output_types: List[DataType]) -> Optional[Operator]:
-    """Attempt to fuse scan+filter+project. Returns None if fusion not possible."""
-    # Try to compile filter
+def try_fuse(scan_op: Any, filter_expr: Any,
+             project_exprs: List[Tuple[str, Any]],
+             limit: Optional[int], store: Any,
+             output_types: List[DataType]) -> Optional[Operator]:
+    """尝试融合 scan+filter+project。无法编译则返回 None。"""
     filter_fn = None
     if filter_expr is not None:
         filter_fn = ExprCompiler.compile_predicate(filter_expr)
         if filter_fn is None:
-            return None  # Can't compile → can't fuse
+            return None
 
-    # Try to compile projection
     project_fn = None
     proj_exprs_only = [expr for _, expr in project_exprs]
     proj_names = [name for name, _ in project_exprs]

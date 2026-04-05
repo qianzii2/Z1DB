@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Parallel scan — threading-based multi-worker chunk scanning."""
+"""并行扫描 — 多线程chunk扫描。"""
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from queue import Queue
@@ -11,7 +11,7 @@ from storage.types import DataType
 
 
 class ParallelScanOperator(Operator):
-    """Scans chunks in parallel using threads. mmap releases GIL."""
+    """多线程并行扫描chunk。"""
 
     def __init__(self, table_name: str, store: TableStore,
                  columns: List[str], num_workers: int = 2) -> None:
@@ -19,8 +19,7 @@ class ParallelScanOperator(Operator):
         self._table_name = table_name
         self._store = store
         self._columns = columns
-        self._num_workers = num_workers
-        self._queue: Queue = Queue()
+        self._num_workers = max(1, num_workers)
         self._batches: List[VectorBatch] = []
         self._batch_idx = 0
 
@@ -31,29 +30,49 @@ class ParallelScanOperator(Operator):
     def open(self) -> None:
         total_chunks = self._store.get_chunk_count()
         if total_chunks == 0:
-            self._batches = []; self._batch_idx = 0; return
+            self._batches = []
+            self._batch_idx = 0
+            return
 
-        # Assign chunks to workers
+        # 过滤空chunk
+        nonempty: List[int] = []
+        first_col = self._columns[0]
+        chunks = self._store.get_column_chunks(first_col)
+        for ci in range(total_chunks):
+            if ci < len(chunks) and chunks[ci].row_count > 0:
+                nonempty.append(ci)
+
+        if not nonempty:
+            self._batches = []
+            self._batch_idx = 0
+            return
+
         result_queue: Queue = Queue()
-        threads = []
 
         def worker(chunk_indices: List[int]) -> None:
             for ci in chunk_indices:
-                first_col = self._columns[0]
-                chunks = self._store.get_column_chunks(first_col)
-                if chunks[ci].row_count == 0: continue
-                cols: Dict[str, DataVector] = {}
-                for name in self._columns:
-                    chunk_list = self._store.get_column_chunks(name)
-                    cols[name] = DataVector.from_column_chunk(chunk_list[ci])
-                batch = VectorBatch(columns=cols, _column_order=list(self._columns))
-                result_queue.put((ci, batch))
+                try:
+                    cols: Dict[str, DataVector] = {}
+                    for name in self._columns:
+                        chunk_list = self._store.get_column_chunks(name)
+                        if ci < len(chunk_list):
+                            cols[name] = DataVector.from_column_chunk(
+                                chunk_list[ci])
+                    if cols:
+                        batch = VectorBatch(
+                            columns=cols,
+                            _column_order=list(self._columns))
+                        result_queue.put((ci, batch))
+                except Exception:
+                    pass
 
-        # Distribute chunks round-robin
-        worker_chunks: List[List[int]] = [[] for _ in range(self._num_workers)]
-        for i in range(total_chunks):
-            worker_chunks[i % self._num_workers].append(i)
+        # 轮询分配chunk给worker
+        worker_chunks: List[List[int]] = [
+            [] for _ in range(self._num_workers)]
+        for i, ci in enumerate(nonempty):
+            worker_chunks[i % self._num_workers].append(ci)
 
+        threads = []
         for wc in worker_chunks:
             if wc:
                 t = threading.Thread(target=worker, args=(wc,))
@@ -63,7 +82,7 @@ class ParallelScanOperator(Operator):
         for t in threads:
             t.join()
 
-        # Collect results in chunk order
+        # 按chunk顺序收集结果
         collected: Dict[int, VectorBatch] = {}
         while not result_queue.empty():
             ci, batch = result_queue.get()
@@ -73,9 +92,11 @@ class ParallelScanOperator(Operator):
         self._batch_idx = 0
 
     def next_batch(self) -> Optional[VectorBatch]:
-        if self._batch_idx >= len(self._batches): return None
+        if self._batch_idx >= len(self._batches):
+            return None
         b = self._batches[self._batch_idx]
         self._batch_idx += 1
         return b
 
-    def close(self) -> None: pass
+    def close(self) -> None:
+        pass

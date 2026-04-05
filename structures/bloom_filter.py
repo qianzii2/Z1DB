@@ -1,17 +1,16 @@
 from __future__ import annotations
 """Bloom Filter — probabilistic set membership. Mergeable.
-False positive rate ≈ (1 - e^(-kn/m))^k. Supports merge via OR."""
+False positive rate ≈ (1 - e^(-kn/m))^k. No false negatives."""
 import math
 from metal.hash import murmur3_128
 
 
 class BloomFilter:
-    """Space-efficient probabilistic filter. No false negatives."""
+    """Space-efficient probabilistic filter."""
 
     __slots__ = ('_m', '_k', '_bits', '_count')
 
-    def __init__(self, expected_items: int = 1000,
-                 fp_rate: float = 0.01) -> None:
+    def __init__(self, expected_items: int = 1000, fp_rate: float = 0.01) -> None:
         if expected_items < 1:
             expected_items = 1
         self._m = max(64, int(-expected_items * math.log(fp_rate) / (math.log(2) ** 2)))
@@ -20,18 +19,16 @@ class BloomFilter:
         self._count = 0
 
     def add(self, item: object) -> None:
-        """Add an item. item can be bytes, str, or int."""
-        raw = self._to_bytes(item)
-        h1, h2 = murmur3_128(raw)
+        key = self._to_bytes(item)
+        h1, h2 = murmur3_128(key)
         for i in range(self._k):
             pos = (h1 + i * h2) % self._m
             self._bits[pos >> 3] |= (1 << (pos & 7))
         self._count += 1
 
     def contains(self, item: object) -> bool:
-        """Check membership. May return false positive, never false negative."""
-        raw = self._to_bytes(item)
-        h1, h2 = murmur3_128(raw)
+        key = self._to_bytes(item)
+        h1, h2 = murmur3_128(key)
         for i in range(self._k):
             pos = (h1 + i * h2) % self._m
             if not (self._bits[pos >> 3] & (1 << (pos & 7))):
@@ -39,7 +36,6 @@ class BloomFilter:
         return True
 
     def merge(self, other: BloomFilter) -> None:
-        """O(m) merge — for parallel/distributed scenarios."""
         if self._m != other._m:
             raise ValueError("cannot merge filters of different sizes")
         for i in range(len(self._bits)):

@@ -296,9 +296,6 @@ class ArrayAggFunc(AggregateFunction):
 class StringAggFunc(AggregateFunction):
     name = 'STRING_AGG'
     def init(self): return ([], ',')
-    def init_with_sep(self, sep: str) -> tuple:
-        """Initialize with custom separator."""
-        return ([], sep)
     def update(self, s, v, rc):
         parts, sep = s
         if v is None: return s
@@ -309,6 +306,8 @@ class StringAggFunc(AggregateFunction):
         parts, sep = s
         return sep.join(parts) if parts else None
     def return_type(self, it): return DataType.VARCHAR
+    def init_with_sep(self, sep: str) -> tuple:
+        return ([], sep)
 
 class GroupingAgg(AggregateFunction):
     name = 'GROUPING'

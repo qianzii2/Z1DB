@@ -1,54 +1,64 @@
 from __future__ import annotations
-"""Query result cache — returns cached results for unchanged tables."""
-from typing import Any, Dict, Optional
+"""查询结果LRU缓存 — 表级版本失效。
+同一SQL + 表未修改 → 直接返回缓存结果。
+任何DML/DDL修改表 → 该表相关缓存全部失效。"""
 from collections import OrderedDict
+from typing import Any, Dict, Optional, Set
 from metal.hash import murmur3_64
 
 
 class ResultCache:
-    """LRU cache for query results. Invalidated when tables are modified."""
+    """LRU结果缓存，语义失效。"""
 
-    def __init__(self, max_entries: int = 128) -> None:
-        self._cache: OrderedDict[int, tuple] = OrderedDict()
-        # Each entry: (result, {table_name: version_at_cache_time})
-        self._max_entries = max_entries
+    __slots__ = ('_cache', '_max_size', '_hits', '_misses')
+
+    def __init__(self, max_size: int = 128) -> None:
+        self._cache: OrderedDict[int, _CacheEntry] = OrderedDict()
+        self._max_size = max_size
         self._hits = 0
         self._misses = 0
 
-    def get(self, sql_hash: int, table_versions: Dict[str, int]) -> Optional[Any]:
-        """Return cached result if all table versions match."""
+    @staticmethod
+    def hash_sql(sql: str) -> int:
+        """对SQL文本做哈希，供外部使用。"""
+        return murmur3_64(sql.strip().lower().encode('utf-8'))
+
+    def get(self, sql_hash: int, current_versions: Dict[str, int]) -> Optional[Any]:
+        """查找缓存结果。current_versions = 调用方维护的表版本号。
+        如果任何引用的表版本号变了，视为过期。"""
         if sql_hash not in self._cache:
             self._misses += 1
             return None
-        result, cached_versions = self._cache[sql_hash]
-        # Check all referenced tables haven't changed
-        for table, version in cached_versions.items():
-            if table_versions.get(table, -1) != version:
-                # Table was modified — invalidate this entry
+        entry = self._cache[sql_hash]
+        # 检查所有引用表的版本号是否仍然匹配
+        for table, ver in entry.table_versions.items():
+            if current_versions.get(table, 0) != ver:
                 del self._cache[sql_hash]
                 self._misses += 1
                 return None
         self._cache.move_to_end(sql_hash)
         self._hits += 1
-        return result
+        return entry.result
 
     def put(self, sql_hash: int, result: Any,
             table_versions: Dict[str, int]) -> None:
-        """Cache a query result with table version snapshot."""
+        """缓存查询结果。table_versions = {表名: 当前版本号}。"""
         if sql_hash in self._cache:
             self._cache.move_to_end(sql_hash)
-        elif len(self._cache) >= self._max_entries:
+            self._cache[sql_hash] = _CacheEntry(result, dict(table_versions))
+            return
+        if len(self._cache) >= self._max_size:
             self._cache.popitem(last=False)
-        self._cache[sql_hash] = (result, dict(table_versions))
+        self._cache[sql_hash] = _CacheEntry(result, dict(table_versions))
 
     def invalidate_table(self, table_name: str) -> None:
-        """Remove all cached entries that reference this table."""
+        """移除所有引用了该表的缓存条目。"""
         to_remove = []
-        for sql_hash, (_, versions) in self._cache.items():
-            if table_name in versions:
-                to_remove.append(sql_hash)
-        for h in to_remove:
-            del self._cache[h]
+        for key, entry in self._cache.items():
+            if table_name in entry.table_versions:
+                to_remove.append(key)
+        for key in to_remove:
+            del self._cache[key]
 
     def clear(self) -> None:
         self._cache.clear()
@@ -62,6 +72,10 @@ class ResultCache:
     def size(self) -> int:
         return len(self._cache)
 
-    @staticmethod
-    def hash_sql(sql: str) -> int:
-        return murmur3_64(sql.strip().encode('utf-8'))
+
+class _CacheEntry:
+    __slots__ = ('result', 'table_versions')
+
+    def __init__(self, result: Any, table_versions: Dict[str, int]) -> None:
+        self.result = result
+        self.table_versions = table_versions
