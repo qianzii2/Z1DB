@@ -92,21 +92,48 @@ class Parser:
         raise ParseError(f"unexpected: {self._c.value!r}",self._c.line,self._c.col)
 
     def _with_cte(self):
-        """Parse WITH name AS (SELECT ...) [, ...] SELECT ..."""
+        """Parse WITH [RECURSIVE] name [(col1, ...)] AS (SELECT ... [UNION ALL SELECT ...]) ..."""
         self._adv()  # consume 'with'
+        is_recursive = False
+        if self._c.type == TokenType.IDENTIFIER and self._c.value == 'recursive':
+            is_recursive = True
+            self._adv()
         ctes = []
         while True:
             cte_name = self._aid()
+            cte_columns = None
+            if self._c.type == TokenType.LPAREN:
+                self._adv()
+                if self._c.type != TokenType.SELECT:
+                    cte_columns = [self._aid()]
+                    while self._c.type == TokenType.COMMA:
+                        self._adv()
+                        cte_columns.append(self._aid())
+                    self._ex(TokenType.RPAREN)
+                else:
+                    # Was actually AS ( SELECT — shouldn't get here normally
+                    cte_query = self._sel()
+                    while self._c.type in (TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
+                        cte_query = self._setop(cte_query)
+                    self._ex(TokenType.RPAREN)
+                    ctes.append((cte_name, cte_query, is_recursive, cte_columns))
+                    if self._c.type == TokenType.COMMA:
+                        self._adv()
+                        continue
+                    else:
+                        break
             self._ex(TokenType.AS)
             self._ex(TokenType.LPAREN)
+            # Parse CTE body — may contain UNION ALL for recursive CTEs
             cte_query = self._sel()
+            while self._c.type in (TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
+                cte_query = self._setop(cte_query)
             self._ex(TokenType.RPAREN)
-            ctes.append((cte_name, cte_query))
+            ctes.append((cte_name, cte_query, is_recursive, cte_columns))
             if self._c.type == TokenType.COMMA:
                 self._adv()
             else:
                 break
-        # Now parse the main SELECT
         main = self._sel()
         import dataclasses
         return dataclasses.replace(main, ctes=ctes)

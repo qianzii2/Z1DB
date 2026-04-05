@@ -376,7 +376,7 @@ class REPL:
 
     def run(self) -> None:
         banner = (
-            f"{_c_bold('Z1DB')} v1.1 — "
+            f"{_c_bold('Z1DB')} v1.2 — "
             f"{_c_dim('Pure Python OLAP Engine')}\n"
             f"{_c_dim('君 问 归 期 未 有 期 ， 曲 江 岸 上 月 华 盈')}\n"
             f"{_c_dim('Type .help for commands, .quit to exit')}"

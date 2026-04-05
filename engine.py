@@ -117,19 +117,35 @@ class Engine:
     def _materialize_ctes(self, ast: object) -> list[str]:
         created: list[str] = []
         if isinstance(ast, SelectStmt) and ast.ctes:
-            for cte_name, cte_query in ast.ctes:
+            for cte_entry in ast.ctes:
+                # Support 2-tuple, 3-tuple, and 4-tuple formats
+                cte_name = cte_entry[0]
+                cte_query = cte_entry[1]
+                is_recursive = cte_entry[2] if len(cte_entry) > 2 else False
+                cte_columns = cte_entry[3] if len(cte_entry) > 3 else None
+
                 nested = self._materialize_ctes(cte_query)
                 created.extend(nested)
-                try:
-                    resolved = Resolver().resolve(cte_query, self._catalog)
-                    validated = Validator().validate(resolved, self._catalog)
-                    optimized = self._optimize_ast(validated)
-                    cte_result = self._planner.execute(optimized, self._catalog)
-                except Exception:
-                    continue
+
+                if is_recursive:
+                    cte_result = self._execute_recursive_cte(cte_name, cte_query, cte_columns)
+                else:
+                    try:
+                        resolved = Resolver().resolve(cte_query, self._catalog)
+                        validated = Validator().validate(resolved, self._catalog)
+                        optimized = self._optimize_ast(validated)
+                        cte_result = self._planner.execute(optimized, self._catalog)
+                    except Exception:
+                        continue
+
                 if cte_result.columns:
+                    # Apply column aliases if provided
+                    col_names = list(cte_result.columns)
+                    if cte_columns and len(cte_columns) == len(col_names):
+                        col_names = list(cte_columns)
+
                     cols = [ColumnSchema(name=cn, dtype=ct, nullable=True)
-                            for cn, ct in zip(cte_result.columns, cte_result.column_types)]
+                            for cn, ct in zip(col_names, cte_result.column_types)]
                     internal_name = f'{_CTE_PREFIX}{cte_name}'
                     self._suppress_persist = True
                     try:
@@ -139,7 +155,7 @@ class Engine:
                                 self._catalog.create_table(schema)
                                 store = self._catalog.get_store(name)
                                 for row in cte_result.rows:
-                                    store.append_row(row)
+                                    store.append_row(list(row))
                                 created.append(name)
                     finally:
                         self._suppress_persist = False
@@ -149,6 +165,27 @@ class Engine:
             created.extend(self._materialize_ctes(ast.left))
             created.extend(self._materialize_ctes(ast.right))
         return created
+
+    def _execute_recursive_cte(self, cte_name: str, query: Any,
+                               column_names: Optional[list] = None) -> ExecutionResult:
+        from executor.recursive_cte import RecursiveCTEExecutor
+        from executor.core.result import ExecutionResult
+
+        if isinstance(query, SetOperationStmt) and query.op.upper() == 'UNION':
+            base_query = query.left
+            recursive_query = query.right
+            union_all = query.all
+            executor = RecursiveCTEExecutor(self._planner, self._catalog)
+            return executor.execute(cte_name, base_query, recursive_query,
+                                    union_all, column_names)
+
+        try:
+            resolved = Resolver().resolve(query, self._catalog)
+            validated = Validator().validate(resolved, self._catalog)
+            optimized = self._optimize_ast(validated)
+            return self._planner.execute(optimized, self._catalog)
+        except Exception:
+            return ExecutionResult()
 
     def _strip_ctes(self, ast: object) -> object:
         if isinstance(ast, SelectStmt) and ast.ctes:
