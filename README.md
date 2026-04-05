@@ -4,7 +4,7 @@
 
 ## 一、项目概述
 
-**Z1DB** 是一个完全用纯 Python 实现的列式 OLAP 数据库引擎。零外部依赖，仅使用 Python 3.8+ 标准库，从 ctypes 裸内存管理到 DPccp JOIN 顺序优化器全部手写实现。
+**Z1DB** 是一个完全用纯 Python 实现的列式 OLAP 数据库引擎。零外部依赖，仅使用 Python 3.8+ 标准库。
 
 ## 二、SQL 支持
 
