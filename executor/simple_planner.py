@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Simple planner — Phase 7: no CTE handling (moved to engine)."""
+"""Simple planner — complete with all fixes."""
 import dataclasses
 from typing import Any, Dict, List, Optional, Set, Tuple
 from catalog.catalog import Catalog, ColumnSchema, TableSchema
@@ -28,26 +28,17 @@ from utils.errors import (ColumnNotFoundError, ExecutionError, NumericOverflowEr
 
 
 class _ScalarAggOperator(Operator):
-    """Wraps a single-row VectorBatch as a proper Operator."""
     def __init__(self, batch: VectorBatch) -> None:
         super().__init__()
         self._batch = batch
         self._emitted = False
-
-    def output_schema(self) -> List[Tuple[str, DataType]]:
+    def output_schema(self):
         return [(n, self._batch.columns[n].dtype) for n in self._batch.column_names]
-
-    def open(self) -> None:
-        self._emitted = False
-
-    def next_batch(self) -> Optional[VectorBatch]:
-        if self._emitted:
-            return None
-        self._emitted = True
-        return self._batch
-
-    def close(self) -> None:
-        pass
+    def open(self): self._emitted = False
+    def next_batch(self):
+        if self._emitted: return None
+        self._emitted = True; return self._batch
+    def close(self): pass
 
 
 class SimplePlanner:
@@ -55,9 +46,6 @@ class SimplePlanner:
         self._registry = function_registry
         self._evaluator = ExpressionEvaluator(function_registry)
 
-    # ══════════════════════════════════════════════════════════════
-    # Entry point — CTE handling is in engine.py
-    # ══════════════════════════════════════════════════════════════
     def execute(self, ast: Any, catalog: Catalog) -> ExecutionResult:
         if isinstance(ast, ExplainStmt):
             return self._exec_explain(ast, catalog)
@@ -126,39 +114,31 @@ class SimplePlanner:
         raise ExecutionError(f"unsupported ALTER action: {ast.action}")
 
     # ══════════════════════════════════════════════════════════════
-    # Set operations
+    # Set ops
     # ══════════════════════════════════════════════════════════════
     def _exec_set_op(self, ast: SetOperationStmt, catalog: Catalog) -> ExecutionResult:
         left_op = self._plan_any(ast.left, catalog)
         right_op = self._plan_any(ast.right, catalog)
         op_name = ast.op.upper()
-        if op_name == 'UNION':
-            op: Operator = UnionOperator(left_op, right_op, ast.all)
-        elif op_name == 'INTERSECT':
-            op = IntersectOperator(left_op, right_op, ast.all)
-        elif op_name == 'EXCEPT':
-            op = ExceptOperator(left_op, right_op, ast.all)
-        else:
-            raise ExecutionError(f"unknown set op: {op_name}")
+        if op_name == 'UNION': op: Operator = UnionOperator(left_op, right_op, ast.all)
+        elif op_name == 'INTERSECT': op = IntersectOperator(left_op, right_op, ast.all)
+        elif op_name == 'EXCEPT': op = ExceptOperator(left_op, right_op, ast.all)
+        else: raise ExecutionError(f"unknown set op: {op_name}")
         return self._drain(op)
 
     def _plan_any(self, ast: Any, catalog: Catalog) -> Operator:
         if isinstance(ast, SetOperationStmt):
             left = self._plan_any(ast.left, catalog)
             right = self._plan_any(ast.right, catalog)
-            if ast.op.upper() == 'UNION':
-                return UnionOperator(left, right, ast.all)
-            if ast.op.upper() == 'INTERSECT':
-                return IntersectOperator(left, right, ast.all)
+            if ast.op.upper() == 'UNION': return UnionOperator(left, right, ast.all)
+            if ast.op.upper() == 'INTERSECT': return IntersectOperator(left, right, ast.all)
             return ExceptOperator(left, right, ast.all)
         if isinstance(ast, SelectStmt):
             ast = self._resolve_subqueries(ast, catalog)
             has_agg = any(self._contains_agg(e) for e in ast.select_list)
             has_win = any(self._contains_window(e) for e in ast.select_list)
-            if has_agg or ast.group_by:
-                return self._plan_grouped(ast, catalog)
-            if has_win:
-                return self._plan_windowed(ast, catalog)
+            if has_agg or ast.group_by: return self._plan_grouped(ast, catalog)
+            if has_win: return self._plan_windowed(ast, catalog)
             return self._plan_select(ast, catalog)
         raise ExecutionError(f"unsupported in set op: {type(ast).__name__}")
 
@@ -182,55 +162,40 @@ class SimplePlanner:
     # DML
     # ══════════════════════════════════════════════════════════════
     def _exec_insert(self, ast: InsertStmt, catalog: Catalog) -> ExecutionResult:
-        schema = catalog.get_table(ast.table)
-        store = catalog.get_store(ast.table)
+        schema = catalog.get_table(ast.table); store = catalog.get_store(ast.table)
         if ast.columns:
-            seen: set = set()
-            sc = {c.name for c in schema.columns}
+            seen: set = set(); sc = {c.name for c in schema.columns}
             for c in ast.columns:
-                if c in seen:
-                    raise ExecutionError(f"duplicate column: '{c}'")
-                if c not in sc:
-                    raise ColumnNotFoundError(c)
+                if c in seen: raise ExecutionError(f"duplicate column: '{c}'")
+                if c not in sc: raise ColumnNotFoundError(c)
                 seen.add(c)
-        dummy = VectorBatch.single_row_no_columns()
-        count = 0
+        dummy = VectorBatch.single_row_no_columns(); count = 0
         for ve in ast.values:
             pv = [self._evaluator.evaluate(e, dummy).get(0) for e in ve]
-            if ast.columns:
-                full = self._reorder(pv, ast.columns, schema)
+            if ast.columns: full = self._reorder(pv, ast.columns, schema)
             else:
                 if len(pv) != len(schema.columns):
-                    raise ExecutionError(
-                        f"expected {len(schema.columns)} values, got {len(pv)}")
+                    raise ExecutionError(f"expected {len(schema.columns)} values, got {len(pv)}")
                 full = pv
-            store.append_row(self._validate_row(full, schema))
-            count += 1
+            store.append_row(self._validate_row(full, schema)); count += 1
         w = 'row' if count == 1 else 'rows'
         return ExecutionResult(affected_rows=count, message=f"Inserted {count} {w}")
 
-    def _reorder(self, vals: list, cols: List[str], schema: TableSchema) -> list:
-        cm = dict(zip(cols, vals))
-        result = []
+    def _reorder(self, vals, cols, schema):
+        cm = dict(zip(cols, vals)); result = []
         for c in schema.columns:
-            if c.name in cm:
-                result.append(cm[c.name])
-            elif c.nullable:
-                result.append(None)
-            else:
-                raise ExecutionError(f"column '{c.name}' is NOT NULL")
+            if c.name in cm: result.append(cm[c.name])
+            elif c.nullable: result.append(None)
+            else: raise ExecutionError(f"column '{c.name}' is NOT NULL")
         return result
 
-    def _validate_row(self, row: list, schema: TableSchema) -> list:
-        if len(row) != len(schema.columns):
-            raise ExecutionError("column count mismatch")
+    def _validate_row(self, row, schema):
+        if len(row) != len(schema.columns): raise ExecutionError("column count mismatch")
         result = []
         for val, col in zip(row, schema.columns):
             if val is None:
-                if not col.nullable:
-                    raise ExecutionError(f"NULL for NOT NULL '{col.name}'")
-                result.append(None)
-                continue
+                if not col.nullable: raise ExecutionError(f"NULL for NOT NULL '{col.name}'")
+                result.append(None); continue
             dt = col.dtype
             try:
                 if dt == DataType.INT:
@@ -238,71 +203,54 @@ class SimplePlanner:
                     if not (-2_147_483_648 <= v <= 2_147_483_647):
                         raise NumericOverflowError(f"overflow: {v}")
                     result.append(v)
-                elif dt == DataType.BIGINT:
-                    result.append(int(val))
-                elif dt in (DataType.FLOAT, DataType.DOUBLE):
-                    result.append(float(val))
+                elif dt == DataType.BIGINT: result.append(int(val))
+                elif dt in (DataType.FLOAT, DataType.DOUBLE): result.append(float(val))
                 elif dt == DataType.BOOLEAN:
                     result.append(val if isinstance(val, bool) else bool(val))
                 elif dt in (DataType.VARCHAR, DataType.TEXT):
                     s = str(val)
-                    if col.max_length and len(s) > col.max_length:
-                        s = s[:col.max_length]
+                    if col.max_length and len(s) > col.max_length: s = s[:col.max_length]
                     result.append(s)
-                else:
-                    result.append(val)
+                else: result.append(val)
             except (ValueError, TypeError) as e:
                 raise ExecutionError(f"cannot convert {val!r} to {dt.name}: {e}")
         return result
 
     def _exec_update(self, ast: UpdateStmt, catalog: Catalog) -> ExecutionResult:
-        schema = catalog.get_table(ast.table)
-        store = catalog.get_store(ast.table)
+        schema = catalog.get_table(ast.table); store = catalog.get_store(ast.table)
         all_rows = store.read_all_rows()
-        cn = schema.column_names
-        ct = [c.dtype for c in schema.columns]
+        cn = schema.column_names; ct = [c.dtype for c in schema.columns]
         count = 0
         for ri, row in enumerate(all_rows):
             if ast.where:
                 b = VectorBatch.from_rows([row], cn, ct)
-                if not self._evaluator.evaluate_predicate(ast.where, b).get_bit(0):
-                    continue
+                if not self._evaluator.evaluate_predicate(ast.where, b).get_bit(0): continue
             for a in ast.assignments:
-                ci = next((i for i, c in enumerate(schema.columns)
-                           if c.name == a.column), None)
-                if ci is None:
-                    raise ColumnNotFoundError(a.column)
+                ci = next((i for i, c in enumerate(schema.columns) if c.name == a.column), None)
+                if ci is None: raise ColumnNotFoundError(a.column)
                 b = VectorBatch.from_rows([row], cn, ct)
                 all_rows[ri][ci] = self._evaluator.evaluate(a.value, b).get(0)
             count += 1
         store.truncate()
-        for r in all_rows:
-            store.append_row(r)
+        for r in all_rows: store.append_row(r)
         w = 'row' if count == 1 else 'rows'
         return ExecutionResult(affected_rows=count, message=f"Updated {count} {w}")
 
     def _exec_delete(self, ast: DeleteStmt, catalog: Catalog) -> ExecutionResult:
-        schema = catalog.get_table(ast.table)
-        store = catalog.get_store(ast.table)
+        schema = catalog.get_table(ast.table); store = catalog.get_store(ast.table)
         if ast.where is None:
-            c = store.row_count
-            store.truncate()
+            c = store.row_count; store.truncate()
             return ExecutionResult(affected_rows=c,
                                    message=f"Deleted {c} {'row' if c == 1 else 'rows'}")
         ar = store.read_all_rows()
-        cn = schema.column_names
-        ct = [c.dtype for c in schema.columns]
-        keep = []
-        count = 0
+        cn = schema.column_names; ct = [c.dtype for c in schema.columns]
+        keep = []; count = 0
         for row in ar:
             b = VectorBatch.from_rows([row], cn, ct)
-            if self._evaluator.evaluate_predicate(ast.where, b).get_bit(0):
-                count += 1
-            else:
-                keep.append(row)
+            if self._evaluator.evaluate_predicate(ast.where, b).get_bit(0): count += 1
+            else: keep.append(row)
         store.truncate()
-        for r in keep:
-            store.append_row(r)
+        for r in keep: store.append_row(r)
         return ExecutionResult(affected_rows=count,
                                message=f"Deleted {count} {'row' if count == 1 else 'rows'}")
 
@@ -319,21 +267,19 @@ class SimplePlanner:
             return self._drain(self._plan_windowed(ast, catalog))
         return self._drain(self._plan_select(ast, catalog))
 
-    def _resolve_subqueries(self, ast: SelectStmt, catalog: Catalog) -> SelectStmt:
+    def _resolve_subqueries(self, ast, catalog):
         if ast.where:
             ast = dataclasses.replace(ast, where=self._resolve_sq(ast.where, catalog))
         new_sl = [self._resolve_sq(e, catalog) for e in ast.select_list]
         return dataclasses.replace(ast, select_list=new_sl)
 
-    def _resolve_sq(self, node: Any, catalog: Catalog) -> Any:
-        if node is None:
-            return None
+    def _resolve_sq(self, node, catalog):
+        if node is None: return None
         if isinstance(node, SubqueryExpr):
             result = self.execute(node.query, catalog)
             if result.rows and result.columns:
-                return Literal(
-                    value=result.rows[0][0],
-                    inferred_type=result.column_types[0] if result.column_types else DataType.INT)
+                return Literal(value=result.rows[0][0],
+                               inferred_type=result.column_types[0] if result.column_types else DataType.INT)
             return Literal(value=None, inferred_type=DataType.UNKNOWN)
         if isinstance(node, InExpr):
             new_vals = []
@@ -343,10 +289,9 @@ class SimplePlanner:
                     for row in result.rows:
                         dt = result.column_types[0] if result.column_types else DataType.INT
                         new_vals.append(Literal(value=row[0], inferred_type=dt))
-                else:
-                    new_vals.append(v)
-            return dataclasses.replace(
-                node, values=new_vals, expr=self._resolve_sq(node.expr, catalog))
+                else: new_vals.append(v)
+            return dataclasses.replace(node, values=new_vals,
+                                       expr=self._resolve_sq(node.expr, catalog))
         if isinstance(node, ExistsExpr):
             result = self.execute(node.query, catalog)
             exists = len(result.rows) > 0
@@ -354,8 +299,7 @@ class SimplePlanner:
             return Literal(value=val, inferred_type=DataType.BOOLEAN)
         if isinstance(node, tuple):
             return tuple(self._resolve_sq(i, catalog) for i in node)
-        if not dataclasses.is_dataclass(node) or isinstance(node, type):
-            return node
+        if not dataclasses.is_dataclass(node) or isinstance(node, type): return node
         changes: dict = {}
         for f in dataclasses.fields(node):
             child = getattr(node, f.name)
@@ -370,121 +314,108 @@ class SimplePlanner:
     # ══════════════════════════════════════════════════════════════
     # Plan builders
     # ══════════════════════════════════════════════════════════════
-    def _plan_select(self, ast: SelectStmt, catalog: Catalog) -> Operator:
+    def _plan_select(self, ast, catalog):
         c = self._build_source(ast, catalog)
-        if ast.where:
-            c = FilterOperator(c, ast.where)
+        if ast.where: c = FilterOperator(c, ast.where)
         if ast.order_by:
-            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls)
-                                  for sk in ast.order_by])
+            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
         c = ProjectOperator(c, self._build_proj(ast))
-        if ast.distinct:
-            c = DistinctOperator(c)
+        if ast.distinct: c = DistinctOperator(c)
         if ast.limit is not None or ast.offset is not None:
             c = LimitOperator(c, self._eval_const(ast.limit),
                               self._eval_const(ast.offset) or 0)
         return c
 
-    def _plan_windowed(self, ast: SelectStmt, catalog: Catalog) -> Operator:
+    def _plan_windowed(self, ast, catalog):
         c = self._build_source(ast, catalog)
-        if ast.where:
-            c = FilterOperator(c, ast.where)
+        if ast.where: c = FilterOperator(c, ast.where)
         win_map: Dict[str, WindowCall] = {}
         new_sl = [self._extract_windows(e, win_map) for e in ast.select_list]
-        if win_map:
-            c = WindowOperator(c, list(win_map.items()))
+        if win_map: c = WindowOperator(c, list(win_map.items()))
         proj = []
         for orig, subst in zip(ast.select_list, new_sl):
             name = self._out_name(orig)
             inner = subst.expr if isinstance(subst, AliasExpr) else subst
             proj.append((name, inner))
-        if ast.order_by:
-            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls)
-                                  for sk in ast.order_by])
+        # Project BEFORE Sort so ORDER BY can reference output column names (aliases)
         c = ProjectOperator(c, proj)
-        if ast.distinct:
-            c = DistinctOperator(c)
+        if ast.order_by:
+            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
+        if ast.distinct: c = DistinctOperator(c)
         if ast.limit is not None or ast.offset is not None:
             c = LimitOperator(c, self._eval_const(ast.limit),
                               self._eval_const(ast.offset) or 0)
         return c
 
-    def _plan_grouped(self, ast: SelectStmt, catalog: Catalog) -> Operator:
+    def _plan_grouped(self, ast, catalog):
         source = self._build_source(ast, catalog)
-        if ast.where:
-            source = FilterOperator(source, ast.where)
+        if ast.where: source = FilterOperator(source, ast.where)
         scan_schema = dict(source.output_schema())
-
         ge: List[Tuple[str, Any]] = []
         if ast.group_by:
-            for k in ast.group_by.keys:
-                ge.append((self._col_name(k), k))
-
+            for k in ast.group_by.keys: ge.append((self._col_name(k), k))
         agg_map: Dict[str, AggregateCall] = {}
         substituted = [self._extract_aggs(e, agg_map) for e in ast.select_list]
         having_subst = self._extract_aggs(ast.having, agg_map) if ast.having else None
-
         ae = [(t, ac) for t, ac in agg_map.items()]
-        if not ge and not ae:
-            return self._plan_select(ast, catalog)
-
-        # Scalar aggregate (no GROUP BY)
+        if not ge and not ae: return self._plan_select(ast, catalog)
         if not ge:
-            batch = self._compute_scalar_agg(source, scan_schema, agg_map,
-                                             substituted, ast)
+            batch = self._compute_scalar_agg(source, scan_schema, agg_map, substituted, ast)
             return _ScalarAggOperator(batch)
-
-        # Handle COUNT(DISTINCT)
+        # Handle COUNT(DISTINCT) and SUM(DISTINCT) etc
         final_ae = []
         for temp, ac in ae:
             if ac.distinct and ac.name.upper() == 'COUNT':
-                final_ae.append((temp, AggregateCall(name='COUNT_DISTINCT',
-                                                      args=ac.args)))
+                final_ae.append((temp, AggregateCall(name='COUNT_DISTINCT', args=ac.args)))
+            elif ac.distinct and ac.name.upper() == 'SUM':
+                final_ae.append((temp, AggregateCall(name='SUM_DISTINCT', args=ac.args)))
+            elif ac.distinct and ac.name.upper() == 'AVG':
+                final_ae.append((temp, AggregateCall(name='AVG_DISTINCT', args=ac.args)))
             else:
                 final_ae.append((temp, ac))
-
         c: Operator = HashAggOperator(source, ge, final_ae, self._registry)
-        if having_subst is not None:
-            c = FilterOperator(c, having_subst)
+        if having_subst is not None: c = FilterOperator(c, having_subst)
         if ast.order_by:
-            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls)
-                                  for sk in ast.order_by])
+            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
         fp = [(self._out_name(o), (s.expr if isinstance(s, AliasExpr) else s))
               for o, s in zip(ast.select_list, substituted)]
         c = ProjectOperator(c, fp)
-        if ast.distinct:
-            c = DistinctOperator(c)
+        if ast.distinct: c = DistinctOperator(c)
         if ast.limit is not None or ast.offset is not None:
             c = LimitOperator(c, self._eval_const(ast.limit),
                               self._eval_const(ast.offset) or 0)
         return c
 
-    def _compute_scalar_agg(self, source: Operator,
-                            scan_schema: Dict[str, DataType],
-                            agg_map: Dict[str, AggregateCall],
-                            substituted: list, ast: Any) -> VectorBatch:
+    def _compute_scalar_agg(self, source, scan_schema, agg_map, substituted, ast):
         agg_states: Dict[str, tuple] = {}
         for temp, ac in agg_map.items():
             name = ac.name.upper()
-            if ac.distinct and name == 'COUNT':
-                name = 'COUNT_DISTINCT'
+            if ac.distinct and name == 'COUNT': name = 'COUNT_DISTINCT'
+            elif ac.distinct and name == 'SUM': name = 'SUM_DISTINCT'
+            elif ac.distinct and name == 'AVG': name = 'AVG_DISTINCT'
             func = self._registry.get_aggregate(name)
-            agg_states[temp] = (func, func.init())
+            # STRING_AGG separator handling
+            if name == 'STRING_AGG' and len(ac.args) >= 2:
+                try:
+                    sep_val = self._evaluator.evaluate(
+                        ac.args[1], VectorBatch.single_row_no_columns()).get(0)
+                    agg_states[temp] = (func, func.init_with_sep(str(sep_val) if sep_val else ','))
+                except Exception:
+                    agg_states[temp] = (func, func.init())
+            else:
+                agg_states[temp] = (func, func.init())
 
         source.open()
         while True:
             batch = source.next_batch()
-            if batch is None:
-                break
+            if batch is None: break
             for temp, ac in agg_map.items():
                 func, state = agg_states[temp]
                 if ac.args and isinstance(ac.args[0], StarExpr):
                     state = func.update(state, None, batch.row_count)
                 else:
-                    state = func.update(
-                        state,
-                        self._evaluator.evaluate(ac.args[0], batch),
-                        batch.row_count)
+                    state = func.update(state,
+                        self._evaluator.evaluate(ac.args[0], batch), batch.row_count)
                 agg_states[temp] = (func, state)
         source.close()
 
@@ -494,29 +425,23 @@ class SimplePlanner:
             ac = agg_map[temp]
             if ac.args and not isinstance(ac.args[0], StarExpr):
                 it = [ExpressionEvaluator.infer_type(ac.args[0], scan_schema)]
-            else:
-                it = []
+            else: it = []
             sd[temp] = DataVector.from_scalar(val, func.return_type(it))
         sb = VectorBatch(columns=sd, _row_count=1)
 
-        rc: Dict[str, DataVector] = {}
-        on: List[str] = []
+        rc: Dict[str, DataVector] = {}; on: List[str] = []
         for orig, subst in zip(ast.select_list, substituted):
             name = self._out_name(orig)
-            rc[name] = self._evaluator.evaluate(subst, sb)
-            on.append(name)
+            rc[name] = self._evaluator.evaluate(subst, sb); on.append(name)
         return VectorBatch(columns=rc, _column_order=on, _row_count=1)
 
     # ══════════════════════════════════════════════════════════════
     # Source
     # ══════════════════════════════════════════════════════════════
-    def _build_source(self, ast: SelectStmt, catalog: Catalog) -> Operator:
-        if ast.from_clause is None:
-            return DualScan()
-        fc = ast.from_clause
-        tref = fc.table
-        if tref.subquery:
-            return self._plan_any(tref.subquery, catalog)
+    def _build_source(self, ast, catalog):
+        if ast.from_clause is None: return DualScan()
+        fc = ast.from_clause; tref = fc.table
+        if tref.subquery: return self._plan_any(tref.subquery, catalog)
         has_join = bool(fc.joins)
         if has_join:
             lq = tref.alias or tref.name
@@ -531,18 +456,15 @@ class SimplePlanner:
                     right_op = self._plan_any(jc.table.subquery, catalog)
                     rq = jc.table.alias or '__sub'
                     rs = right_op.output_schema()
-                    right_op = ProjectOperator(
-                        right_op,
-                        [(f"{rq}.{n}", ColumnRef(table=None, column=n))
-                         for n, _ in rs])
+                    right_op = ProjectOperator(right_op,
+                        [(f"{rq}.{n}", ColumnRef(table=None, column=n)) for n, _ in rs])
                 else:
                     rq = jc.table.alias or jc.table.name
                     r_store = catalog.get_store(jc.table.name)
                     r_cols = [c.name for c in r_store.schema.columns]
                     right_op = ProjectOperator(
                         SeqScan(jc.table.name, r_store, r_cols),
-                        [(f"{rq}.{c}", ColumnRef(table=None, column=c))
-                         for c in r_cols])
+                        [(f"{rq}.{c}", ColumnRef(table=None, column=c)) for c in r_cols])
                 if jc.join_type == 'CROSS':
                     cur = CrossJoinOperator(cur, right_op)
                 else:
@@ -552,158 +474,118 @@ class SimplePlanner:
             st = catalog.get_store(tref.name)
             needed = self._collect_all_cols(ast)
             ordered = [c.name for c in st.schema.columns if c.name in needed]
-            if not ordered:
-                ordered = [st.schema.columns[0].name]
+            if not ordered: ordered = [st.schema.columns[0].name]
             return SeqScan(tref.name, st, ordered)
 
     # ══════════════════════════════════════════════════════════════
-    # Extraction helpers
+    # Extraction
     # ══════════════════════════════════════════════════════════════
-    def _extract_aggs(self, expr: Any, agg_map: Dict[str, AggregateCall]) -> Any:
-        if expr is None:
-            return None
+    def _extract_aggs(self, expr, agg_map):
+        if expr is None: return None
         if isinstance(expr, AggregateCall):
-            t = f'__agg_{len(agg_map)}'
-            agg_map[t] = expr
+            t = f'__agg_{len(agg_map)}'; agg_map[t] = expr
             return ColumnRef(table=None, column=t)
         if isinstance(expr, AliasExpr):
-            return AliasExpr(
-                expr=self._extract_aggs(expr.expr, agg_map), alias=expr.alias)
+            return AliasExpr(expr=self._extract_aggs(expr.expr, agg_map), alias=expr.alias)
         return self._rec_extract(expr, agg_map)
 
-    def _rec_extract(self, node: Any, agg_map: Dict) -> Any:
-        if node is None:
-            return None
-        if isinstance(node, AggregateCall):
-            return self._extract_aggs(node, agg_map)
+    def _rec_extract(self, node, agg_map):
+        if node is None: return None
+        if isinstance(node, AggregateCall): return self._extract_aggs(node, agg_map)
         if isinstance(node, tuple):
             return tuple(self._rec_extract(i, agg_map) for i in node)
-        if not dataclasses.is_dataclass(node) or isinstance(node, type):
-            return node
+        if not dataclasses.is_dataclass(node) or isinstance(node, type): return node
         ch: dict = {}
         for f in dataclasses.fields(node):
             c = getattr(node, f.name)
-            if isinstance(c, AggregateCall):
-                ch[f.name] = self._extract_aggs(c, agg_map)
+            if isinstance(c, AggregateCall): ch[f.name] = self._extract_aggs(c, agg_map)
             elif isinstance(c, list):
-                new_list = []
+                nl = []
                 for item in c:
-                    if isinstance(item, AggregateCall):
-                        new_list.append(self._extract_aggs(item, agg_map))
+                    if isinstance(item, AggregateCall): nl.append(self._extract_aggs(item, agg_map))
                     elif isinstance(item, tuple):
-                        new_list.append(
-                            tuple(self._rec_extract(x, agg_map) for x in item))
+                        nl.append(tuple(self._rec_extract(x, agg_map) for x in item))
                     elif dataclasses.is_dataclass(item) and not isinstance(item, type):
-                        new_list.append(self._rec_extract(item, agg_map))
-                    else:
-                        new_list.append(item)
-                ch[f.name] = new_list
+                        nl.append(self._rec_extract(item, agg_map))
+                    else: nl.append(item)
+                ch[f.name] = nl
             elif isinstance(c, tuple):
                 ch[f.name] = tuple(self._rec_extract(i, agg_map) for i in c)
             elif dataclasses.is_dataclass(c) and not isinstance(c, type):
                 ch[f.name] = self._rec_extract(c, agg_map)
         return dataclasses.replace(node, **ch) if ch else node
 
-    def _extract_windows(self, expr: Any,
-                         win_map: Dict[str, WindowCall]) -> Any:
+    def _extract_windows(self, expr, win_map):
         if isinstance(expr, WindowCall):
-            t = f'__win_{len(win_map)}'
-            win_map[t] = expr
+            t = f'__win_{len(win_map)}'; win_map[t] = expr
             return ColumnRef(table=None, column=t)
         if isinstance(expr, AliasExpr):
-            return AliasExpr(
-                expr=self._extract_windows(expr.expr, win_map),
-                alias=expr.alias)
-        if not dataclasses.is_dataclass(expr) or isinstance(expr, type):
-            return expr
+            return AliasExpr(expr=self._extract_windows(expr.expr, win_map), alias=expr.alias)
+        if not dataclasses.is_dataclass(expr) or isinstance(expr, type): return expr
         ch: dict = {}
         for f in dataclasses.fields(expr):
             c = getattr(expr, f.name)
-            if isinstance(c, WindowCall):
-                ch[f.name] = self._extract_windows(c, win_map)
+            if isinstance(c, WindowCall): ch[f.name] = self._extract_windows(c, win_map)
             elif isinstance(c, list):
                 ch[f.name] = [self._extract_windows(i, win_map) for i in c]
             elif dataclasses.is_dataclass(c) and not isinstance(c, type):
                 ch[f.name] = self._extract_windows(c, win_map)
         return dataclasses.replace(expr, **ch) if ch else expr
 
-    def _contains_agg(self, n: Any) -> bool:
-        if isinstance(n, AggregateCall):
-            return True
-        if isinstance(n, WindowCall):
-            return False
-        if isinstance(n, AliasExpr):
-            return self._contains_agg(n.expr)
-        if isinstance(n, tuple):
-            return any(self._contains_agg(i) for i in n)
-        if n is None or not dataclasses.is_dataclass(n) or isinstance(n, type):
-            return False
+    def _contains_agg(self, n):
+        if isinstance(n, AggregateCall): return True
+        if isinstance(n, WindowCall): return False
+        if isinstance(n, AliasExpr): return self._contains_agg(n.expr)
+        if isinstance(n, tuple): return any(self._contains_agg(i) for i in n)
+        if n is None or not dataclasses.is_dataclass(n) or isinstance(n, type): return False
         for f in dataclasses.fields(n):
             c = getattr(n, f.name)
             if isinstance(c, list):
-                if any(self._contains_agg(i) for i in c):
-                    return True
-            elif self._contains_agg(c):
-                return True
+                if any(self._contains_agg(i) for i in c): return True
+            elif self._contains_agg(c): return True
         return False
 
-    def _contains_window(self, n: Any) -> bool:
-        if isinstance(n, WindowCall):
-            return True
-        if isinstance(n, AliasExpr):
-            return self._contains_window(n.expr)
-        if n is None or not dataclasses.is_dataclass(n) or isinstance(n, type):
-            return False
+    def _contains_window(self, n):
+        if isinstance(n, WindowCall): return True
+        if isinstance(n, AliasExpr): return self._contains_window(n.expr)
+        if n is None or not dataclasses.is_dataclass(n) or isinstance(n, type): return False
         for f in dataclasses.fields(n):
             c = getattr(n, f.name)
             if isinstance(c, list):
-                if any(self._contains_window(i) for i in c):
-                    return True
-            elif self._contains_window(c):
-                return True
+                if any(self._contains_window(i) for i in c): return True
+            elif self._contains_window(c): return True
         return False
 
-    def _collect_all_cols(self, ast: SelectStmt) -> Set[str]:
+    def _collect_all_cols(self, ast):
         r: Set[str] = set()
-        for e in ast.select_list:
-            r |= self._cc(e)
-        if ast.where:
-            r |= self._cc(ast.where)
-        for sk in (ast.order_by or []):
-            r |= self._cc(sk.expr)
+        for e in ast.select_list: r |= self._cc(e)
+        if ast.where: r |= self._cc(ast.where)
+        for sk in (ast.order_by or []): r |= self._cc(sk.expr)
         if ast.group_by:
-            for k in ast.group_by.keys:
-                r |= self._cc(k)
-        if ast.having:
-            r |= self._cc(ast.having)
+            for k in ast.group_by.keys: r |= self._cc(k)
+        if ast.having: r |= self._cc(ast.having)
         return r
 
-    def _cc(self, n: Any) -> Set[str]:
-        if n is None:
-            return set()
+    def _cc(self, n):
+        if n is None: return set()
         if isinstance(n, ColumnRef):
             r = {n.column}
-            if n.table:
-                r.add(f"{n.table}.{n.column}")
+            if n.table: r.add(f"{n.table}.{n.column}")
             return r
         if isinstance(n, tuple):
             result: Set[str] = set()
-            for item in n:
-                result |= self._cc(item)
+            for item in n: result |= self._cc(item)
             return result
-        if not dataclasses.is_dataclass(n) or isinstance(n, type):
-            return set()
+        if not dataclasses.is_dataclass(n) or isinstance(n, type): return set()
         r: Set[str] = set()
         for f in dataclasses.fields(n):
             c = getattr(n, f.name)
             if isinstance(c, list):
-                for item in c:
-                    r |= self._cc(item)
-            else:
-                r |= self._cc(c)
+                for item in c: r |= self._cc(item)
+            else: r |= self._cc(c)
         return r
 
-    def _build_proj(self, ast: SelectStmt) -> List[tuple]:
+    def _build_proj(self, ast):
         proj: List[tuple] = []
         for expr in ast.select_list:
             name = self._out_name(expr)
@@ -713,42 +595,32 @@ class SimplePlanner:
             proj.append((name, inner))
         return proj
 
-    def _out_name(self, expr: Any) -> str:
-        if isinstance(expr, AliasExpr):
-            return expr.alias
-        if isinstance(expr, ColumnRef):
-            return expr.column
+    def _out_name(self, expr):
+        if isinstance(expr, AliasExpr): return expr.alias
+        if isinstance(expr, ColumnRef): return expr.column
         return Formatter.expr_to_sql(expr)
 
-    def _col_name(self, expr: Any) -> str:
-        if isinstance(expr, ColumnRef):
-            return expr.column
+    def _col_name(self, expr):
+        if isinstance(expr, ColumnRef): return expr.column
         return Formatter.expr_to_sql(expr)
 
-    def _eval_const(self, expr: Any) -> Optional[int]:
-        if expr is None:
-            return None
+    def _eval_const(self, expr):
+        if expr is None: return None
         dummy = VectorBatch.single_row_no_columns()
         vec = self._evaluator.evaluate(expr, dummy)
         val = vec.get(0)
-        if val is None:
-            return None
+        if val is None: return None
         val = int(val)
-        if val < 0:
-            raise ExecutionError("LIMIT/OFFSET must be non-negative")
+        if val < 0: raise ExecutionError("LIMIT/OFFSET must be non-negative")
         return val
 
-    def _drain(self, op: Operator) -> ExecutionResult:
+    def _drain(self, op):
         schema = op.output_schema()
-        cn = [n for n, _ in schema]
-        ct = [t for _, t in schema]
-        op.open()
-        rows: list = []
+        cn = [n for n, _ in schema]; ct = [t for _, t in schema]
+        op.open(); rows: list = []
         while True:
             b = op.next_batch()
-            if b is None:
-                break
+            if b is None: break
             rows.extend(b.to_rows())
         op.close()
-        return ExecutionResult(columns=cn, column_types=ct,
-                               rows=rows, row_count=len(rows))
+        return ExecutionResult(columns=cn, column_types=ct, rows=rows, row_count=len(rows))

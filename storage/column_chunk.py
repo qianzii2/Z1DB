@@ -1,11 +1,17 @@
 from __future__ import annotations
-"""Column chunk — the basic unit of columnar storage."""
-
+"""Column chunk — the basic unit of columnar storage.
+Auto-creates dictionary encoding for low-cardinality VARCHAR columns."""
 from metal.bitmap import Bitmap
 from metal.config import CHUNK_SIZE
 from metal.typed_vector import TypedVector
 from storage.types import DTYPE_TO_ARRAY_CODE, DataType
 from utils.errors import ExecutionError
+
+try:
+    from storage.compression.dict_codec import DictEncoded
+    _HAS_DICT = True
+except ImportError:
+    _HAS_DICT = False
 
 
 class ColumnChunk:
@@ -18,6 +24,7 @@ class ColumnChunk:
         self.null_bitmap = Bitmap(0)
         self.zone_map: dict = {'min': None, 'max': None, 'null_count': 0}
         self.compression = 'NONE'
+        self.dict_encoded: object = None  # DictEncoded for VARCHAR, built lazily
 
         code = DTYPE_TO_ARRAY_CODE.get(dtype)
         if code is not None:
@@ -29,7 +36,6 @@ class ColumnChunk:
         else:
             raise ExecutionError(f"unsupported column type: {dtype.name}")
 
-    # ------------------------------------------------------------------
     def append(self, value: object) -> None:
         if self.row_count >= self.max_capacity:
             raise ExecutionError("chunk full")
@@ -57,7 +63,6 @@ class ColumnChunk:
         self.row_count += 1
         self._update_zone_map(value)
 
-    # ------------------------------------------------------------------
     def _update_zone_map(self, value: object) -> None:
         if value is None:
             self.zone_map['null_count'] += 1
@@ -65,14 +70,13 @@ class ColumnChunk:
         cur_min = self.zone_map['min']
         cur_max = self.zone_map['max']
         try:
-            if cur_min is None or value < cur_min:  # type: ignore[operator]
+            if cur_min is None or value < cur_min:
                 self.zone_map['min'] = value
-            if cur_max is None or value > cur_max:  # type: ignore[operator]
+            if cur_max is None or value > cur_max:
                 self.zone_map['max'] = value
         except TypeError:
             pass
 
-    # ------------------------------------------------------------------
     def get(self, row_idx: int) -> object:
         if self.null_bitmap.get_bit(row_idx):
             return None
@@ -83,4 +87,31 @@ class ColumnChunk:
             return self.data[row_idx]
         if isinstance(self.data, list):
             return self.data[row_idx]
-        return None  # pragma: no cover
+        return None
+
+    def build_dict_encoding(self) -> None:
+        """Build dictionary encoding for VARCHAR/TEXT columns if beneficial.
+        Called after chunk is full or before query execution."""
+        if not _HAS_DICT:
+            return
+        if self.dtype not in (DataType.VARCHAR, DataType.TEXT):
+            return
+        if not isinstance(self.data, list) or self.row_count == 0:
+            return
+        # Only build if NDV < 65536 and NDV < row_count / 2
+        distinct = set()
+        for i in range(self.row_count):
+            if not self.null_bitmap.get_bit(i):
+                distinct.add(self.data[i])
+                if len(distinct) > 65535:
+                    return  # Too many distinct values
+        if len(distinct) >= self.row_count // 2:
+            return  # Not worth it
+        # Build dictionary
+        non_null_values = []
+        for i in range(self.row_count):
+            if self.null_bitmap.get_bit(i):
+                non_null_values.append('')
+            else:
+                non_null_values.append(self.data[i])
+        self.dict_encoded = DictEncoded.encode(non_null_values)

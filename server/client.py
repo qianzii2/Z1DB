@@ -10,7 +10,7 @@ class REPL:
         self._show_timer = True
 
     def run(self) -> None:
-        print("Z1DB v0.7 — Type .help for commands, .quit to exit")
+        print("Z1DB v0.8 — Type .help for commands, .quit to exit")
         buffer = ''
         while True:
             prompt = 'z1db> ' if not buffer else '  ...> '

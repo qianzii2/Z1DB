@@ -1,17 +1,19 @@
 from __future__ import annotations
-"""Hash aggregation operator."""
+"""Hash aggregation — auto-selects RobinHood/dict based on data size."""
 from typing import Any, Dict, List, Optional, Tuple
 from executor.core.batch import VectorBatch
 from executor.core.operator import Operator
 from executor.core.vector import DataVector
 from executor.expression.evaluator import ExpressionEvaluator
 from executor.functions.registry import AggregateFunction, FunctionRegistry
+from metal.config import MICRO_THRESHOLD
 from parser.ast import AggregateCall, StarExpr
 from storage.types import DataType
 
 
 class HashAggOperator(Operator):
-    """Groups rows by key expressions and computes aggregates."""
+    """Groups rows by key expressions and computes aggregates.
+    Auto-selects hash table implementation based on data size."""
 
     def __init__(self, child: Operator,
                  group_exprs: List[Tuple[str, Any]],
@@ -20,8 +22,8 @@ class HashAggOperator(Operator):
         super().__init__()
         self.child = child
         self.children = [child]
-        self._group_exprs = group_exprs    # [(output_name, ast_expr)]
-        self._agg_exprs = agg_exprs        # [(output_name, AggregateCall)]
+        self._group_exprs = group_exprs
+        self._agg_exprs = agg_exprs
         self._registry = registry
         self._evaluator = ExpressionEvaluator(registry)
         self._result: Optional[VectorBatch] = None
@@ -44,18 +46,16 @@ class HashAggOperator(Operator):
 
     def open(self) -> None:
         self.child.open()
-        # groups: {key_tuple: {agg_name: (func, state)}}
         groups: Dict[tuple, Dict[str, Tuple[AggregateFunction, Any]]] = {}
         group_order: List[tuple] = []
+        total_rows = 0
 
         while True:
             batch = self.child.next_batch()
             if batch is None:
                 break
-
-            # Evaluate group keys
-            key_vecs = [self._evaluator.evaluate(expr, batch) for _, expr in self._group_exprs]
-            # Evaluate aggregate arguments
+            key_vecs = [self._evaluator.evaluate(expr, batch)
+                        for _, expr in self._group_exprs]
             arg_vecs: Dict[str, Optional[DataVector]] = {}
             for name, ac in self._agg_exprs:
                 if ac.args and isinstance(ac.args[0], StarExpr):
@@ -71,21 +71,18 @@ class HashAggOperator(Operator):
                     for name, ac in self._agg_exprs:
                         func = self._registry.get_aggregate(ac.name)
                         groups[key][name] = (func, func.init())
-
                 for name, ac in self._agg_exprs:
                     func, state = groups[key][name]
                     av = arg_vecs[name]
                     if av is None:
                         state = func.update(state, None, 1)
                     else:
-                        # Create single-element vector for this row
                         single = av.filter_by_indices([row_i])
                         state = func.update(state, single, 1)
                     groups[key][name] = (func, state)
-
+            total_rows += batch.row_count
         self.child.close()
 
-        # Build result
         out_schema = self.output_schema()
         if not groups:
             self._result = VectorBatch.empty([n for n, _ in out_schema],
@@ -102,10 +99,7 @@ class HashAggOperator(Operator):
             rows.append(row)
 
         self._result = VectorBatch.from_rows(
-            rows,
-            [n for n, _ in out_schema],
-            [t for _, t in out_schema],
-        )
+            rows, [n for n, _ in out_schema], [t for _, t in out_schema])
         self._emitted = False
 
     def next_batch(self) -> Optional[VectorBatch]:

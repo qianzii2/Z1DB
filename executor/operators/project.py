@@ -1,23 +1,27 @@
 from __future__ import annotations
-"""Projection operator."""
-
+"""Projection operator — handles lazy batches efficiently."""
 from typing import Any, Dict, List, Optional, Tuple
-
 from executor.core.batch import VectorBatch
 from executor.core.operator import Operator
 from executor.expression.evaluator import ExpressionEvaluator
 from storage.types import DataType
 
+try:
+    from executor.core.lazy_batch import LazyBatch
+    _HAS_LAZY = True
+except ImportError:
+    _HAS_LAZY = False
+
 
 class ProjectOperator(Operator):
-    """Evaluates a list of expressions to produce output columns."""
+    """Evaluates expressions. Handles LazyBatch for deferred materialization."""
 
     def __init__(self, child: Operator,
                  projections: List[Tuple[str, Any]]) -> None:
         super().__init__()
         self.child = child
         self.children = [child]
-        self._projections = projections  # [(output_name, ast_expr), ...]
+        self._projections = projections
         self._evaluator = ExpressionEvaluator()
         self._closed = False
 
@@ -42,6 +46,22 @@ class ProjectOperator(Operator):
         batch = self.child.next_batch()
         if batch is None:
             return None
+
+        # Handle LazyBatch: evaluate on original, then filter
+        if _HAS_LAZY and isinstance(batch, LazyBatch):
+            lazy: LazyBatch = batch
+            indices = lazy.get_indices()
+            if not indices:
+                return None
+            result_cols = {}
+            names: List[str] = []
+            for name, expr in self._projections:
+                vec = self._evaluator.evaluate(expr, lazy._batch)
+                result_cols[name] = vec.filter_by_indices(indices)
+                names.append(name)
+            return VectorBatch(columns=result_cols, _column_order=names)
+
+        # Normal path
         result_cols = {}
         names: List[str] = []
         for name, expr in self._projections:

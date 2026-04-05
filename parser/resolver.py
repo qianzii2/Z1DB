@@ -127,12 +127,29 @@ class Resolver:
 
     def _resolve_ref(self, expr: Any, alias_map: Dict, select_list: list) -> Any:
         if isinstance(expr, ColumnRef) and expr.table is None and expr.column in alias_map:
-            return alias_map[expr.column]
+            resolved = alias_map[expr.column]
+            # Don't resolve if it would introduce a WindowCall into ORDER BY
+            # (WindowCall can only appear inside WindowOperator, not in Sort)
+            try:
+                from parser.ast import WindowCall
+                if isinstance(resolved, WindowCall):
+                    return expr  # Keep as ColumnRef — will resolve to projected column name
+            except ImportError:
+                pass
+            return resolved
         if isinstance(expr, Literal) and isinstance(expr.value, int) and expr.inferred_type in (DataType.INT, DataType.BIGINT):
             o = expr.value
             if 1 <= o <= len(select_list):
                 t = select_list[o - 1]
-                return t.expr if isinstance(t, AliasExpr) else t
+                result = t.expr if isinstance(t, AliasExpr) else t
+                # Same check: don't resolve ordinal to WindowCall
+                try:
+                    from parser.ast import WindowCall
+                    if isinstance(result, WindowCall):
+                        return expr
+                except ImportError:
+                    pass
+                return result
         return expr
 
     def _resolve_aliases(self, node: Any, alias_map: Dict) -> Any:

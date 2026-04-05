@@ -1,8 +1,6 @@
 from __future__ import annotations
-"""DataVector — typed column vector with null bitmap."""
-
+"""DataVector — typed column vector with null bitmap + optional dict encoding."""
 from typing import Any, List, Optional
-
 from metal.bitmap import Bitmap, BitmapLike
 from metal.typed_vector import TypedVector
 from storage.column_chunk import ColumnChunk
@@ -11,18 +9,17 @@ from utils.errors import ExecutionError
 
 
 class DataVector:
-    """A typed array of values with an associated null bitmap."""
+    """A typed array of values with null bitmap and optional dictionary encoding."""
 
-    __slots__ = ('dtype', 'data', 'nulls', '_length')
+    __slots__ = ('dtype', 'data', 'nulls', '_length', 'dict_encoded')
 
-    def __init__(self, dtype: DataType,
-                 data: Any,
-                 nulls: Bitmap,
-                 _length: int) -> None:
+    def __init__(self, dtype: DataType, data: Any, nulls: Bitmap,
+                 _length: int, dict_encoded: Any = None) -> None:
         self.dtype = dtype
-        self.data = data      # TypedVector | Bitmap | list[str]
+        self.data = data
         self.nulls = nulls
         self._length = _length
+        self.dict_encoded = dict_encoded  # DictEncoded or None
 
     def __len__(self) -> int:
         return self._length
@@ -37,19 +34,17 @@ class DataVector:
             return self.data[i]
         if isinstance(self.data, list):
             return self.data[i]
-        return None  # pragma: no cover
+        return None
 
     def is_null(self, i: int) -> bool:
         return self.nulls.get_bit(i)
 
-    # -- filtering -----------------------------------------------------
     def filter_by_bitmap(self, mask: BitmapLike) -> DataVector:
         return self.filter_by_indices(mask.to_indices())
 
     def filter_by_indices(self, indices: List[int]) -> DataVector:
         n = len(indices)
         new_nulls = Bitmap(n)
-
         if isinstance(self.data, TypedVector):
             new_data: Any = TypedVector(self.data.dtype_code, [self.data[i] for i in indices])
         elif isinstance(self.data, list):
@@ -61,18 +56,15 @@ class DataVector:
                     new_data.set_bit(j)
         else:
             raise ExecutionError(f"unexpected data type in filter: {type(self.data)}")
-
         for j, i in enumerate(indices):
             if self.nulls.get_bit(i):
                 new_nulls.set_bit(j)
-
+        # Don't propagate dict_encoded after filtering (indices changed)
         return DataVector(dtype=self.dtype, data=new_data, nulls=new_nulls, _length=n)
 
-    # -- conversion ----------------------------------------------------
     def to_python_list(self) -> list:
         return [self.get(i) for i in range(self._length)]
 
-    # -- factories -----------------------------------------------------
     @staticmethod
     def from_column_chunk(chunk: ColumnChunk) -> DataVector:
         n = chunk.row_count
@@ -84,12 +76,20 @@ class DataVector:
             data = chunk.data.copy()
         else:
             raise ExecutionError(f"unexpected chunk data type: {type(chunk.data)}")
-
         nulls = Bitmap(n)
         for i in range(n):
             if chunk.null_bitmap.get_bit(i):
                 nulls.set_bit(i)
-        return DataVector(dtype=chunk.dtype, data=data, nulls=nulls, _length=n)
+        # Propagate dictionary encoding if available
+        de = None
+        if chunk.dict_encoded is not None:
+            de = chunk.dict_encoded
+        elif chunk.dtype in (DataType.VARCHAR, DataType.TEXT) and n > 0:
+            # Try to build dict encoding lazily on first scan
+            chunk.build_dict_encoding()
+            de = chunk.dict_encoded
+        return DataVector(dtype=chunk.dtype, data=data, nulls=nulls,
+                          _length=n, dict_encoded=de)
 
     @staticmethod
     def from_scalar(value: Any, dtype: DataType) -> DataVector:
@@ -98,7 +98,6 @@ class DataVector:
             nulls.set_bit(0)
             dt = dtype if dtype != DataType.UNKNOWN else DataType.INT
             return DataVector.from_nulls(dt, 1, nulls)
-
         code = DTYPE_TO_ARRAY_CODE.get(dtype)
         if code is not None:
             data: Any = TypedVector(code, [value])
@@ -131,7 +130,6 @@ class DataVector:
             raise ExecutionError("cannot concat empty vector list")
         dtype = vectors[0].dtype
         total = sum(len(v) for v in vectors)
-
         if isinstance(vectors[0].data, TypedVector):
             new_data: Any = TypedVector(vectors[0].data.dtype_code)
             for v in vectors:
@@ -146,9 +144,7 @@ class DataVector:
                 new_data.append_from(v.data, len(v))
         else:
             raise ExecutionError(f"unexpected data type in concat: {type(vectors[0].data)}")
-
         new_nulls = Bitmap(0)
         for v in vectors:
             new_nulls.append_from(v.nulls, len(v))
-
         return DataVector(dtype=dtype, data=new_data, nulls=new_nulls, _length=total)

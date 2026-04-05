@@ -1,16 +1,12 @@
 from __future__ import annotations
 """Base operator interface for the Volcano execution model."""
-
 from abc import ABC, abstractmethod
 from typing import List, Optional
-
 from executor.core.batch import VectorBatch
 from storage.types import DataType
 
 
 class Operator(ABC):
-    """Abstract pull-based operator."""
-
     def __init__(self) -> None:
         self.children: List[Operator] = []
 
@@ -24,7 +20,6 @@ class Operator(ABC):
     def close(self) -> None: ...
 
     def output_schema(self) -> List[tuple[str, DataType]]:
-        """Return [(column_name, dtype), ...].  May be called before open()."""
         return []
 
     def explain(self, indent: int = 0) -> str:

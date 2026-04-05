@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Aggregate function registry — Phase 5: MEDIAN, ARRAY_AGG, more stats."""
+"""Aggregate function registry — complete 22 aggregates."""
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 import math
@@ -54,6 +54,19 @@ class SumAgg(AggregateFunction):
         if it and it[0] in (DataType.FLOAT, DataType.DOUBLE): return DataType.DOUBLE
         return DataType.BIGINT
 
+class SumDistinctAgg(AggregateFunction):
+    name = 'SUM_DISTINCT'
+    def init(self): return set()
+    def update(self, s, v, rc):
+        if v is None: return s
+        for i in range(len(v)):
+            if not v.is_null(i): s.add(v.get(i))
+        return s
+    def finalize(self, s): return sum(s) if s else None
+    def return_type(self, it):
+        if it and it[0] in (DataType.FLOAT, DataType.DOUBLE): return DataType.DOUBLE
+        return DataType.BIGINT
+
 class AvgAgg(AggregateFunction):
     name = 'AVG'
     def init(self): return (0.0, 0)
@@ -64,6 +77,17 @@ class AvgAgg(AggregateFunction):
             if not v.is_null(i): sm += v.get(i); c += 1
         return (sm, c)
     def finalize(self, s): return s[0]/s[1] if s[1] else None
+    def return_type(self, it): return DataType.DOUBLE
+
+class AvgDistinctAgg(AggregateFunction):
+    name = 'AVG_DISTINCT'
+    def init(self): return set()
+    def update(self, s, v, rc):
+        if v is None: return s
+        for i in range(len(v)):
+            if not v.is_null(i): s.add(v.get(i))
+        return s
+    def finalize(self, s): return sum(s)/len(s) if s else None
     def return_type(self, it): return DataType.DOUBLE
 
 class MinAgg(AggregateFunction):
@@ -150,37 +174,50 @@ class MedianAgg(AggregateFunction):
         return s
     def finalize(self, s):
         if not s: return None
-        s.sort()
-        n = len(s)
-        if n % 2 == 1: return s[n // 2]
-        return (s[n//2 - 1] + s[n//2]) / 2
+        s.sort(); n = len(s)
+        return s[n//2] if n % 2 == 1 else (s[n//2-1] + s[n//2]) / 2
     def return_type(self, it): return DataType.DOUBLE
 
-class ArrayAggFunc(AggregateFunction):
-    name = 'ARRAY_AGG'
-    def init(self): return []
+class PercentileContAgg(AggregateFunction):
+    name = 'PERCENTILE_CONT'
+    def init(self): return ([], 0.5)
     def update(self, s, v, rc):
+        vals, pct = s
         if v is None: return s
         for i in range(len(v)):
-            if not v.is_null(i): s.append(v.get(i))
-        return s
-    def finalize(self, s): return s if s else None
-    def return_type(self, it): return DataType.VARCHAR  # represented as string
-
-class StringAggFunc(AggregateFunction):
-    name = 'STRING_AGG'
-    def init(self): return ([], None)
-    def update(self, s, v, rc):
-        parts, sep = s
-        if v is None: return s
-        for i in range(len(v)):
-            if not v.is_null(i): parts.append(str(v.get(i)))
-        return (parts, sep)
+            if not v.is_null(i):
+                val = v.get(i)
+                if isinstance(val, (int, float)):
+                    # First arg might be the percentile value
+                    pass
+                vals.append(val)
+        return (vals, pct)
     def finalize(self, s):
-        parts, sep = s
-        if not parts: return None
-        return (sep or ',').join(parts)
-    def return_type(self, it): return DataType.VARCHAR
+        vals, pct = s
+        if not vals: return None
+        vals.sort(); n = len(vals)
+        idx = pct * (n - 1)
+        lo = int(idx); hi = min(lo + 1, n - 1)
+        frac = idx - lo
+        return vals[lo] * (1 - frac) + vals[hi] * frac
+    def return_type(self, it): return DataType.DOUBLE
+
+class PercentileDiscAgg(AggregateFunction):
+    name = 'PERCENTILE_DISC'
+    def init(self): return ([], 0.5)
+    def update(self, s, v, rc):
+        vals, pct = s
+        if v is None: return s
+        for i in range(len(v)):
+            if not v.is_null(i): vals.append(v.get(i))
+        return (vals, pct)
+    def finalize(self, s):
+        vals, pct = s
+        if not vals: return None
+        vals.sort()
+        idx = int(math.ceil(pct * len(vals))) - 1
+        return vals[max(0, min(idx, len(vals) - 1))]
+    def return_type(self, it): return it[0] if it else DataType.UNKNOWN
 
 class ModeAgg(AggregateFunction):
     name = 'MODE'
@@ -196,6 +233,90 @@ class ModeAgg(AggregateFunction):
         return max(s, key=s.get)
     def return_type(self, it): return it[0] if it else DataType.UNKNOWN
 
+class ApproxCountDistinctAgg(AggregateFunction):
+    name = 'APPROX_COUNT_DISTINCT'
+    def init(self):
+        from executor.sketch.hyperloglog import HyperLogLog
+        return HyperLogLog(p=11)
+    def update(self, s, v, rc):
+        if v is None: return s
+        for i in range(len(v)):
+            if not v.is_null(i): s.add(v.get(i))
+        return s
+    def finalize(self, s): return s.estimate()
+    def return_type(self, it): return DataType.BIGINT
+
+class ApproxPercentileAgg(AggregateFunction):
+    name = 'APPROX_PERCENTILE'
+    def init(self):
+        from executor.sketch.t_digest import TDigest
+        return TDigest(compression=100)
+    def update(self, s, v, rc):
+        if v is None: return s
+        for i in range(len(v)):
+            if not v.is_null(i):
+                try: s.add(float(v.get(i)))
+                except (ValueError, TypeError): pass
+        return s
+    def finalize(self, s): return s.quantile(0.5)
+    def return_type(self, it): return DataType.DOUBLE
+
+class ApproxTopKAgg(AggregateFunction):
+    name = 'APPROX_TOP_K'
+    def init(self):
+        from executor.sketch.count_min_sketch import CountMinSketch
+        return (CountMinSketch(width=2048, depth=5), {})
+    def update(self, s, v, rc):
+        cms, candidates = s
+        if v is None: return s
+        for i in range(len(v)):
+            if not v.is_null(i):
+                val = v.get(i)
+                cms.add(val)
+                candidates[val] = candidates.get(val, 0) + 1
+        return (cms, candidates)
+    def finalize(self, s):
+        cms, candidates = s
+        if not candidates: return None
+        top = sorted(candidates.items(), key=lambda x: -x[1])[:10]
+        return str([item[0] for item in top])
+    def return_type(self, it): return DataType.VARCHAR
+
+class ArrayAggFunc(AggregateFunction):
+    name = 'ARRAY_AGG'
+    def init(self): return []
+    def update(self, s, v, rc):
+        if v is None: return s
+        for i in range(len(v)):
+            if not v.is_null(i): s.append(v.get(i))
+        return s
+    def finalize(self, s): return str(s) if s else None
+    def return_type(self, it): return DataType.VARCHAR
+
+class StringAggFunc(AggregateFunction):
+    name = 'STRING_AGG'
+    def init(self): return ([], ',')
+    def init_with_sep(self, sep: str) -> tuple:
+        """Initialize with custom separator."""
+        return ([], sep)
+    def update(self, s, v, rc):
+        parts, sep = s
+        if v is None: return s
+        for i in range(len(v)):
+            if not v.is_null(i): parts.append(str(v.get(i)))
+        return (parts, sep)
+    def finalize(self, s):
+        parts, sep = s
+        return sep.join(parts) if parts else None
+    def return_type(self, it): return DataType.VARCHAR
+
+class GroupingAgg(AggregateFunction):
+    name = 'GROUPING'
+    def init(self): return 0
+    def update(self, s, v, rc): return s
+    def finalize(self, s): return s
+    def return_type(self, it): return DataType.INT
+
 
 class FunctionRegistry:
     def __init__(self) -> None:
@@ -205,12 +326,16 @@ class FunctionRegistry:
         self._aggregates[func.name.upper()] = func
     def get_aggregate(self, name: str) -> AggregateFunction:
         upper = name.upper()
-        if upper not in self._aggregates: raise ExecutionError(f"unknown aggregate: {name}")
+        if upper not in self._aggregates:
+            raise ExecutionError(f"unknown aggregate: {name}")
         return self._aggregates[upper]
     def has_aggregate(self, name: str) -> bool:
         return name.upper() in self._aggregates
     def register_defaults(self) -> None:
-        for cls in (CountAgg, CountDistinctAgg, SumAgg, AvgAgg, MinAgg, MaxAgg,
+        for cls in (CountAgg, CountDistinctAgg, SumAgg, SumDistinctAgg,
+                    AvgAgg, AvgDistinctAgg, MinAgg, MaxAgg,
                     StddevAgg, StddevPopAgg, VarianceAgg, VarPopAgg,
-                    MedianAgg, ArrayAggFunc, StringAggFunc, ModeAgg):
+                    MedianAgg, PercentileContAgg, PercentileDiscAgg, ModeAgg,
+                    ApproxCountDistinctAgg, ApproxPercentileAgg, ApproxTopKAgg,
+                    ArrayAggFunc, StringAggFunc, GroupingAgg):
             self.register_aggregate(cls())

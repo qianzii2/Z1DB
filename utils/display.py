@@ -1,16 +1,10 @@
 from __future__ import annotations
-"""Result formatting and table rendering.
-
-Uses duck typing to avoid importing higher-layer types.  The *dtype*
-parameter is expected to have a ``.name`` attribute (e.g. an ``Enum`` member).
-"""
-
+"""Result formatting and table rendering."""
 import datetime
 from typing import Any
 
 
 def format_value(val: Any, dtype: Any) -> str:
-    """Format a single cell value for display."""
     if val is None:
         return 'NULL'
     name = dtype.name if hasattr(dtype, 'name') else str(dtype)
@@ -37,16 +31,22 @@ def format_value(val: Any, dtype: Any) -> str:
 
 
 def print_result(result: Any) -> None:
-    """Pretty-print an ExecutionResult-like object."""
-    # DDL / message results
     if getattr(result, 'message', '') and not getattr(result, 'columns', []):
-        print(f"{result.message} ({_fmt_time(result.timing)})")
+        timing = getattr(result, 'timing', 0.0)
+        if timing > 0:
+            print(f"{result.message} ({_fmt_time(timing)})")
+        else:
+            print(f"{result.message}")
         return
 
     if getattr(result, 'affected_rows', 0) > 0 and not getattr(result, 'columns', []):
         n = result.affected_rows
         word = 'row' if n == 1 else 'rows'
-        print(f"Inserted {n} {word} ({_fmt_time(result.timing)})")
+        timing = getattr(result, 'timing', 0.0)
+        if timing > 0:
+            print(f"Inserted {n} {word} ({_fmt_time(timing)})")
+        else:
+            print(f"Inserted {n} {word}")
         return
 
     columns = getattr(result, 'columns', [])
@@ -55,7 +55,6 @@ def print_result(result: Any) -> None:
         rows = getattr(result, 'rows', [])
         timing = getattr(result, 'timing', 0.0)
 
-        # Build string matrix
         str_rows: list[list[str]] = []
         for row in rows:
             str_row: list[str] = []
@@ -64,14 +63,12 @@ def print_result(result: Any) -> None:
                 str_row.append(format_value(val, dt) if dt else str(val) if val is not None else 'NULL')
             str_rows.append(str_row)
 
-        # Column widths
         widths = [len(c) for c in columns]
         for sr in str_rows:
             for ci, s in enumerate(sr):
                 if ci < len(widths):
                     widths[ci] = max(widths[ci], len(s))
 
-        # Draw
         def line(left: str, mid: str, right: str, fill: str = '─') -> str:
             return left + mid.join(fill * (w + 2) for w in widths) + right
 
@@ -89,11 +86,17 @@ def print_result(result: Any) -> None:
 
         n = len(rows)
         word = 'row' if n == 1 else 'rows'
-        print(f"{n} {word} ({_fmt_time(timing)})")
+        if timing > 0:
+            print(f"{n} {word} ({_fmt_time(timing)})")
+        else:
+            print(f"{n} {word}")
     else:
         timing = getattr(result, 'timing', 0.0)
         msg = getattr(result, 'message', '') or 'OK'
-        print(f"{msg} ({_fmt_time(timing)})")
+        if timing > 0:
+            print(f"{msg} ({_fmt_time(timing)})")
+        else:
+            print(msg)
 
 
 def _fmt_time(t: float) -> str:
