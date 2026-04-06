@@ -1,22 +1,24 @@
 from __future__ import annotations
-"""Strategy selector — bridges adaptive engine with planner.
-Examines AST + catalog statistics to choose strategies."""
+"""策略选择器 — 分析 AST + 统计信息选择执行策略。"""
 from typing import Any, Dict, List, Optional, Set, Tuple
 from catalog.catalog import Catalog
-from executor.adaptive.micro_engine import AdaptiveStrategy, MicroAdaptiveEngine
+from executor.adaptive.micro_engine import (
+    AdaptiveStrategy, MicroAdaptiveEngine)
 from parser.ast import ColumnRef, SelectStmt, SortKey
 from storage.types import DataType
 
 
 class StrategySelector:
-    """Selects execution strategies based on table statistics and query shape."""
+    """分析 SELECT 并推荐执行策略。"""
 
-    def __init__(self, catalog: Catalog, stats: Optional[Dict] = None) -> None:
+    def __init__(self, catalog: Catalog,
+                 stats: Optional[Dict] = None) -> None:
         self._catalog = catalog
         self._stats = stats or {}
 
-    def analyze_select(self, ast: SelectStmt) -> AdaptiveStrategy:
-        """Analyze a SELECT statement and return strategy decisions."""
+    def analyze_select(self,
+                       ast: SelectStmt) -> AdaptiveStrategy:
+        """分析 SELECT 返回策略决策。"""
         row_count = 0
         has_where = ast.where is not None
         has_join = bool(ast.from_clause and ast.from_clause.joins)
@@ -29,31 +31,30 @@ class StrategySelector:
         sort_dtype = None
         has_zone_maps = False
 
-        # Get row count from primary table
         if ast.from_clause and ast.from_clause.table:
             tname = ast.from_clause.table.name
             if self._catalog.table_exists(tname):
                 store = self._catalog.get_store(tname)
                 row_count = store.row_count
-                # Check if zone maps exist
+                # [FIX-C01] 安全检查 zone_map 方法是否存在
                 if row_count > 0:
-                    chunks = store.get_column_chunks(store.schema.columns[0].name)
-                    has_zone_maps = any(
-                        c.zone_map.get('min') is not None for c in chunks)
+                    has_zone_maps = self._has_zone_maps(tname)
 
-        # Join right side size
         if has_join:
             for jc in ast.from_clause.joins:
-                if jc.table and self._catalog.table_exists(jc.table.name):
-                    join_right_rows = self._catalog.get_store(jc.table.name).row_count
+                if (jc.table
+                        and self._catalog.table_exists(jc.table.name)):
+                    join_right_rows = self._catalog.get_store(
+                        jc.table.name).row_count
 
-        # GROUP BY NDV estimate
         if has_group_by and ast.group_by.keys:
             first_key = ast.group_by.keys[0]
-            if isinstance(first_key, ColumnRef) and ast.from_clause:
+            if (isinstance(first_key, ColumnRef)
+                    and ast.from_clause):
                 tname = ast.from_clause.table.name
                 if tname in self._stats:
-                    col_stats = self._stats[tname].column_stats.get(first_key.column)
+                    col_stats = self._stats[tname] \
+                        .column_stats.get(first_key.column)
                     if col_stats:
                         group_ndv = col_stats.ndv
                     else:
@@ -61,10 +62,10 @@ class StrategySelector:
                 else:
                     group_ndv = max(row_count // 10, 1)
 
-        # Sort type
         if has_order_by and ast.order_by:
             first_sort = ast.order_by[0]
-            if isinstance(first_sort.expr, ColumnRef) and ast.from_clause:
+            if (isinstance(first_sort.expr, ColumnRef)
+                    and ast.from_clause):
                 tname = ast.from_clause.table.name
                 if self._catalog.table_exists(tname):
                     schema = self._catalog.get_table(tname)
@@ -73,10 +74,10 @@ class StrategySelector:
                             sort_dtype = c.dtype
                             break
 
-        # Limit value
         if has_limit:
             try:
-                if hasattr(ast.limit, 'value') and isinstance(ast.limit.value, int):
+                if (hasattr(ast.limit, 'value')
+                        and isinstance(ast.limit.value, int)):
                     limit_n = ast.limit.value
             except Exception:
                 pass
@@ -94,3 +95,42 @@ class StrategySelector:
             sort_dtype=sort_dtype,
             has_zone_maps=has_zone_maps,
         )
+
+    def recommend_scan(self, table_name: str,
+                       has_where: bool = False) -> str:
+        if not self._catalog.table_exists(table_name):
+            return 'SEQ_SCAN'
+        store = self._catalog.get_store(table_name)
+        rc = store.row_count
+        strategy = MicroAdaptiveEngine.select_strategy(
+            row_count=rc, has_where=has_where,
+            has_zone_maps=self._has_zone_maps(table_name))
+        return strategy.scan
+
+    def recommend_join(self, left_rows: int,
+                       right_rows: int) -> str:
+        strategy = MicroAdaptiveEngine.select_strategy(
+            row_count=left_rows,
+            has_join=True,
+            join_right_rows=right_rows)
+        return strategy.join
+
+    def _has_zone_maps(self, table_name: str) -> bool:
+        """[FIX-C01] 安全检测 zone_map 可用性。"""
+        try:
+            store = self._catalog.get_store(table_name)
+            if store.row_count == 0:
+                return False
+            if not hasattr(store, 'get_column_chunks'):
+                return False
+            if not hasattr(store, 'schema') or not store.schema.columns:
+                return False
+            chunks = store.get_column_chunks(
+                store.schema.columns[0].name)
+            return any(
+                hasattr(c, 'zone_map')
+                and isinstance(c.zone_map, dict)
+                and c.zone_map.get('min') is not None
+                for c in chunks)
+        except Exception:
+            return False

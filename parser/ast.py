@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""AST节点定义。"""
+"""AST 节点定义。"""
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 from storage.types import DataType
@@ -21,16 +21,20 @@ class SelectStmt:
 
 @dataclass
 class SetOperationStmt:
-    op: str = 'UNION'; all: bool = False; left: Any = None; right: Any = None
+    op: str = 'UNION'; all: bool = False
+    left: Any = None; right: Any = None
 
 @dataclass
 class InsertStmt:
     table: str = ''; columns: Optional[List[str]] = None
-    values: list = field(default_factory=list); query: Optional[Any] = None
+    values: list = field(default_factory=list)
+    query: Optional[Any] = None
 
 @dataclass
 class UpdateStmt:
-    table: str = ''; assignments: list = field(default_factory=list); where: Optional[Any] = None
+    table: str = ''
+    assignments: list = field(default_factory=list)
+    where: Optional[Any] = None
 
 @dataclass
 class DeleteStmt:
@@ -38,7 +42,9 @@ class DeleteStmt:
 
 @dataclass
 class CreateTableStmt:
-    table: str = ''; columns: List[ColumnDef] = field(default_factory=list); if_not_exists: bool = False
+    table: str = ''
+    columns: List[ColumnDef] = field(default_factory=list)
+    if_not_exists: bool = False
 
 @dataclass
 class DropTableStmt:
@@ -46,7 +52,8 @@ class DropTableStmt:
 
 @dataclass
 class CreateIndexStmt:
-    index_name: str = ''; table: str = ''; columns: List[str] = field(default_factory=list)
+    index_name: str = ''; table: str = ''
+    columns: List[str] = field(default_factory=list)
     unique: bool = False; if_not_exists: bool = False
 
 @dataclass
@@ -59,8 +66,18 @@ class ExplainStmt:
 
 @dataclass
 class AlterTableStmt:
-    table: str = ''; action: str = ''; column_def: Optional[ColumnDef] = None
+    table: str = ''; action: str = ''
+    column_def: Optional[ColumnDef] = None
     column_name: str = ''; new_name: str = ''
+
+@dataclass
+class CopyStmt:
+    """COPY table FROM/TO 'filepath' [WITH (...)]"""
+    table: str = ''
+    file_path: str = ''
+    direction: str = 'FROM'  # FROM / TO
+    has_header: bool = True
+    delimiter: str = ','
 
 @dataclass
 class FromClause:
@@ -69,21 +86,27 @@ class FromClause:
 
 @dataclass
 class TableRef:
-    name: str = ''; alias: Optional[str] = None; subquery: Optional[Any] = None
+    name: str = ''; alias: Optional[str] = None
+    subquery: Optional[Any] = None
+    func_args: Optional[list] = None  # 表函数参数
 
 @dataclass
 class JoinClause:
-    join_type: str = 'INNER'; table: Optional[TableRef] = None
-    on: Optional[Any] = None; using: Optional[List[str]] = None
+    join_type: str = 'INNER'
+    table: Optional[TableRef] = None
+    on: Optional[Any] = None
+    using: Optional[List[str]] = None
     natural: bool = False
 
 @dataclass
 class SortKey:
-    expr: Any = None; direction: str = 'ASC'; nulls: Optional[str] = None
+    expr: Any = None; direction: str = 'ASC'
+    nulls: Optional[str] = None
 
 @dataclass
 class ColumnDef:
-    name: str = ''; type_name: Optional[TypeName] = None; nullable: bool = True; primary_key: bool = False
+    name: str = ''; type_name: Optional[TypeName] = None
+    nullable: bool = True; primary_key: bool = False
 
 @dataclass
 class TypeName:
@@ -107,7 +130,7 @@ class ColumnRef:
 
 @dataclass
 class StarExpr:
-    table: Optional[str] = None
+    table: Optional[str] = None # [新增] 支持 t.*
 
 @dataclass
 class BinaryExpr:
@@ -128,7 +151,8 @@ class AliasExpr:
 @dataclass
 class AggregateCall:
     name: str = ''; args: list = field(default_factory=list)
-    distinct: bool = False; filter_clause: Optional[Any] = None
+    distinct: bool = False
+    filter_clause: Optional[Any] = None
 
 @dataclass
 class FunctionCall:
@@ -136,20 +160,26 @@ class FunctionCall:
 
 @dataclass
 class WindowCall:
-    func: Any = None; partition_by: list = field(default_factory=list)
-    order_by: list = field(default_factory=list); frame: Optional[WindowFrame] = None
+    func: Any = None
+    partition_by: list = field(default_factory=list)
+    order_by: list = field(default_factory=list)
+    frame: Optional[WindowFrame] = None
 
 @dataclass
 class WindowFrame:
-    mode: str = 'ROWS'; start: Optional[FrameBound] = None; end: Optional[FrameBound] = None
+    mode: str = 'ROWS'
+    start: Optional[FrameBound] = None
+    end: Optional[FrameBound] = None
 
 @dataclass
 class FrameBound:
-    type: str = 'CURRENT_ROW'; offset: Optional[int] = None
+    type: str = 'CURRENT_ROW'
+    offset: Optional[int] = None
 
 @dataclass
 class CaseExpr:
-    operand: Optional[Any] = None; when_clauses: list = field(default_factory=list)
+    operand: Optional[Any] = None
+    when_clauses: list = field(default_factory=list)
     else_expr: Optional[Any] = None
 
 @dataclass
@@ -158,15 +188,19 @@ class CastExpr:
 
 @dataclass
 class InExpr:
-    expr: Any = None; values: list = field(default_factory=list); negated: bool = False
+    expr: Any = None
+    values: list = field(default_factory=list)
+    negated: bool = False
 
 @dataclass
 class BetweenExpr:
-    expr: Any = None; low: Any = None; high: Any = None; negated: bool = False
+    expr: Any = None; low: Any = None; high: Any = None
+    negated: bool = False
 
 @dataclass
 class LikeExpr:
-    expr: Any = None; pattern: Any = None; negated: bool = False
+    expr: Any = None; pattern: Any = None
+    negated: bool = False
 
 @dataclass
 class SubqueryExpr:

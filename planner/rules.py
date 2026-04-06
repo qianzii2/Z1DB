@@ -1,5 +1,7 @@
 from __future__ import annotations
-"""优化规则 — 真正的谓词下推 + 谓词重排 + TopN推入。"""
+"""优化规则 — 谓词下推 + 谓词重排 + TopN 推入。
+[FIX-B10] 不构造子查询，将单表谓词合并到 JOIN ON。
+[P04] CROSS JOIN 不合并谓词到 ON（否则语义改变）。"""
 import dataclasses
 from typing import Any, List, Optional, Set
 from parser.ast import (
@@ -10,17 +12,8 @@ from parser.ast import (
 
 
 class PredicatePushdown:
-    """将WHERE中的单表谓词下推到JOIN的输入侧。
-
-    SELECT * FROM A JOIN B ON A.id = B.id WHERE A.x > 10 AND B.y < 5
-    →
-    SELECT * FROM
-      (SELECT * FROM A WHERE A.x > 10) A
-      JOIN
-      (SELECT * FROM B WHERE B.y < 5) B
-      ON A.id = B.id
-
-    减少JOIN输入规模 → 更快执行。"""
+    """将 WHERE 中的单表谓词下推到 JOIN ON 条件中。
+    减少 JOIN 输入规模 → 更快执行。"""
 
     @staticmethod
     def apply(ast: SelectStmt) -> SelectStmt:
@@ -30,7 +23,7 @@ class PredicatePushdown:
             return ast
 
         # 收集所有表名/别名
-        table_aliases: dict = {}  # alias → name
+        table_aliases: dict = {}
         base = ast.from_clause.table
         base_alias = base.alias or base.name
         table_aliases[base_alias] = base.name
@@ -39,10 +32,9 @@ class PredicatePushdown:
                 ja = jc.table.alias or jc.table.name
                 table_aliases[ja] = jc.table.name
 
-        # 分解AND
         conjuncts = PredicatePushdown._split_and(ast.where)
 
-        # 分类：单表谓词 vs 多表谓词
+        # 分类：单表谓词 vs 多表/无表谓词
         single_table: dict = {}  # table_alias → [pred, ...]
         remaining: list = []
 
@@ -54,102 +46,50 @@ class PredicatePushdown:
                     single_table.setdefault(t, []).append(pred)
                 else:
                     remaining.append(pred)
-            elif len(pred_tables) == 0:
-                # 常量谓词，保留在WHERE
-                remaining.append(pred)
             else:
                 remaining.append(pred)
 
         if not single_table:
-            return ast  # 没有可下推的
+            return ast
 
-        # 对基表应用下推：包装为带WHERE的子查询TableRef
-        new_base = base
-        if base_alias in single_table:
-            pushed = PredicatePushdown._combine_and(
-                single_table[base_alias])
-            if pushed and not base.subquery:
-                # 构造 (SELECT * FROM table WHERE pushed) alias
-                inner_select = SelectStmt(
-                    select_list=[StarExpr()],
-                    from_clause=FromClause(
-                        table=TableRef(name=base.name), joins=[]),
-                    where=PredicatePushdown._strip_table_prefix(
-                        pushed, base_alias))
-                new_base = TableRef(
-                    name=base_alias, alias=base_alias,
-                    subquery=inner_select)
-
-        # 对JOIN表应用下推
+        # 对 JOIN 表应用下推（合并到 ON 条件）
         new_joins = []
         for jc in ast.from_clause.joins:
             if jc.table is None:
                 new_joins.append(jc)
                 continue
             ja = jc.table.alias or jc.table.name
-            if ja in single_table and not jc.table.subquery:
-                pushed = PredicatePushdown._combine_and(
-                    single_table[ja])
-                if pushed:
-                    inner_select = SelectStmt(
-                        select_list=[StarExpr()],
-                        from_clause=FromClause(
-                            table=TableRef(name=jc.table.name), joins=[]),
-                        where=PredicatePushdown._strip_table_prefix(
-                            pushed, ja))
-                    new_tref = TableRef(
-                        name=ja, alias=ja, subquery=inner_select)
-                    new_joins.append(dataclasses.replace(
-                        jc, table=new_tref))
-                else:
+            if ja in single_table:
+                # [P04] CROSS JOIN 不合并谓词到 ON（会改变语义为 INNER JOIN）
+                if jc.join_type == 'CROSS':
+                    remaining.extend(single_table[ja])
                     new_joins.append(jc)
+                else:
+                    pushed = PredicatePushdown._combine_and(
+                        single_table[ja])
+                    if pushed and jc.on:
+                        combined_on = BinaryExpr(
+                            op='AND', left=jc.on, right=pushed)
+                        new_joins.append(
+                            dataclasses.replace(jc, on=combined_on))
+                    elif pushed:
+                        new_joins.append(
+                            dataclasses.replace(jc, on=pushed))
+                    else:
+                        new_joins.append(jc)
             else:
                 new_joins.append(jc)
 
-        new_where = (PredicatePushdown._combine_and(remaining)
-                     if remaining else None)
-        new_from = FromClause(table=new_base, joins=new_joins)
+        # 基表的单表谓词保留在 WHERE
+        base_preds = single_table.get(base_alias, [])
+        all_remaining = base_preds + remaining
+        new_where = (PredicatePushdown._combine_and(all_remaining)
+                     if all_remaining else None)
+
+        new_from = dataclasses.replace(
+            ast.from_clause, joins=new_joins)
         return dataclasses.replace(
             ast, where=new_where, from_clause=new_from)
-
-    @staticmethod
-    def _strip_table_prefix(pred: Any, alias: str) -> Any:
-        """移除谓词中的表前缀（下推后不再需要）。"""
-        if isinstance(pred, ColumnRef):
-            if pred.table == alias:
-                return ColumnRef(table=None, column=pred.column)
-            return pred
-        if isinstance(pred, BinaryExpr):
-            return BinaryExpr(
-                op=pred.op,
-                left=PredicatePushdown._strip_table_prefix(
-                    pred.left, alias),
-                right=PredicatePushdown._strip_table_prefix(
-                    pred.right, alias))
-        if isinstance(pred, UnaryExpr):
-            return UnaryExpr(
-                op=pred.op,
-                operand=PredicatePushdown._strip_table_prefix(
-                    pred.operand, alias))
-        if isinstance(pred, IsNullExpr):
-            return IsNullExpr(
-                expr=PredicatePushdown._strip_table_prefix(
-                    pred.expr, alias),
-                negated=pred.negated)
-        if dataclasses.is_dataclass(pred) and not isinstance(pred, type):
-            changes = {}
-            for f in dataclasses.fields(pred):
-                child = getattr(pred, f.name)
-                if isinstance(child, list):
-                    changes[f.name] = [
-                        PredicatePushdown._strip_table_prefix(i, alias)
-                        for i in child]
-                elif (dataclasses.is_dataclass(child)
-                      and not isinstance(child, type)):
-                    changes[f.name] = \
-                        PredicatePushdown._strip_table_prefix(child, alias)
-            return dataclasses.replace(pred, **changes) if changes else pred
-        return pred
 
     @staticmethod
     def _split_and(expr: Any) -> list:
@@ -188,7 +128,7 @@ class PredicatePushdown:
 
 
 class PredicateReorder:
-    """按估计选择率重排AND子句。最具选择性的谓词先执行。"""
+    """按估计选择率重排 AND 子句。最具选择性的谓词先执行。"""
 
     @staticmethod
     def apply(ast: SelectStmt) -> SelectStmt:
@@ -197,7 +137,8 @@ class PredicateReorder:
         conjuncts = PredicatePushdown._split_and(ast.where)
         if len(conjuncts) <= 1:
             return ast
-        scored = [(PredicateReorder._score(c), c) for c in conjuncts]
+        scored = [(PredicateReorder._score(c), c)
+                  for c in conjuncts]
         scored.sort(key=lambda x: x[0])
         reordered = [c for _, c in scored]
         new_where = PredicatePushdown._combine_and(reordered)
@@ -226,7 +167,7 @@ class PredicateReorder:
 
 
 class TopNPushdown:
-    """ORDER BY + LIMIT → TopN算子（堆排序O(n log K)）。"""
+    """ORDER BY + LIMIT → TopN 算子（堆排序 O(n log K)）。"""
 
     @staticmethod
     def should_use_top_n(ast: SelectStmt) -> bool:

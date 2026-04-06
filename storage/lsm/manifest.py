@@ -1,5 +1,6 @@
 from __future__ import annotations
-"""LSM Manifest — tracks active SSTables and their levels."""
+"""LSM Manifest — 跟踪活跃 SSTable 及其层级。
+[FIX-S02] 使用原子 rename 防止崩溃时 MANIFEST 损坏。"""
 import json
 import os
 from typing import Any, Dict, List, Optional
@@ -7,8 +8,6 @@ from storage.lsm.sstable import SSTableReader
 
 
 class Manifest:
-    """Tracks which SSTables are active at each level."""
-
     def __init__(self, data_dir: str) -> None:
         self._data_dir = data_dir
         self._levels: Dict[int, List[str]] = {0: [], 1: [], 2: []}
@@ -43,22 +42,43 @@ class Manifest:
 
     def next_sstable_path(self, level: int) -> str:
         self._next_id += 1
-        return os.path.join(self._data_dir, f'sst_L{level}_{self._next_id}.z1ss')
+        return os.path.join(
+            self._data_dir,
+            f'sst_L{level}_{self._next_id}.z1ss')
 
     def level_count(self, level: int) -> int:
         return len(self._levels.get(level, []))
 
     def _save(self) -> None:
+        """[FIX-S02] 原子保存：写临时文件 → fsync → rename。"""
         path = os.path.join(self._data_dir, 'MANIFEST.json')
+        tmp_path = path + '.tmp'
         os.makedirs(self._data_dir, exist_ok=True)
-        data = {'levels': self._levels, 'next_id': self._next_id}
-        with open(path, 'w') as f:
-            json.dump(data, f)
+        data = {
+            'levels': {str(k): v for k, v in self._levels.items()},
+            'next_id': self._next_id,
+        }
+        try:
+            with open(tmp_path, 'w') as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)  # 原子替换
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def _load(self) -> None:
         path = os.path.join(self._data_dir, 'MANIFEST.json')
         if os.path.exists(path):
-            with open(path, 'r') as f:
-                data = json.load(f)
-            self._levels = {int(k): v for k, v in data.get('levels', {}).items()}
-            self._next_id = data.get('next_id', 0)
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                self._levels = {
+                    int(k): v
+                    for k, v in data.get('levels', {}).items()}
+                self._next_id = data.get('next_id', 0)
+            except Exception:
+                pass  # 损坏时用默认空状态

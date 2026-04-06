@@ -1,893 +1,410 @@
 from __future__ import annotations
-"""递归下降 + Pratt表达式解析器。
-支持CTE、INSERT SELECT、CREATE INDEX、NATURAL JOIN、USING。"""
+"""SQL 解析器 — 语句级解析。表达式解析委托到 expr_parser.py。"""
 from typing import List, Optional
 from parser.ast import *
 from parser.precedence import Precedence
+from parser.expr_parser import ExprParser, _UNRESERVED
 from parser.token import Token, TokenType
 from storage.types import DataType
 from utils.errors import ParseError
 
-_UNRESERVED = frozenset({
-    TokenType.INT, TokenType.INTEGER, TokenType.BIGINT, TokenType.FLOAT_KW,
-    TokenType.DOUBLE, TokenType.REAL, TokenType.BOOLEAN, TokenType.BOOL,
-    TokenType.VARCHAR, TokenType.TEXT_KW, TokenType.DATE_KW,
-    TokenType.TIMESTAMP,
-    TokenType.FIRST, TokenType.LAST, TokenType.KEY, TokenType.PARTITION,
-    TokenType.ROWS, TokenType.RANGE, TokenType.UNBOUNDED,
-    TokenType.PRECEDING, TokenType.FOLLOWING, TokenType.CURRENT,
-    TokenType.ROW, TokenType.OVER,
-    TokenType.COLUMN, TokenType.RENAME, TokenType.TO, TokenType.ADD,
-    TokenType.INDEX, TokenType.UNIQUE, TokenType.USING, TokenType.NATURAL,
-})
-
-_INFIX = {
-    TokenType.OR: Precedence.OR,
-    TokenType.AND: Precedence.AND,
-    TokenType.EQUAL: Precedence.COMPARISON,
-    TokenType.NOT_EQUAL: Precedence.COMPARISON,
-    TokenType.LESS: Precedence.COMPARISON,
-    TokenType.GREATER: Precedence.COMPARISON,
-    TokenType.LESS_EQUAL: Precedence.COMPARISON,
-    TokenType.GREATER_EQUAL: Precedence.COMPARISON,
-    TokenType.IS: Precedence.IS,
-    TokenType.IN: Precedence.COMPARISON,
-    TokenType.BETWEEN: Precedence.COMPARISON,
-    TokenType.LIKE: Precedence.COMPARISON,
-    TokenType.PIPE_PIPE: Precedence.CONCAT,
-    TokenType.PLUS: Precedence.ADDITION,
-    TokenType.MINUS: Precedence.ADDITION,
-    TokenType.STAR: Precedence.MULTIPLY,
-    TokenType.SLASH: Precedence.MULTIPLY,
-    TokenType.PERCENT: Precedence.MULTIPLY,
-}
-
-_AGGS = frozenset({
-    'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
-    'STDDEV', 'STDDEV_POP', 'VARIANCE', 'VAR_POP',
-    'MEDIAN', 'MODE', 'ARRAY_AGG', 'STRING_AGG', 'COUNT_DISTINCT',
-    'SUM_DISTINCT', 'AVG_DISTINCT',
-    'PERCENTILE_CONT', 'PERCENTILE_DISC',
-    'APPROX_COUNT_DISTINCT', 'APPROX_PERCENTILE', 'APPROX_TOP_K',
-    'GROUPING',
-})
-
-_WINFUNCS = frozenset({
-    'ROW_NUMBER', 'RANK', 'DENSE_RANK', 'NTILE', 'PERCENT_RANK',
-    'CUME_DIST', 'LAG', 'LEAD', 'FIRST_VALUE', 'LAST_VALUE', 'NTH_VALUE',
-})
-
-_NOARG_FUNCS = frozenset({'current_date', 'current_timestamp', 'now'})
-
 
 class Parser:
     def __init__(self, tokens: list[Token]) -> None:
-        self._t = tokens
-        self._p = 0
-        self._c = tokens[0]
+        self._tokens = tokens
+        self._pos = 0
+        self._current = tokens[0]
+        self._expr = ExprParser(self)  # 表达式解析器
 
-    def _adv(self):
-        self._p += 1
-        self._c = (self._t[self._p] if self._p < len(self._t)
-                   else self._t[-1])
+    # ═══ 基础方法（供 ExprParser 回调）═══
 
-    def _pk(self) -> Token:
-        n = self._p + 1
-        return self._t[n] if n < len(self._t) else self._t[-1]
+    def _advance(self):
+        self._pos += 1
+        self._current = (self._tokens[self._pos]
+                         if self._pos < len(self._tokens) else self._tokens[-1])
 
-    def _ex(self, tt):
-        if self._c.type != tt:
-            raise ParseError(
-                f"expected {tt.value}, got {self._c.value!r}",
-                self._c.line, self._c.col)
-        t = self._c
-        self._adv()
-        return t
+    # ═══ [RP1] ParserInterface 实现 ═══
 
-    def _exi(self):
-        return int(self._ex(TokenType.INTEGER_LIT).value)
+    def advance(self) -> None:
+        """ParserInterface: 推进 token。"""
+        self._advance()
 
-    def _aid(self):
-        if self._c.type == TokenType.IDENTIFIER:
-            v = self._c.value
-            self._adv()
-            return v
-        if self._c.type in _UNRESERVED:
-            v = self._c.value.lower()
-            self._adv()
-            return v
-        raise ParseError(
-            f"expected identifier, got {self._c.value!r}",
-            self._c.line, self._c.col)
+    def current_token(self) -> Token:
+        """ParserInterface: 当前 token。"""
+        return self._current
+
+    def peek_token(self) -> Token:
+        """ParserInterface: 下一个 token。"""
+        return self._peek()
+
+    def expect(self, tt: TokenType) -> Token:
+        """ParserInterface: 期望并消费 token。"""
+        return self._expect(tt)
+
+    def expect_int(self) -> int:
+        """ParserInterface: 期望整数字面量。"""
+        return self._expect_int()
+
+    def accept_identifier(self) -> str:
+        """ParserInterface: 接受标识符。"""
+        return self._accept_identifier()
+
+    def parse_type_name(self) -> Any:
+        """ParserInterface: 解析类型名。"""
+        return self._parse_type_name()
+
+    def parse_select(self) -> Any:
+        """ParserInterface: 解析 SELECT 语句。"""
+        return self._parse_select()
+
+    def _peek(self) -> Token:
+        n = self._pos + 1
+        return self._tokens[n] if n < len(self._tokens) else self._tokens[-1]
+
+    def _expect(self, tt) -> Token:
+        if self._current.type != tt:
+            raise ParseError(f"期望 {tt.value}，实际 {self._current.value!r}",
+                             self._current.line, self._current.col)
+        t = self._current; self._advance(); return t
+
+    def _expect_int(self) -> int:
+        return int(self._expect(TokenType.INTEGER_LIT).value)
+
+    def _accept_identifier(self) -> str:
+        if self._current.type == TokenType.IDENTIFIER:
+            v = self._current.value; self._advance(); return v
+        if self._current.type in _UNRESERVED:
+            v = self._current.value.lower(); self._advance(); return v
+        raise ParseError(f"期望标识符，实际 {self._current.value!r}",
+                         self._current.line, self._current.col)
+
+    def _parse_type_name(self):
+        if self._current.type in _UNRESERVED or self._current.type == TokenType.IDENTIFIER:
+            n = self._current.value.upper(); self._advance()
+        else:
+            raise ParseError(f"期望类型名", self._current.line, self._current.col)
+        p = []
+        if self._current.type == TokenType.LPAREN:
+            self._advance(); p.append(self._expect_int()); self._expect(TokenType.RPAREN)
+        return TypeName(name=n, params=p)
+
+    # ═══ 顶层入口 ═══
 
     def parse(self):
-        stmt = self._stmt()
-        while self._c.type in (TokenType.UNION, TokenType.INTERSECT,
-                                TokenType.EXCEPT):
-            stmt = self._setop(stmt)
-        if self._c.type == TokenType.SEMICOLON:
-            self._adv()
-        if self._c.type != TokenType.EOF:
-            raise ParseError(
-                f"extra tokens: {self._c.value!r}",
-                self._c.line, self._c.col)
+        stmt = self._parse_statement()
+        while self._current.type in (TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
+            stmt = self._parse_set_operation(stmt)
+        if self._current.type == TokenType.SEMICOLON: self._advance()
+        if self._current.type != TokenType.EOF:
+            raise ParseError(f"多余 token: {self._current.value!r}",
+                             self._current.line, self._current.col)
         return stmt
 
-    def _setop(self, left):
-        op = self._c.value
-        self._adv()
-        a = False
-        if self._c.type == TokenType.ALL:
-            a = True
-            self._adv()
-        right = self._sel()
-        while self._c.type in (TokenType.UNION, TokenType.INTERSECT,
-                                TokenType.EXCEPT):
-            right = self._setop(right)
-        return SetOperationStmt(op=op, all=a, left=left, right=right)
-
-    def _stmt(self):
-        tt = self._c.type
-        if tt == TokenType.IDENTIFIER and self._c.value == 'with':
-            return self._with_cte()
-        if tt == TokenType.SELECT:
-            return self._sel()
-        if tt == TokenType.INSERT:
-            return self._ins()
-        if tt == TokenType.UPDATE:
-            return self._upd()
-        if tt == TokenType.DELETE:
-            return self._dlt()
+    def _parse_statement(self):
+        tt = self._current.type
+        if tt == TokenType.WITH or (tt == TokenType.IDENTIFIER and self._current.value == 'with'):
+            return self._parse_with_cte()
+        if tt == TokenType.SELECT: return self._parse_select()
+        if tt == TokenType.INSERT: return self._parse_insert()
+        if tt == TokenType.UPDATE: return self._parse_update()
+        if tt == TokenType.DELETE: return self._parse_delete()
+        if tt == TokenType.COPY: return self._parse_copy()
         if tt == TokenType.CREATE:
-            self._adv()
-            if self._c.type == TokenType.INDEX:
-                return self._create_index(unique=False)
-            if self._c.type == TokenType.UNIQUE:
-                self._adv()
-                self._ex(TokenType.INDEX)
-                return self._create_index(unique=True)
-            self._ex(TokenType.TABLE)
-            return self._crt()
+            self._advance()
+            if self._current.type == TokenType.INDEX: self._advance(); return self._parse_create_index(False)
+            if self._current.type == TokenType.UNIQUE: self._advance(); self._expect(TokenType.INDEX); return self._parse_create_index(True)
+            self._expect(TokenType.TABLE); return self._parse_create_table()
         if tt == TokenType.DROP:
-            self._adv()
-            if self._c.type == TokenType.INDEX:
-                return self._drop_index()
-            self._ex(TokenType.TABLE)
-            return self._drp()
-        if tt == TokenType.EXPLAIN:
-            return self._explain()
-        if tt == TokenType.ALTER:
-            return self._alter()
-        raise ParseError(
-            f"unexpected: {self._c.value!r}", self._c.line, self._c.col)
+            self._advance()
+            if self._current.type == TokenType.INDEX: self._advance(); return self._parse_drop_index()
+            self._expect(TokenType.TABLE); return self._parse_drop_table()
+        if tt == TokenType.EXPLAIN: return self._parse_explain()
+        if tt == TokenType.ALTER: return self._parse_alter()
+        raise ParseError(f"意外: {self._current.value!r}", self._current.line, self._current.col)
 
-    # ═══ CREATE/DROP INDEX ═══
+    # ═══ SET OPS ═══
 
-    def _create_index(self, unique: bool = False):
-        """CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col1, ...)"""
-        self._adv()  # INDEX
-        ine = False
-        if self._c.type == TokenType.IF:
-            self._adv()
-            self._ex(TokenType.NOT)
-            self._ex(TokenType.EXISTS)
-            ine = True
-        idx_name = self._aid()
-        self._ex(TokenType.ON)
-        table = self._aid()
-        self._ex(TokenType.LPAREN)
-        cols = [self._aid()]
-        while self._c.type == TokenType.COMMA:
-            self._adv()
-            cols.append(self._aid())
-        self._ex(TokenType.RPAREN)
-        return CreateIndexStmt(
-            index_name=idx_name, table=table, columns=cols,
-            unique=unique, if_not_exists=ine)
-
-    def _drop_index(self):
-        """DROP INDEX [IF EXISTS] name"""
-        self._adv()  # INDEX
-        ie = False
-        if self._c.type == TokenType.IF:
-            self._adv()
-            self._ex(TokenType.EXISTS)
-            ie = True
-        return DropIndexStmt(index_name=self._aid(), if_exists=ie)
-
-    # ═══ CTE ═══
-
-    def _with_cte(self):
-        self._adv()  # 'with'
-        is_recursive = False
-        if (self._c.type == TokenType.IDENTIFIER
-                and self._c.value == 'recursive'):
-            is_recursive = True
-            self._adv()
-        ctes = []
-        while True:
-            cte_name = self._aid()
-            cte_columns = None
-            if self._c.type == TokenType.LPAREN:
-                self._adv()
-                if self._c.type != TokenType.SELECT:
-                    cte_columns = [self._aid()]
-                    while self._c.type == TokenType.COMMA:
-                        self._adv()
-                        cte_columns.append(self._aid())
-                    self._ex(TokenType.RPAREN)
-                else:
-                    cte_query = self._sel()
-                    while self._c.type in (TokenType.UNION,
-                                            TokenType.INTERSECT,
-                                            TokenType.EXCEPT):
-                        cte_query = self._setop(cte_query)
-                    self._ex(TokenType.RPAREN)
-                    ctes.append((cte_name, cte_query, is_recursive,
-                                 cte_columns))
-                    if self._c.type == TokenType.COMMA:
-                        self._adv()
-                        continue
-                    else:
-                        break
-            self._ex(TokenType.AS)
-            self._ex(TokenType.LPAREN)
-            cte_query = self._sel()
-            while self._c.type in (TokenType.UNION, TokenType.INTERSECT,
-                                    TokenType.EXCEPT):
-                cte_query = self._setop(cte_query)
-            self._ex(TokenType.RPAREN)
-            ctes.append((cte_name, cte_query, is_recursive, cte_columns))
-            if self._c.type == TokenType.COMMA:
-                self._adv()
-            else:
-                break
-        main = self._sel()
-        import dataclasses
-        return dataclasses.replace(main, ctes=ctes)
-
-    def _explain(self):
-        self._ex(TokenType.EXPLAIN)
-        inner = self._stmt()
-        while self._c.type in (TokenType.UNION, TokenType.INTERSECT,
-                                TokenType.EXCEPT):
-            inner = self._setop(inner)
-        return ExplainStmt(statement=inner)
-
-    def _alter(self):
-        self._ex(TokenType.ALTER)
-        self._ex(TokenType.TABLE)
-        table = self._aid()
-        if self._c.type == TokenType.ADD:
-            self._adv()
-            if self._c.type == TokenType.COLUMN:
-                self._adv()
-            return AlterTableStmt(
-                table=table, action='ADD_COLUMN', column_def=self._cd())
-        if self._c.type == TokenType.DROP:
-            self._adv()
-            if self._c.type == TokenType.COLUMN:
-                self._adv()
-            return AlterTableStmt(
-                table=table, action='DROP_COLUMN', column_name=self._aid())
-        if self._c.type == TokenType.RENAME:
-            self._adv()
-            if self._c.type == TokenType.COLUMN:
-                self._adv()
-            old = self._aid()
-            self._ex(TokenType.TO)
-            new = self._aid()
-            return AlterTableStmt(
-                table=table, action='RENAME_COLUMN',
-                column_name=old, new_name=new)
-        raise ParseError(
-            f"expected ADD/DROP/RENAME", self._c.line, self._c.col)
+    def _parse_set_operation(self, left):
+        op = self._current.value; self._advance()
+        all_ = False
+        if self._current.type == TokenType.ALL: all_ = True; self._advance()
+        right = self._parse_select()
+        while self._current.type in (TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
+            right = self._parse_set_operation(right)
+        return SetOperationStmt(op=op, all=all_, left=left, right=right)
 
     # ═══ SELECT ═══
 
-    def _sel(self):
-        self._ex(TokenType.SELECT)
-        dist = False
-        if self._c.type == TokenType.DISTINCT:
-            dist = True
-            self._adv()
-        sl = [self._si()]
-        while self._c.type == TokenType.COMMA:
-            self._adv()
-            sl.append(self._si())
-        fc = self._fr() if self._c.type == TokenType.FROM else None
-        w = None
-        if self._c.type == TokenType.WHERE:
-            self._adv()
-            w = self._expr()
-        gb = self._gb() if self._c.type == TokenType.GROUP else None
-        hv = None
-        if self._c.type == TokenType.HAVING:
-            self._adv()
-            hv = self._expr()
-        ob = []
-        if self._c.type == TokenType.ORDER:
-            ob = self._ob()
-        lm = None
-        if self._c.type == TokenType.LIMIT:
-            self._adv()
-            lm = self._expr()
-        of = None
-        if self._c.type == TokenType.OFFSET:
-            self._adv()
-            of = self._expr()
-        return SelectStmt(
-            distinct=dist, select_list=sl, from_clause=fc, where=w,
-            group_by=gb, having=hv, order_by=ob, limit=lm, offset=of)
+    def _parse_select(self):
+        self._expect(TokenType.SELECT)
+        distinct = False
+        if self._current.type == TokenType.DISTINCT: distinct = True; self._advance()
+        select_list = [self._parse_select_item()]
+        while self._current.type == TokenType.COMMA: self._advance(); select_list.append(self._parse_select_item())
+        from_clause = self._parse_from() if self._current.type == TokenType.FROM else None
+        where = None
+        if self._current.type == TokenType.WHERE: self._advance(); where = self._expr.parse_expression()
+        group_by = self._parse_group_by() if self._current.type == TokenType.GROUP else None
+        having = None
+        if self._current.type == TokenType.HAVING: self._advance(); having = self._expr.parse_expression()
+        order_by = self._parse_order_by() if self._current.type == TokenType.ORDER else []
+        limit = None
+        if self._current.type == TokenType.LIMIT: self._advance(); limit = self._expr.parse_expression()
+        offset = None
+        if self._current.type == TokenType.OFFSET: self._advance(); offset = self._expr.parse_expression()
+        return SelectStmt(distinct=distinct, select_list=select_list, from_clause=from_clause,
+                          where=where, group_by=group_by, having=having, order_by=order_by,
+                          limit=limit, offset=offset)
 
-    def _si(self):
-        e = self._expr()
-        if self._c.type == TokenType.AS:
-            self._adv()
-            return AliasExpr(expr=e, alias=self._aid())
-        if self._c.type == TokenType.IDENTIFIER:
-            a = self._c.value
-            self._adv()
-            return AliasExpr(expr=e, alias=a)
+    def _parse_select_item(self):
+        e = self._expr.parse_expression()
+        if self._current.type == TokenType.AS: self._advance(); return AliasExpr(expr=e, alias=self._accept_identifier())
+        if self._current.type == TokenType.IDENTIFIER:
+            a = self._current.value; self._advance(); return AliasExpr(expr=e, alias=a)
         return e
 
-    # ═══ FROM + JOIN (NATURAL/USING支持) ═══
+    # ═══ FROM / JOIN ═══
 
-    def _fr(self):
-        self._ex(TokenType.FROM)
-        tr = self._tref()
+    def _parse_from(self):
+        self._expect(TokenType.FROM); tref = self._parse_table_ref()
         joins = []
-        while self._c.type in (TokenType.JOIN, TokenType.INNER,
-                                TokenType.LEFT, TokenType.RIGHT,
-                                TokenType.CROSS, TokenType.FULL,
-                                TokenType.COMMA, TokenType.NATURAL):
-            if self._c.type == TokenType.COMMA:
-                self._adv()
-                joins.append(JoinClause(
-                    join_type='CROSS', table=self._tref()))
-                continue
-            joins.append(self._jn())
-        return FromClause(table=tr, joins=joins)
+        while self._current.type in (TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT,
+                                      TokenType.CROSS, TokenType.FULL, TokenType.COMMA, TokenType.NATURAL):
+            if self._current.type == TokenType.COMMA: self._advance(); joins.append(JoinClause(join_type='CROSS', table=self._parse_table_ref())); continue
+            joins.append(self._parse_join())
+        return FromClause(table=tref, joins=joins)
 
-    def _tref(self):
-        if self._c.type == TokenType.LPAREN:
-            self._adv()
-            if self._c.type == TokenType.SELECT:
-                sq = self._sel()
-                self._ex(TokenType.RPAREN)
+    def _parse_table_ref(self):
+        if self._current.type == TokenType.LPAREN:
+            self._advance()
+            if self._current.type == TokenType.SELECT:
+                sq = self._parse_select(); self._expect(TokenType.RPAREN)
                 a = None
-                if self._c.type == TokenType.AS:
-                    self._adv()
-                    a = self._aid()
-                elif self._c.type == TokenType.IDENTIFIER:
-                    a = self._c.value
-                    self._adv()
-                return TableRef(
-                    name=a or '__subquery', alias=a, subquery=sq)
-        n = self._aid()
+                if self._current.type == TokenType.AS: self._advance(); a = self._accept_identifier()
+                elif self._current.type == TokenType.IDENTIFIER: a = self._current.value; self._advance()
+                return TableRef(name=a or '__subquery', alias=a, subquery=sq)
+        name = self._accept_identifier()
+        if self._current.type == TokenType.LPAREN:
+            func_args = self._parse_func_args()
+            a = None
+            if self._current.type == TokenType.AS: self._advance(); a = self._accept_identifier()
+            elif self._current.type == TokenType.IDENTIFIER: a = self._current.value; self._advance()
+            return TableRef(name=name, alias=a, func_args=func_args)
         a = None
-        if self._c.type == TokenType.AS:
-            self._adv()
-            a = self._aid()
-        elif self._c.type == TokenType.IDENTIFIER:
-            a = self._c.value
-            self._adv()
-        return TableRef(name=n, alias=a)
+        if self._current.type == TokenType.AS: self._advance(); a = self._accept_identifier()
+        elif self._current.type == TokenType.IDENTIFIER: a = self._current.value; self._advance()
+        return TableRef(name=name, alias=a)
 
-    def _jn(self):
+    def _parse_func_args(self):
+        self._expect(TokenType.LPAREN); args = []
+        if self._current.type != TokenType.RPAREN:
+            args.append(self._expr.parse_expression())
+            while self._current.type == TokenType.COMMA: self._advance(); args.append(self._expr.parse_expression())
+        self._expect(TokenType.RPAREN); return args
+
+    def _parse_join(self):
         natural = False
-        if self._c.type == TokenType.NATURAL:
-            natural = True
-            self._adv()
+        if self._current.type == TokenType.NATURAL: natural = True; self._advance()
         jt = 'INNER'
-        if self._c.type == TokenType.INNER:
-            self._adv()
-        elif self._c.type == TokenType.LEFT:
-            self._adv()
-            jt = 'LEFT'
-        elif self._c.type == TokenType.RIGHT:
-            self._adv()
-            jt = 'RIGHT'
-        elif self._c.type == TokenType.CROSS:
-            self._adv()
-            jt = 'CROSS'
-        elif self._c.type == TokenType.FULL:
-            self._adv()
-            jt = 'FULL'
-        if self._c.type == TokenType.OUTER:
-            self._adv()
-        self._ex(TokenType.JOIN)
-        t = self._tref()
-        on = None
-        using_cols = None
-        if natural:
-            pass  # resolver自动处理
-        elif self._c.type == TokenType.ON:
-            self._adv()
-            on = self._expr()
-        elif self._c.type == TokenType.USING:
-            self._adv()
-            self._ex(TokenType.LPAREN)
-            using_cols = [self._aid()]
-            while self._c.type == TokenType.COMMA:
-                self._adv()
-                using_cols.append(self._aid())
-            self._ex(TokenType.RPAREN)
-        return JoinClause(join_type=jt, table=t, on=on,
-                          using=using_cols, natural=natural)
+        if self._current.type == TokenType.INNER: self._advance()
+        elif self._current.type == TokenType.LEFT: self._advance(); jt = 'LEFT'
+        elif self._current.type == TokenType.RIGHT: self._advance(); jt = 'RIGHT'
+        elif self._current.type == TokenType.CROSS: self._advance(); jt = 'CROSS'
+        elif self._current.type == TokenType.FULL: self._advance(); jt = 'FULL'
+        if self._current.type == TokenType.OUTER: self._advance()
+        self._expect(TokenType.JOIN); t = self._parse_table_ref()
+        on = None; using_cols = None
+        if natural: pass
+        elif self._current.type == TokenType.ON: self._advance(); on = self._expr.parse_expression()
+        elif self._current.type == TokenType.USING:
+            self._advance(); self._expect(TokenType.LPAREN)
+            using_cols = [self._accept_identifier()]
+            while self._current.type == TokenType.COMMA: self._advance(); using_cols.append(self._accept_identifier())
+            self._expect(TokenType.RPAREN)
+        return JoinClause(join_type=jt, table=t, on=on, using=using_cols, natural=natural)
 
     # ═══ GROUP BY / ORDER BY ═══
 
-    def _gb(self):
-        self._ex(TokenType.GROUP)
-        self._ex(TokenType.BY)
-        k = [self._expr()]
-        while self._c.type == TokenType.COMMA:
-            self._adv()
-            k.append(self._expr())
-        return GroupByClause(keys=k)
+    def _parse_group_by(self):
+        self._expect(TokenType.GROUP); self._expect(TokenType.BY)
+        keys = [self._expr.parse_expression()]
+        while self._current.type == TokenType.COMMA: self._advance(); keys.append(self._expr.parse_expression())
+        return GroupByClause(keys=keys)
 
-    def _ob(self):
-        self._ex(TokenType.ORDER)
-        self._ex(TokenType.BY)
-        k = [self._sk()]
-        while self._c.type == TokenType.COMMA:
-            self._adv()
-            k.append(self._sk())
-        return k
+    def _parse_order_by(self):
+        self._expect(TokenType.ORDER); self._expect(TokenType.BY)
+        keys = [self._expr.parse_sort_key()]
+        while self._current.type == TokenType.COMMA: self._advance(); keys.append(self._expr.parse_sort_key())
+        return keys
 
-    def _sk(self):
-        e = self._expr()
-        d = 'ASC'
-        if self._c.type == TokenType.ASC:
-            self._adv()
-        elif self._c.type == TokenType.DESC:
-            d = 'DESC'
-            self._adv()
-        ns = None
-        if self._c.type == TokenType.NULLS:
-            self._adv()
-            if self._c.type == TokenType.FIRST:
-                ns = 'NULLS_FIRST'
-                self._adv()
-            elif self._c.type == TokenType.LAST:
-                ns = 'NULLS_LAST'
-                self._adv()
-        return SortKey(expr=e, direction=d, nulls=ns)
+    # ═══ INSERT / UPDATE / DELETE ═══
 
-    # ═══ INSERT ═══
-
-    def _ins(self):
-        self._ex(TokenType.INSERT)
-        self._ex(TokenType.INTO)
-        t = self._aid()
+    def _parse_insert(self):
+        self._expect(TokenType.INSERT); self._expect(TokenType.INTO); t = self._accept_identifier()
         cols = None
-        if self._c.type == TokenType.LPAREN:
-            saved_pos = self._p
-            saved_c = self._c
-            self._adv()
-            if self._c.type == TokenType.SELECT:
-                self._p = saved_pos
-                self._c = saved_c
+        if self._current.type == TokenType.LPAREN:
+            saved = self._pos; saved_c = self._current; self._advance()
+            if self._current.type == TokenType.SELECT: self._pos = saved; self._current = saved_c
             else:
-                cols = [self._aid()]
-                while self._c.type == TokenType.COMMA:
-                    self._adv()
-                    cols.append(self._aid())
-                self._ex(TokenType.RPAREN)
-        if self._c.type == TokenType.SELECT:
-            query = self._sel()
-            return InsertStmt(table=t, columns=cols, values=[], query=query)
-        self._ex(TokenType.VALUES)
-        rows = [self._vr()]
-        while self._c.type == TokenType.COMMA:
-            self._adv()
-            rows.append(self._vr())
+                cols = [self._accept_identifier()]
+                while self._current.type == TokenType.COMMA: self._advance(); cols.append(self._accept_identifier())
+                self._expect(TokenType.RPAREN)
+        if self._current.type == TokenType.SELECT:
+            return InsertStmt(table=t, columns=cols, values=[], query=self._parse_select())
+        self._expect(TokenType.VALUES)
+        rows = [self._parse_value_row()]
+        while self._current.type == TokenType.COMMA: self._advance(); rows.append(self._parse_value_row())
         return InsertStmt(table=t, columns=cols, values=rows)
 
-    def _vr(self):
-        self._ex(TokenType.LPAREN)
-        e = [self._expr()]
-        while self._c.type == TokenType.COMMA:
-            self._adv()
-            e.append(self._expr())
-        self._ex(TokenType.RPAREN)
-        return e
+    def _parse_value_row(self):
+        self._expect(TokenType.LPAREN)
+        e = [self._expr.parse_expression()]
+        while self._current.type == TokenType.COMMA: self._advance(); e.append(self._expr.parse_expression())
+        self._expect(TokenType.RPAREN); return e
 
-    # ═══ UPDATE / DELETE ═══
-
-    def _upd(self):
-        self._ex(TokenType.UPDATE)
-        t = self._aid()
-        self._ex(TokenType.SET)
-        a = [self._asgn()]
-        while self._c.type == TokenType.COMMA:
-            self._adv()
-            a.append(self._asgn())
+    def _parse_update(self):
+        self._expect(TokenType.UPDATE); t = self._accept_identifier(); self._expect(TokenType.SET)
+        a = [self._parse_assignment()]
+        while self._current.type == TokenType.COMMA: self._advance(); a.append(self._parse_assignment())
         w = None
-        if self._c.type == TokenType.WHERE:
-            self._adv()
-            w = self._expr()
+        if self._current.type == TokenType.WHERE: self._advance(); w = self._expr.parse_expression()
         return UpdateStmt(table=t, assignments=a, where=w)
 
-    def _asgn(self):
-        c = self._aid()
-        self._ex(TokenType.EQUAL)
-        return Assignment(column=c, value=self._expr())
+    def _parse_assignment(self):
+        c = self._accept_identifier(); self._expect(TokenType.EQUAL)
+        return Assignment(column=c, value=self._expr.parse_expression())
 
-    def _dlt(self):
-        self._ex(TokenType.DELETE)
-        self._ex(TokenType.FROM)
-        t = self._aid()
+    def _parse_delete(self):
+        self._expect(TokenType.DELETE); self._expect(TokenType.FROM); t = self._accept_identifier()
         w = None
-        if self._c.type == TokenType.WHERE:
-            self._adv()
-            w = self._expr()
+        if self._current.type == TokenType.WHERE: self._advance(); w = self._expr.parse_expression()
         return DeleteStmt(table=t, where=w)
 
-    # ═══ CREATE TABLE / DROP TABLE ═══
+    # ═══ CREATE / DROP / ALTER ═══
 
-    def _crt(self):
+    def _parse_create_table(self):
         ine = False
-        if self._c.type == TokenType.IF:
-            self._adv()
-            self._ex(TokenType.NOT)
-            self._ex(TokenType.EXISTS)
-            ine = True
-        t = self._aid()
-        self._ex(TokenType.LPAREN)
-        cols = [self._cd()]
-        while self._c.type == TokenType.COMMA:
-            self._adv()
-            cols.append(self._cd())
-        self._ex(TokenType.RPAREN)
+        if self._current.type == TokenType.IF: self._advance(); self._expect(TokenType.NOT); self._expect(TokenType.EXISTS); ine = True
+        t = self._accept_identifier(); self._expect(TokenType.LPAREN)
+        cols = [self._parse_column_def()]
+        while self._current.type == TokenType.COMMA: self._advance(); cols.append(self._parse_column_def())
+        self._expect(TokenType.RPAREN)
         return CreateTableStmt(table=t, columns=cols, if_not_exists=ine)
 
-    def _cd(self):
-        n = self._aid()
-        tn = self._tn()
-        nl = True
-        pk = False
+    def _parse_column_def(self):
+        n = self._accept_identifier(); tn = self._parse_type_name(); nl = True; pk = False
         while True:
-            if self._c.type == TokenType.NOT:
-                self._adv()
-                self._ex(TokenType.NULL)
-                nl = False
-            elif self._c.type == TokenType.NULL:
-                self._adv()
-                nl = True
-            elif self._c.type == TokenType.PRIMARY:
-                self._adv()
-                self._ex(TokenType.KEY)
-                pk = True
-            else:
-                break
+            if self._current.type == TokenType.NOT: self._advance(); self._expect(TokenType.NULL); nl = False
+            elif self._current.type == TokenType.NULL: self._advance(); nl = True
+            elif self._current.type == TokenType.PRIMARY: self._advance(); self._expect(TokenType.KEY); pk = True
+            else: break
         return ColumnDef(name=n, type_name=tn, nullable=nl, primary_key=pk)
 
-    def _tn(self):
-        if (self._c.type in _UNRESERVED
-                or self._c.type == TokenType.IDENTIFIER):
-            n = self._c.value.upper()
-            self._adv()
-        else:
-            raise ParseError(
-                f"expected type", self._c.line, self._c.col)
-        p = []
-        if self._c.type == TokenType.LPAREN:
-            self._adv()
-            p.append(self._exi())
-            self._ex(TokenType.RPAREN)
-        return TypeName(name=n, params=p)
-
-    def _drp(self):
+    def _parse_drop_table(self):
         ie = False
-        if self._c.type == TokenType.IF:
-            self._adv()
-            self._ex(TokenType.EXISTS)
-            ie = True
-        return DropTableStmt(table=self._aid(), if_exists=ie)
+        if self._current.type == TokenType.IF: self._advance(); self._expect(TokenType.EXISTS); ie = True
+        return DropTableStmt(table=self._accept_identifier(), if_exists=ie)
 
-    # ═══ Pratt表达式 ═══
+    def _parse_create_index(self, unique):
+        ine = False
+        if self._current.type == TokenType.IF: self._advance(); self._expect(TokenType.NOT); self._expect(TokenType.EXISTS); ine = True
+        idx = self._accept_identifier(); self._expect(TokenType.ON); tbl = self._accept_identifier()
+        self._expect(TokenType.LPAREN); cols = [self._accept_identifier()]
+        while self._current.type == TokenType.COMMA: self._advance(); cols.append(self._accept_identifier())
+        self._expect(TokenType.RPAREN)
+        return CreateIndexStmt(index_name=idx, table=tbl, columns=cols, unique=unique, if_not_exists=ine)
 
-    def _expr(self, mp=Precedence.LOWEST):
-        l = self._prefix()
-        while self._iprec() > mp:
-            l = self._infix(l)
-        return l
+    def _parse_drop_index(self):
+        ie = False
+        if self._current.type == TokenType.IF: self._advance(); self._expect(TokenType.EXISTS); ie = True
+        return DropIndexStmt(index_name=self._accept_identifier(), if_exists=ie)
 
-    def _prefix(self):
-        tt = self._c.type
-        if tt == TokenType.NOT:
-            self._adv()
-            return UnaryExpr(
-                op='NOT', operand=self._expr(Precedence.NOT_PREFIX))
-        if tt == TokenType.MINUS:
-            self._adv()
-            return UnaryExpr(
-                op='-', operand=self._expr(Precedence.UNARY))
-        if tt == TokenType.PLUS:
-            self._adv()
-            return UnaryExpr(
-                op='+', operand=self._expr(Precedence.UNARY))
-        if tt in (TokenType.INTEGER_LIT, TokenType.FLOAT_LIT,
-                  TokenType.STRING, TokenType.TRUE, TokenType.FALSE,
-                  TokenType.NULL):
-            return self._lit()
-        if tt == TokenType.IDENTIFIER or tt in _UNRESERVED:
-            return self._idexpr()
-        if tt == TokenType.CASE:
-            return self._case()
-        if tt == TokenType.CAST:
-            return self._cast()
-        if tt == TokenType.EXISTS:
-            self._adv()
-            self._ex(TokenType.LPAREN)
-            sq = self._sel()
-            self._ex(TokenType.RPAREN)
-            return ExistsExpr(query=sq)
-        if tt == TokenType.LPAREN:
-            self._adv()
-            if self._c.type == TokenType.SELECT:
-                sq = self._sel()
-                self._ex(TokenType.RPAREN)
-                return SubqueryExpr(query=sq)
-            e = self._expr()
-            self._ex(TokenType.RPAREN)
-            return e
-        if tt == TokenType.STAR:
-            self._adv()
-            return StarExpr()
-        raise ParseError(
-            f"unexpected: {self._c.value!r}", self._c.line, self._c.col)
+    def _parse_explain(self):
+        self._expect(TokenType.EXPLAIN); inner = self._parse_statement()
+        while self._current.type in (TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
+            inner = self._parse_set_operation(inner)
+        return ExplainStmt(statement=inner)
 
-    def _lit(self):
-        t = self._c
-        self._adv()
-        if t.type == TokenType.INTEGER_LIT:
-            v = int(t.value)
-            return Literal(
-                value=v,
-                inferred_type=(DataType.INT if v <= 2_147_483_647
-                               else DataType.BIGINT))
-        if t.type == TokenType.FLOAT_LIT:
-            return Literal(value=float(t.value),
-                           inferred_type=DataType.DOUBLE)
-        if t.type == TokenType.STRING:
-            return Literal(value=t.value, inferred_type=DataType.VARCHAR)
-        if t.type == TokenType.TRUE:
-            return Literal(value=True, inferred_type=DataType.BOOLEAN)
-        if t.type == TokenType.FALSE:
-            return Literal(value=False, inferred_type=DataType.BOOLEAN)
-        return Literal(value=None, inferred_type=DataType.UNKNOWN)
+    def _parse_alter(self):
+        self._expect(TokenType.ALTER); self._expect(TokenType.TABLE); t = self._accept_identifier()
+        if self._current.type == TokenType.ADD:
+            self._advance()
+            if self._current.type == TokenType.COLUMN: self._advance()
+            return AlterTableStmt(table=t, action='ADD_COLUMN', column_def=self._parse_column_def())
+        if self._current.type == TokenType.DROP:
+            self._advance()
+            if self._current.type == TokenType.COLUMN: self._advance()
+            return AlterTableStmt(table=t, action='DROP_COLUMN', column_name=self._accept_identifier())
+        if self._current.type == TokenType.RENAME:
+            self._advance()
+            if self._current.type == TokenType.COLUMN: self._advance()
+            old = self._accept_identifier(); self._expect(TokenType.TO); new = self._accept_identifier()
+            return AlterTableStmt(table=t, action='RENAME_COLUMN', column_name=old, new_name=new)
+        raise ParseError(f"期望 ADD/DROP/RENAME", self._current.line, self._current.col)
 
-    def _idexpr(self):
-        name = self._c.value
-        if self._c.type in _UNRESERVED:
-            name = name.lower()
-        self._adv()
-        if name.lower() in _NOARG_FUNCS:
-            if self._c.type == TokenType.LPAREN:
-                self._adv()
-                self._ex(TokenType.RPAREN)
-            return FunctionCall(name=name.upper(), args=[])
-        if self._c.type == TokenType.LPAREN:
-            return self._fncall(name)
-        if self._c.type == TokenType.DOT:
-            self._adv()
-            return ColumnRef(table=name, column=self._aid())
-        return ColumnRef(table=None, column=name)
+    # ═══ COPY ═══
 
-    def _fncall(self, name):
-        self._ex(TokenType.LPAREN)
-        upper = name.upper()
-        if upper in _AGGS:
-            if self._c.type == TokenType.STAR:
-                self._adv()
-                self._ex(TokenType.RPAREN)
-                func = AggregateCall(name=upper, args=[StarExpr()])
-                if self._c.type == TokenType.OVER:
-                    return self._window(func)
-                return func
-            dist = False
-            if self._c.type == TokenType.DISTINCT:
-                dist = True
-                self._adv()
-            args = [self._expr()]
-            while self._c.type == TokenType.COMMA:
-                self._adv()
-                args.append(self._expr())
-            self._ex(TokenType.RPAREN)
-            func = AggregateCall(name=upper, args=args, distinct=dist)
-            if self._c.type == TokenType.OVER:
-                return self._window(func)
-            return func
-        if upper in _WINFUNCS:
-            args = []
-            if self._c.type != TokenType.RPAREN:
-                args.append(self._expr())
-                while self._c.type == TokenType.COMMA:
-                    self._adv()
-                    args.append(self._expr())
-            self._ex(TokenType.RPAREN)
-            func = FunctionCall(name=upper, args=args)
-            if self._c.type == TokenType.OVER:
-                return self._window(func)
-            return func
-        args = []
-        if self._c.type != TokenType.RPAREN:
-            args.append(self._expr())
-            while self._c.type == TokenType.COMMA:
-                self._adv()
-                args.append(self._expr())
-        self._ex(TokenType.RPAREN)
-        func = FunctionCall(name=name, args=args)
-        if self._c.type == TokenType.OVER:
-            return self._window(func)
-        return func
+    def _parse_copy(self):
+        self._expect(TokenType.COPY); table = self._accept_identifier()
+        direction = 'FROM'
+        if self._current.type == TokenType.FROM: self._advance()
+        elif self._current.type == TokenType.TO: direction = 'TO'; self._advance()
+        else: raise ParseError("期望 FROM 或 TO", self._current.line, self._current.col)
+        file_path = self._expect(TokenType.STRING).value
+        has_header = True; delimiter = ','
+        if self._current.type == TokenType.WITH:
+            self._advance(); self._expect(TokenType.LPAREN)
+            while self._current.type != TokenType.RPAREN:
+                opt = self._current.value.upper(); self._advance()
+                if opt == 'HEADER':
+                    val = self._parse_option_value()
+                    has_header = val in ('TRUE', '1', 'YES', 'ON')
+                elif opt == 'DELIMITER': delimiter = self._expect(TokenType.STRING).value
+                if self._current.type == TokenType.COMMA: self._advance()
+            self._expect(TokenType.RPAREN)
+        return CopyStmt(table=table, file_path=file_path, direction=direction,
+                        has_header=has_header, delimiter=delimiter)
 
-    def _window(self, func):
-        self._ex(TokenType.OVER)
-        self._ex(TokenType.LPAREN)
-        pb = []
-        if self._c.type == TokenType.PARTITION:
-            self._adv()
-            self._ex(TokenType.BY)
-            pb.append(self._expr())
-            while self._c.type == TokenType.COMMA:
-                self._adv()
-                pb.append(self._expr())
-        oby = []
-        if self._c.type == TokenType.ORDER:
-            self._ex(TokenType.ORDER)
-            self._ex(TokenType.BY)
-            oby.append(self._sk())
-            while self._c.type == TokenType.COMMA:
-                self._adv()
-                oby.append(self._sk())
-        frame = None
-        if self._c.type in (TokenType.ROWS, TokenType.RANGE):
-            frame = self._frame()
-        self._ex(TokenType.RPAREN)
-        return WindowCall(
-            func=func, partition_by=pb, order_by=oby, frame=frame)
+    def _parse_option_value(self):
+        if self._current.type == TokenType.TRUE: self._advance(); return 'TRUE'
+        if self._current.type == TokenType.FALSE: self._advance(); return 'FALSE'
+        if self._current.type == TokenType.IDENTIFIER: v = self._current.value.upper(); self._advance(); return v
+        if self._current.type == TokenType.STRING: v = self._expect(TokenType.STRING).value; return v.upper()
+        if self._current.type == TokenType.INTEGER_LIT: v = self._current.value; self._advance(); return v
+        if self._current.type in _UNRESERVED: v = self._current.value.upper(); self._advance(); return v
+        raise ParseError(f"期望选项值", self._current.line, self._current.col)
 
-    def _frame(self):
-        mode = self._c.value
-        self._adv()
-        if self._c.type == TokenType.BETWEEN:
-            self._adv()
-            s = self._bound()
-            self._ex(TokenType.AND)
-            e = self._bound()
-            return WindowFrame(mode=mode, start=s, end=e)
-        s = self._bound()
-        return WindowFrame(
-            mode=mode, start=s, end=FrameBound(type='CURRENT_ROW'))
+    # ═══ CTE ═══
 
-    def _bound(self):
-        if self._c.type == TokenType.UNBOUNDED:
-            self._adv()
-            if self._c.type == TokenType.PRECEDING:
-                self._adv()
-                return FrameBound(type='UNBOUNDED_PRECEDING')
-            self._ex(TokenType.FOLLOWING)
-            return FrameBound(type='UNBOUNDED_FOLLOWING')
-        if self._c.type == TokenType.CURRENT:
-            self._adv()
-            self._ex(TokenType.ROW)
-            return FrameBound(type='CURRENT_ROW')
-        if self._c.type == TokenType.INTEGER_LIT:
-            n = int(self._c.value)
-            self._adv()
-            if self._c.type == TokenType.PRECEDING:
-                self._adv()
-                return FrameBound(type='N_PRECEDING', offset=n)
-            self._ex(TokenType.FOLLOWING)
-            return FrameBound(type='N_FOLLOWING', offset=n)
-        raise ParseError(
-            f"expected frame bound", self._c.line, self._c.col)
-
-    def _case(self):
-        self._ex(TokenType.CASE)
-        op = None
-        if self._c.type != TokenType.WHEN:
-            op = self._expr()
-        ws = []
-        while self._c.type == TokenType.WHEN:
-            self._adv()
-            c = self._expr()
-            self._ex(TokenType.THEN)
-            r = self._expr()
-            ws.append((c, r))
-        el = None
-        if self._c.type == TokenType.ELSE:
-            self._adv()
-            el = self._expr()
-        self._ex(TokenType.END)
-        return CaseExpr(operand=op, when_clauses=ws, else_expr=el)
-
-    def _cast(self):
-        self._ex(TokenType.CAST)
-        self._ex(TokenType.LPAREN)
-        e = self._expr()
-        self._ex(TokenType.AS)
-        t = self._tn()
-        self._ex(TokenType.RPAREN)
-        return CastExpr(expr=e, type_name=t)
-
-    def _iprec(self):
-        if self._c.type == TokenType.NOT:
-            n = self._pk()
-            if n.type in (TokenType.IN, TokenType.BETWEEN, TokenType.LIKE):
-                return Precedence.COMPARISON
-            return Precedence.LOWEST
-        return _INFIX.get(self._c.type, Precedence.LOWEST)
-
-    def _infix(self, left):
-        tt = self._c.type
-        if tt == TokenType.IS:
-            return self._is(left)
-        if tt == TokenType.IN:
-            return self._in(left, False)
-        if tt == TokenType.BETWEEN:
-            return self._btw(left, False)
-        if tt == TokenType.LIKE:
-            return self._lk(left, False)
-        if tt == TokenType.NOT:
-            n = self._pk()
-            if n.type == TokenType.IN:
-                self._adv()
-                return self._in(left, True)
-            if n.type == TokenType.BETWEEN:
-                self._adv()
-                return self._btw(left, True)
-            if n.type == TokenType.LIKE:
-                self._adv()
-                return self._lk(left, True)
-        prec = _INFIX[tt]
-        op = self._c.value
-        self._adv()
-        m = {
-            'AND': 'AND', 'OR': 'OR', '=': '=', '!=': '!=',
-            '<': '<', '>': '>', '<=': '<=', '>=': '>=',
-            '+': '+', '-': '-', '*': '*', '/': '/', '%': '%', '||': '||',
-        }
-        return BinaryExpr(
-            op=m.get(op, op), left=left, right=self._expr(prec))
-
-    def _is(self, l):
-        self._ex(TokenType.IS)
-        neg = False
-        if self._c.type == TokenType.NOT:
-            neg = True
-            self._adv()
-        self._ex(TokenType.NULL)
-        return IsNullExpr(expr=l, negated=neg)
-
-    def _in(self, l, neg):
-        self._ex(TokenType.IN)
-        self._ex(TokenType.LPAREN)
-        if self._c.type == TokenType.SELECT:
-            sq = self._sel()
-            self._ex(TokenType.RPAREN)
-            return InExpr(
-                expr=l, values=[SubqueryExpr(query=sq)], negated=neg)
-        vs = [self._expr()]
-        while self._c.type == TokenType.COMMA:
-            self._adv()
-            vs.append(self._expr())
-        self._ex(TokenType.RPAREN)
-        return InExpr(expr=l, values=vs, negated=neg)
-
-    def _btw(self, l, neg):
-        self._ex(TokenType.BETWEEN)
-        lo = self._expr(Precedence.COMPARISON)
-        self._ex(TokenType.AND)
-        return BetweenExpr(
-            expr=l, low=lo, high=self._expr(Precedence.COMPARISON),
-            negated=neg)
-
-    def _lk(self, l, neg):
-        self._ex(TokenType.LIKE)
-        return LikeExpr(
-            expr=l, pattern=self._expr(Precedence.COMPARISON), negated=neg)
+    def _parse_with_cte(self):
+        self._advance()
+        is_recursive = False
+        if self._current.type == TokenType.IDENTIFIER and self._current.value == 'recursive':
+            is_recursive = True; self._advance()
+        ctes = []
+        while True:
+            cte_name = self._accept_identifier(); cte_columns = None
+            if self._current.type == TokenType.LPAREN:
+                self._advance()
+                if self._current.type != TokenType.SELECT:
+                    cte_columns = [self._accept_identifier()]
+                    while self._current.type == TokenType.COMMA: self._advance(); cte_columns.append(self._accept_identifier())
+                    self._expect(TokenType.RPAREN)
+                else:
+                    cte_query = self._parse_select()
+                    while self._current.type in (TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
+                        cte_query = self._parse_set_operation(cte_query)
+                    self._expect(TokenType.RPAREN)
+                    ctes.append((cte_name, cte_query, is_recursive, cte_columns))
+                    if self._current.type == TokenType.COMMA: self._advance(); continue
+                    else: break
+            self._expect(TokenType.AS); self._expect(TokenType.LPAREN)
+            cte_query = self._parse_select()
+            while self._current.type in (TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
+                cte_query = self._parse_set_operation(cte_query)
+            self._expect(TokenType.RPAREN)
+            ctes.append((cte_name, cte_query, is_recursive, cte_columns))
+            if self._current.type == TokenType.COMMA: self._advance()
+            else: break
+        import dataclasses
+        return dataclasses.replace(self._parse_select(), ctes=ctes)

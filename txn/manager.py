@@ -1,6 +1,6 @@
 from __future__ import annotations
 """事务管理器 — BEGIN/COMMIT/ROLLBACK + 自动提交。
-修复：auto_begin 后 auto_commit 属性正确返回 True。"""
+修复：auto_begin 创建的事务通过 _auto_txn_id 追踪，commit/rollback 正确释放。"""
 import threading
 from typing import Any, Dict, List, Optional
 from txn.lock import TableLockManager
@@ -8,14 +8,14 @@ from txn.lock import TableLockManager
 
 class Transaction:
     __slots__ = ('txn_id', 'modified_tables', 'snapshots', 'active',
-                 'auto_started')
+                 'is_auto')
 
-    def __init__(self, txn_id: int, auto_started: bool = False) -> None:
+    def __init__(self, txn_id: int, is_auto: bool = False) -> None:
         self.txn_id = txn_id
         self.modified_tables: Dict[str, Any] = {}
         self.snapshots: Dict[str, list] = {}
         self.active = True
-        self.auto_started = auto_started
+        self.is_auto = is_auto  # 是否由 auto_begin 创建
 
 
 class TransactionManager:
@@ -36,23 +36,23 @@ class TransactionManager:
 
     @property
     def auto_commit(self) -> bool:
-        """当前事务是否为自动开启的（DML自动提交模式）。
-        显式 BEGIN 的事务返回 False，auto_begin 开启的返回 True。"""
+        """当前事务是否为自动事务（可自动提交）。"""
         if self._current_txn is None:
             return False
-        return self._current_txn.auto_started
+        return self._current_txn.is_auto
 
     def begin(self) -> int:
-        """显式 BEGIN — 需要用户手动 COMMIT/ROLLBACK。"""
+        """显式 BEGIN — 非自动事务。"""
         with self._mutex:
             txn_id = self._next_txn_id
             self._next_txn_id += 1
-            txn = Transaction(txn_id, auto_started=False)
+            txn = Transaction(txn_id, is_auto=False)
             self._active[txn_id] = txn
             self._current_txn = txn
             return txn_id
 
     def commit(self) -> bool:
+        """提交当前事务，释放所有写锁。"""
         if self._current_txn is None:
             return False
         txn = self._current_txn
@@ -68,10 +68,16 @@ class TransactionManager:
         return True
 
     def rollback(self, catalog: Any = None) -> bool:
+        """回滚当前事务：恢复快照 + 释放写锁。"""
         if self._current_txn is None:
             return False
         txn = self._current_txn
-        # 恢复快照（在 mutex 外操作 store 避免死锁）
+        # 先在 mutex 内标记非活跃，防止并发问题
+        with self._mutex:
+            txn.active = False
+            self._active.pop(txn.txn_id, None)
+            self._current_txn = None
+        # 恢复快照（mutex 外操作存储，避免死锁）
         if catalog and txn.snapshots:
             for table, snapshot_rows in txn.snapshots.items():
                 try:
@@ -81,19 +87,16 @@ class TransactionManager:
                         store.append_row(list(row))
                 except Exception:
                     pass
-        with self._mutex:
-            for table in txn.modified_tables:
-                try:
-                    self._lock_manager.release_write(table)
-                except Exception:
-                    pass
-            txn.active = False
-            self._active.pop(txn.txn_id, None)
-            self._current_txn = None
+        # 释放写锁
+        for table in txn.modified_tables:
+            try:
+                self._lock_manager.release_write(table)
+            except Exception:
+                pass
         return True
 
     def snapshot_table(self, table: str, catalog: Any) -> None:
-        """DML 前对表做快照（仅首次）。"""
+        """对表做快照（仅首次）。"""
         if self._current_txn is None:
             return
         txn = self._current_txn
@@ -104,18 +107,21 @@ class TransactionManager:
             self._lock_manager.acquire_write(table)
 
     def auto_begin(self) -> Optional[int]:
-        """自动开启事务（DML 隐式调用）。已在事务中则不重复开启。"""
-        if self._current_txn is None:
-            with self._mutex:
-                txn_id = self._next_txn_id
-                self._next_txn_id += 1
-                txn = Transaction(txn_id, auto_started=True)
-                self._active[txn_id] = txn
-                self._current_txn = txn
-                return txn_id
-        return None
+        """自动事务：如果没有活跃事务则创建，返回事务 ID。"""
+        if self._current_txn is not None:
+            return None  # 已有显式事务，不创建
+        with self._mutex:
+            txn_id = self._next_txn_id
+            self._next_txn_id += 1
+            txn = Transaction(txn_id, is_auto=True)
+            self._active[txn_id] = txn
+            self._current_txn = txn
+            return txn_id
 
     def auto_commit_if_needed(self, auto_txn_id: Optional[int]) -> None:
-        if (auto_txn_id is not None and self._current_txn
-                and self._current_txn.txn_id == auto_txn_id):
+        """如果 auto_txn_id 对应当前自动事务，则提交。"""
+        if (auto_txn_id is not None
+                and self._current_txn is not None
+                and self._current_txn.txn_id == auto_txn_id
+                and self._current_txn.is_auto):
             self.commit()

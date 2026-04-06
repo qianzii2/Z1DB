@@ -81,9 +81,6 @@ class RecursiveCTEExecutor:
             result_rows.extend(new_rows)
             working_rows = new_rows
 
-        # 清理
-        self._cleanup(cte_name)
-
         return ExecutionResult(
             columns=columns,
             column_types=col_types,

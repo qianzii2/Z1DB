@@ -121,8 +121,8 @@ class DFARegex:
 
     @staticmethod
     def compile(pattern: str) -> DFARegex:
-        """Compile regex pattern to DFA."""
-        _NFAState._counter = 0
+        """编译正则为 DFA。"""
+        _NFAState._counter = 0  # R4：每次编译重置
         nfa = _parse_regex(pattern)
         return _nfa_to_dfa(nfa)
 

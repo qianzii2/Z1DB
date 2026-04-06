@@ -1,7 +1,6 @@
 from __future__ import annotations
-"""Top-N算子 — ORDER BY ... LIMIT N 用堆实现。
-O(n log N) 替代 O(n log n)，N << n 时大幅优化。
-修复：提取时不再 reverse=True（sort_key 已编码方向）。"""
+"""Top-N 算子 — ORDER BY ... LIMIT N 用堆实现。
+O(n log N) 替代 O(n log n)，N ≪ n 时大幅优化。"""
 import heapq
 from typing import Any, List, Optional, Tuple
 from executor.core.batch import VectorBatch
@@ -11,7 +10,7 @@ from storage.types import DataType
 
 
 class TopNOperator(Operator):
-    """维护大小为N的堆，只物化top N行。"""
+    """维护大小为 N 的最大堆，只物化 top N 行。"""
 
     def __init__(self, child: Operator,
                  sort_keys: List[Tuple[Any, str, Optional[str]]],
@@ -30,6 +29,7 @@ class TopNOperator(Operator):
     def open(self) -> None:
         self.child.open()
         evaluator = ExpressionEvaluator()
+
         heap: list = []
         row_idx = 0
 
@@ -37,19 +37,24 @@ class TopNOperator(Operator):
             batch = self._ensure_batch(self.child.next_batch())
             if batch is None:
                 break
+
+            # 批量评估排序 key
             key_vecs = []
             for expr, direction, nulls_pos in self._sort_keys:
                 key_vecs.append(
                     evaluator.evaluate(expr, batch).to_python_list())
+
             col_names = batch.column_names
             for i in range(batch.row_count):
                 row = [batch.columns[n].get(i) for n in col_names]
+                # 构建可比较的 key
                 key_parts = []
                 for ki, (_, direction, nulls_pos) in enumerate(
                         self._sort_keys):
                     val = key_vecs[ki][i]
                     key_parts.append(
                         _make_comparable(val, direction, nulls_pos))
+
                 entry = _HeapEntry(tuple(key_parts), row_idx, row)
                 if len(heap) < self._n:
                     heapq.heappush(heap, entry)
@@ -64,8 +69,7 @@ class TopNOperator(Operator):
             self._result = VectorBatch.empty(
                 [n for n, _ in schema], [t for _, t in schema])
         else:
-            # 修复：用 sort_key 直接排序，不 reverse
-            # sort_key 已编码方向（DESC用负值），直接升序即正确顺序
+            # 按 sort_key 正序排列（不 reverse）
             entries = sorted(heap, key=lambda e: e.sort_key)
             rows = [e.row for e in entries]
             schema = self.output_schema()
@@ -86,7 +90,7 @@ class TopNOperator(Operator):
 
 
 class _HeapEntry:
-    """堆条目。反转比较使 heapq 成为 max-heap（保留最小的N个）。"""
+    """堆条目。反转比较使 heapq 成为 max-heap（保留最小的 N 个）。"""
     __slots__ = ('sort_key', 'row_idx', 'row')
 
     def __init__(self, sort_key: tuple, row_idx: int, row: list) -> None:
@@ -95,7 +99,7 @@ class _HeapEntry:
         self.row = row
 
     def __lt__(self, other: _HeapEntry) -> bool:
-        # 反转比较：max-heap行为（淘汰最大的 sort_key）
+        # 反转比较：max-heap 行为（淘汰最大的 sort_key）
         if self.sort_key != other.sort_key:
             return self.sort_key > other.sort_key
         return self.row_idx > other.row_idx
@@ -116,13 +120,16 @@ def _make_comparable(val: Any, direction: str,
     if nulls_pos is None:
         nulls_pos = ('NULLS_LAST' if direction == 'ASC'
                      else 'NULLS_FIRST')
+
     if val is None:
         null_priority = 1 if nulls_pos == 'NULLS_LAST' else -1
         return (null_priority, 0)
+
     if direction == 'DESC':
         if isinstance(val, (int, float)):
             return (0, -val)
         return (0, _Reversed(val))
+
     return (0, val)
 
 
@@ -139,7 +146,8 @@ class _Reversed:
                 return self.val > other.val
             except TypeError:
                 return str(self.val) > str(other.val)
-        return NotImplemented
+        # 与非 _Reversed 比较：_Reversed 排在后面
+        return False
 
     def __gt__(self, other: Any) -> bool:
         if isinstance(other, _Reversed):
@@ -147,18 +155,18 @@ class _Reversed:
                 return self.val < other.val
             except TypeError:
                 return str(self.val) < str(other.val)
-        return NotImplemented
+        return True
 
     def __eq__(self, other: Any) -> bool:
         if isinstance(other, _Reversed):
             return self.val == other.val
-        return NotImplemented
+        return False
 
     def __le__(self, other: Any) -> bool:
-        return self == other or self < other
+        return self.__lt__(other) or self.__eq__(other)
 
     def __ge__(self, other: Any) -> bool:
-        return self == other or self > other
+        return self.__gt__(other) or self.__eq__(other)
 
     def __repr__(self) -> str:
         return f"Rev({self.val!r})"

@@ -1,32 +1,32 @@
 from __future__ import annotations
-"""Gorilla compression for floats. Paper: Pelkonen et al., 2015 (Facebook).
-XOR adjacent floats, store only the changed bits. ~12x compression for timeseries."""
+"""Gorilla 压缩（浮点）— XOR 相邻值，只存变化位。
+修复 M16：_clz64/_ctz64 改用 metal.bitwise 避免重复。"""
 import struct
 from typing import List, Tuple
+from metal.bitwise import clz64, ctz64
 
 
 def gorilla_encode(values: list) -> bytes:
-    """Encode float64 values using Gorilla XOR compression."""
+    """Gorilla XOR 编码 float64 值。"""
     if not values:
         return b''
     bits: list = []
     prev = struct.unpack('Q', struct.pack('d', float(values[0])))[0]
-    # First value: store all 64 bits
+    # 首个值：存储全部 64 位
     for i in range(63, -1, -1):
         bits.append((prev >> i) & 1)
     for idx in range(1, len(values)):
         curr = struct.unpack('Q', struct.pack('d', float(values[idx])))[0]
         xor = prev ^ curr
         if xor == 0:
-            bits.append(0)  # Same as previous: 1 bit
+            bits.append(0)
         else:
             bits.append(1)
-            leading = _clz64(xor)
-            trailing = _ctz64(xor)
+            leading = clz64(xor)
+            trailing = ctz64(xor)
             sig_bits = 64 - leading - trailing
             if sig_bits <= 0:
                 sig_bits = 1
-            # Store leading zeros (6 bits) + significant bits length (6 bits) + significant bits
             bits.append(1)
             for i in range(5, -1, -1):
                 bits.append((leading >> i) & 1)
@@ -35,7 +35,7 @@ def gorilla_encode(values: list) -> bytes:
             for i in range(sig_bits - 1, -1, -1):
                 bits.append((xor >> (trailing + i)) & 1)
         prev = curr
-    # Pack bits into bytes
+    # 打包为字节
     result = bytearray()
     for i in range(0, len(bits), 8):
         byte = 0
@@ -43,12 +43,11 @@ def gorilla_encode(values: list) -> bytes:
             if i + j < len(bits):
                 byte |= (bits[i + j] << (7 - j))
         result.append(byte)
-    # Prepend count
     return struct.pack('I', len(values)) + bytes(result)
 
 
 def gorilla_decode(data: bytes) -> list:
-    """Decode Gorilla-compressed float64 values."""
+    """解码 Gorilla 压缩的 float64 值。"""
     if len(data) < 4:
         return []
     count = struct.unpack('I', data[:4])[0]
@@ -70,7 +69,6 @@ def gorilla_decode(data: bytes) -> list:
                 pos += 1
         return val
 
-    # First value: 64 bits
     first_raw = read_bits(64)
     values = [struct.unpack('d', struct.pack('Q', first_raw))[0]]
     prev = first_raw
@@ -79,7 +77,8 @@ def gorilla_decode(data: bytes) -> list:
             break
         flag = read_bits(1)
         if flag == 0:
-            values.append(struct.unpack('d', struct.pack('Q', prev))[0])
+            values.append(
+                struct.unpack('d', struct.pack('Q', prev))[0])
         else:
             ctrl = read_bits(1)
             if ctrl == 1:
@@ -93,54 +92,16 @@ def gorilla_decode(data: bytes) -> list:
             else:
                 xor = read_bits(64)
             curr = prev ^ xor
-            values.append(struct.unpack('d', struct.pack('Q', curr))[0])
+            values.append(
+                struct.unpack('d', struct.pack('Q', curr))[0])
             prev = curr
     return values
 
 
 def gorilla_compression_ratio(values: list) -> float:
-    """Estimate compression ratio."""
+    """估算压缩率。"""
     if not values:
         return 1.0
     encoded = gorilla_encode(values)
     original = len(values) * 8
     return len(encoded) / original if original > 0 else 1.0
-
-
-def _clz64(x: int) -> int:
-    if x == 0:
-        return 64
-    n = 0
-    if x <= 0x00000000FFFFFFFF:
-        n += 32; x <<= 32
-    if x <= 0x0000FFFFFFFFFFFF:
-        n += 16; x <<= 16
-    if x <= 0x00FFFFFFFFFFFFFF:
-        n += 8; x <<= 8
-    if x <= 0x0FFFFFFFFFFFFFFF:
-        n += 4; x <<= 4
-    if x <= 0x3FFFFFFFFFFFFFFF:
-        n += 2; x <<= 2
-    if x <= 0x7FFFFFFFFFFFFFFF:
-        n += 1
-    return n
-
-
-def _ctz64(x: int) -> int:
-    if x == 0:
-        return 64
-    n = 0
-    x &= 0xFFFFFFFFFFFFFFFF
-    if (x & 0xFFFFFFFF) == 0:
-        n += 32; x >>= 32
-    if (x & 0xFFFF) == 0:
-        n += 16; x >>= 16
-    if (x & 0xFF) == 0:
-        n += 8; x >>= 8
-    if (x & 0xF) == 0:
-        n += 4; x >>= 4
-    if (x & 0x3) == 0:
-        n += 2; x >>= 2
-    if (x & 0x1) == 0:
-        n += 1
-    return n

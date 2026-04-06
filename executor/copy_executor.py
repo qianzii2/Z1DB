@@ -1,6 +1,6 @@
 from __future__ import annotations
-"""COPY执行器 — CSV批量加载。
-比INSERT快：批量列写入、编译日期解析、自动字典编码检测。"""
+"""COPY 执行器 — CSV 批量加载/导出。
+[M03] 新增 COPY TO 导出功能。"""
 import time
 from typing import Any, Dict, List, Optional
 from catalog.catalog import Catalog, ColumnSchema, TableSchema
@@ -8,7 +8,6 @@ from executor.core.result import ExecutionResult
 from storage.types import DataType
 from utils.errors import ExecutionError
 
-# 编译日期解析器（修正导入路径）
 try:
     from executor.string_algo.compiled_date import ISO_DATE_PARSER
     _HAS_COMPILED_DATE = True
@@ -16,14 +15,14 @@ except ImportError:
     _HAS_COMPILED_DATE = False
 
 try:
-    from utils.csv_io import read_csv, parse_csv
+    from utils.csv_io import read_csv, write_csv, parse_csv
     _HAS_CSV = True
 except ImportError:
     _HAS_CSV = False
 
 
 class CopyExecutor:
-    """执行COPY FROM批量数据加载。"""
+    """执行 COPY FROM/TO 批量数据操作。"""
 
     def __init__(self, catalog: Catalog) -> None:
         self._catalog = catalog
@@ -31,20 +30,17 @@ class CopyExecutor:
     def copy_from(self, table_name: str, file_path: str,
                   has_header: bool = True, delimiter: str = ',',
                   batch_size: int = 10000) -> ExecutionResult:
-        """从CSV批量加载到表，返回行数。"""
+        """从 CSV 批量加载到表。"""
         if not _HAS_CSV:
-            raise ExecutionError("CSV module not available")
-
+            raise ExecutionError("CSV 模块不可用")
         if not self._catalog.table_exists(table_name):
-            raise ExecutionError(f"table '{table_name}' not found")
+            raise ExecutionError(f"表 '{table_name}' 不存在")
 
         schema = self._catalog.get_table(table_name)
         store = self._catalog.get_store(table_name)
-
         t0 = time.perf_counter()
         headers, rows = read_csv(file_path, delimiter=delimiter,
                                   has_header=has_header)
-
         converters = self._build_converters(schema)
         count = 0
         errors = 0
@@ -53,7 +49,6 @@ class CopyExecutor:
             while len(raw_row) < len(schema.columns):
                 raw_row.append(None)
             raw_row = raw_row[:len(schema.columns)]
-
             converted = []
             valid = True
             for ci, (val, col) in enumerate(zip(raw_row, schema.columns)):
@@ -64,7 +59,6 @@ class CopyExecutor:
                     if not col.nullable:
                         valid = False
                         break
-
             if valid:
                 store.append_row(converted)
                 count += 1
@@ -73,13 +67,71 @@ class CopyExecutor:
 
         elapsed = time.perf_counter() - t0
         rate = count / elapsed if elapsed > 0 else 0
-        msg = f"COPY {count} rows ({elapsed:.3f}s, {rate:.0f} rows/sec)"
+        msg = f"COPY {count} 行 ({elapsed:.3f}s, {rate:.0f} 行/秒)"
         if errors:
-            msg += f", {errors} errors"
+            msg += f", {errors} 个错误"
         return ExecutionResult(affected_rows=count, message=msg)
 
+    def copy_to(self, table_name: str, file_path: str,
+                has_header: bool = True,
+                delimiter: str = ',') -> ExecutionResult:
+        """[M03] 导出表到 CSV 文件。"""
+        if not _HAS_CSV:
+            raise ExecutionError("CSV 模块不可用")
+        if not self._catalog.table_exists(table_name):
+            raise ExecutionError(f"表 '{table_name}' 不存在")
+
+        schema = self._catalog.get_table(table_name)
+        store = self._catalog.get_store(table_name)
+        t0 = time.perf_counter()
+
+        all_rows = store.read_all_rows()
+        # 格式化值用于 CSV 输出
+        formatted_rows = []
+        for row in all_rows:
+            fmt_row = []
+            for ci, val in enumerate(row):
+                col = schema.columns[ci] if ci < len(schema.columns) else None
+                fmt_row.append(self._format_for_csv(val, col))
+            formatted_rows.append(fmt_row)
+
+        headers = schema.column_names
+        count = write_csv(file_path, headers, formatted_rows,
+                          delimiter=delimiter)
+
+        elapsed = time.perf_counter() - t0
+        rate = count / elapsed if elapsed > 0 else 0
+        msg = f"COPY {count} 行到 '{file_path}' ({elapsed:.3f}s, {rate:.0f} 行/秒)"
+        return ExecutionResult(affected_rows=count, message=msg)
+
+    @staticmethod
+    def _format_for_csv(val: Any, col: Optional[ColumnSchema]) -> Any:
+        """将内部值格式化为 CSV 可写形式。"""
+        if val is None:
+            return None
+        if col is None:
+            return val
+        dt = col.dtype
+        if dt == DataType.DATE:
+            try:
+                import datetime
+                d = datetime.date(1970, 1, 1) + datetime.timedelta(days=int(val))
+                return d.isoformat()
+            except Exception:
+                return val
+        if dt == DataType.TIMESTAMP:
+            try:
+                import datetime
+                dt_obj = datetime.datetime(1970, 1, 1) + datetime.timedelta(
+                    microseconds=int(val))
+                return dt_obj.isoformat()
+            except Exception:
+                return val
+        if dt == DataType.BOOLEAN:
+            return 'true' if val else 'false'
+        return val
+
     def _build_converters(self, schema: TableSchema) -> List[Any]:
-        """为每列构建类型转换函数。"""
         converters = []
         for col in schema.columns:
             dt = col.dtype
@@ -107,25 +159,14 @@ class CopyExecutor:
         return converters
 
     @staticmethod
-    def _conv_int(val: Any) -> Optional[int]:
-        if val is None or val == '':
-            return None
-        return int(val)
+    def _conv_int(val): return int(val) if val is not None and val != '' else None
+    @staticmethod
+    def _conv_bigint(val): return int(val) if val is not None and val != '' else None
+    @staticmethod
+    def _conv_float(val): return float(val) if val is not None and val != '' else None
 
     @staticmethod
-    def _conv_bigint(val: Any) -> Optional[int]:
-        if val is None or val == '':
-            return None
-        return int(val)
-
-    @staticmethod
-    def _conv_float(val: Any) -> Optional[float]:
-        if val is None or val == '':
-            return None
-        return float(val)
-
-    @staticmethod
-    def _conv_bool(val: Any) -> Optional[bool]:
+    def _conv_bool(val):
         if val is None or val == '':
             return None
         if isinstance(val, bool):
@@ -138,7 +179,7 @@ class CopyExecutor:
         return None
 
     @staticmethod
-    def _conv_date(val: Any) -> Optional[int]:
+    def _conv_date(val):
         if val is None or val == '':
             return None
         if _HAS_COMPILED_DATE:
@@ -155,7 +196,7 @@ class CopyExecutor:
         return None
 
     @staticmethod
-    def _conv_timestamp(val: Any) -> Optional[int]:
+    def _conv_timestamp(val):
         if val is None or val == '':
             return None
         if _HAS_COMPILED_DATE:
@@ -173,14 +214,12 @@ class CopyExecutor:
         return None
 
     @staticmethod
-    def _conv_varchar(val: Any, max_len: int) -> Optional[str]:
+    def _conv_varchar(val, max_len):
         if val is None or val == '':
             return None
         s = str(val)
         return s[:max_len] if len(s) > max_len else s
 
     @staticmethod
-    def _conv_str(val: Any) -> Optional[str]:
-        if val is None or val == '':
-            return None
-        return str(val)
+    def _conv_str(val):
+        return str(val) if val is not None and val != '' else None

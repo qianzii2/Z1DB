@@ -1,7 +1,9 @@
 from __future__ import annotations
 """查询优化器：常量折叠、谓词简化。
-通过AliasExpr包装保留原始列名。"""
+通过 AliasExpr 包装保留原始列名。
+修复 M11：整数除法使用 math.trunc 而非 int(a/b)。"""
 import dataclasses
+import math
 from typing import Any, Optional
 from parser.ast import (
     AliasExpr, BinaryExpr, CaseExpr, ColumnRef, InExpr, BetweenExpr,
@@ -10,6 +12,12 @@ from parser.ast import (
 )
 from parser.formatter import Formatter
 from storage.types import DataType
+
+
+def _trunc_div(a, b):
+    """SQL 标准截断除法：向零截断（不是 Python 的 floor 除法）。
+    -7 / 2 → -3（SQL标准），Python // 会得到 -4。"""
+    return math.trunc(a / b)
 
 
 class QueryOptimizer:
@@ -60,7 +68,7 @@ class QueryOptimizer:
                 result = self._eval_const_binary(expr.op, left, right)
                 if result is not None:
                     return result
-            # 代数简化 — 只在另一侧也是Literal时才做，防止NULL语义错误
+            # 代数简化
             if expr.op == '+':
                 if isinstance(right, Literal) and right.value == 0:
                     return left
@@ -71,7 +79,6 @@ class QueryOptimizer:
                     return left
                 if isinstance(left, Literal) and left.value == 1:
                     return right
-                # x * 0: 只有双方都是Literal才折叠（因为NULL*0=NULL）
                 if (isinstance(right, Literal) and right.value == 0
                         and isinstance(left, Literal)):
                     return Literal(value=0, inferred_type=DataType.INT)
@@ -124,7 +131,8 @@ class QueryOptimizer:
                 expr,
                 operand=self._fold(expr.operand) if expr.operand else None,
                 when_clauses=new_whens,
-                else_expr=self._fold(expr.else_expr) if expr.else_expr else None)
+                else_expr=self._fold(expr.else_expr)
+                if expr.else_expr else None)
         if isinstance(expr, InExpr):
             return dataclasses.replace(
                 expr, expr=self._fold(expr.expr),
@@ -140,7 +148,7 @@ class QueryOptimizer:
         if isinstance(expr, (AggregateCall, FunctionCall)):
             return dataclasses.replace(
                 expr, args=[self._fold(a) for a in expr.args])
-        # 通用dataclass递归
+        # 通用 dataclass 递归
         if dataclasses.is_dataclass(expr) and not isinstance(expr, type):
             changes: dict = {}
             for f in dataclasses.fields(expr):
@@ -148,8 +156,10 @@ class QueryOptimizer:
                 if isinstance(child, list):
                     changes[f.name] = [self._fold(item) for item in child]
                 elif isinstance(child, tuple):
-                    changes[f.name] = tuple(self._fold(item) for item in child)
-                elif dataclasses.is_dataclass(child) and not isinstance(child, type):
+                    changes[f.name] = tuple(
+                        self._fold(item) for item in child)
+                elif (dataclasses.is_dataclass(child)
+                      and not isinstance(child, type)):
                     changes[f.name] = self._fold(child)
             return dataclasses.replace(expr, **changes) if changes else expr
         return expr
@@ -158,7 +168,6 @@ class QueryOptimizer:
                            right: Literal) -> Optional[Literal]:
         lv, rv = left.value, right.value
         if lv is None or rv is None:
-            # NULL特殊规则
             if op == 'AND' and (lv is False or rv is False):
                 return Literal(value=False, inferred_type=DataType.BOOLEAN)
             if op == 'OR' and (lv is True or rv is True):
@@ -178,7 +187,8 @@ class QueryOptimizer:
                 if rv == 0:
                     return None
                 if isinstance(lv, int) and isinstance(rv, int):
-                    return Literal(value=int(lv / rv),
+                    # M11 修复：SQL 标准截断除法
+                    return Literal(value=_trunc_div(lv, rv),
                                    inferred_type=DataType.INT)
                 return Literal(value=lv / rv, inferred_type=DataType.DOUBLE)
             if op == '%':
@@ -190,17 +200,23 @@ class QueryOptimizer:
                 return Literal(value=str(lv) + str(rv),
                                inferred_type=DataType.VARCHAR)
             if op == '=':
-                return Literal(value=lv == rv, inferred_type=DataType.BOOLEAN)
+                return Literal(value=lv == rv,
+                               inferred_type=DataType.BOOLEAN)
             if op == '!=':
-                return Literal(value=lv != rv, inferred_type=DataType.BOOLEAN)
+                return Literal(value=lv != rv,
+                               inferred_type=DataType.BOOLEAN)
             if op == '<':
-                return Literal(value=lv < rv, inferred_type=DataType.BOOLEAN)
+                return Literal(value=lv < rv,
+                               inferred_type=DataType.BOOLEAN)
             if op == '>':
-                return Literal(value=lv > rv, inferred_type=DataType.BOOLEAN)
+                return Literal(value=lv > rv,
+                               inferred_type=DataType.BOOLEAN)
             if op == '<=':
-                return Literal(value=lv <= rv, inferred_type=DataType.BOOLEAN)
+                return Literal(value=lv <= rv,
+                               inferred_type=DataType.BOOLEAN)
             if op == '>=':
-                return Literal(value=lv >= rv, inferred_type=DataType.BOOLEAN)
+                return Literal(value=lv >= rv,
+                               inferred_type=DataType.BOOLEAN)
             if op == 'AND':
                 return Literal(value=bool(lv and rv),
                                inferred_type=DataType.BOOLEAN)

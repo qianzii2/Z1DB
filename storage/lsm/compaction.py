@@ -1,29 +1,23 @@
 from __future__ import annotations
-
-"""LSM Compaction — merge multiple SSTables into one.
-Removes tombstones and duplicate keys during merge."""
+"""LSM Compaction — 合并多个 SSTable 为一个。
+[FIX-S03] 先写新 SSTable + 更新 MANIFEST，再删旧文件。"""
 import os
-import tempfile
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from storage.lsm.sstable import SSTableWriter, SSTableReader
 
 
 class Compactor:
-    """Merges multiple SSTables into a single sorted SSTable."""
-
     def __init__(self, data_dir: str) -> None:
         self._data_dir = data_dir
 
     def compact(self, sstables: List[SSTableReader],
-                output_path: str, columns: List[str]) -> SSTableReader:
-        """Merge N SSTables into 1, removing tombstones and duplicates.
-
-        Uses a simple N-way merge (latest key wins for duplicates).
-        Tombstones (row=None) are removed in the final output.
-        """
+                output_path: str,
+                columns: List[str]) -> SSTableReader:
+        """合并 N 个 SSTable 为 1 个。
+        [FIX-S03] 返回新 SSTable，调用方负责更新 MANIFEST 后再删旧文件。"""
         writer = SSTableWriter(output_path, columns)
 
-        # N-way merge using iterators
+        # N 路归并
         iters: List[Iterator] = [st.scan() for st in sstables]
         heads: List[Optional[Tuple[Any, Any]]] = []
         for it in iters:
@@ -33,7 +27,6 @@ class Compactor:
                 heads.append(None)
 
         while True:
-            # Find minimum key among all heads
             min_key = None
             min_idx = -1
             for i, head in enumerate(heads):
@@ -52,28 +45,26 @@ class Compactor:
                         pass
 
             if min_idx == -1:
-                break  # All iterators exhausted
+                break
 
-            # Collect all entries with this key (last one wins)
+            # 同 key 取最后一个版本（后面的 SSTable 更新）
             final_row = None
             for i, head in enumerate(heads):
                 if head is None:
                     continue
                 if head[0] == min_key:
-                    final_row = head[1]  # Latest version wins
+                    final_row = head[1]
                     try:
                         heads[i] = next(iters[i])
                     except StopIteration:
                         heads[i] = None
 
-            # Skip tombstones
+            # 跳过 tombstone
             if final_row is not None:
                 writer.add(min_key, final_row)
 
-        meta = writer.finish()
+        writer.finish()
 
-        # Delete old SSTables
-        for st in sstables:
-            st.delete_files()
-
+        # [FIX-S03] 不在此处删除旧文件！
+        # 调用方应在更新 MANIFEST 后再删除
         return SSTableReader(output_path)

@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""LIMIT / OFFSET 算子。"""
+"""LIMIT / OFFSET 算子 — 跳过 offset 行后输出至多 limit 行。"""
 from typing import List, Optional
 from executor.core.batch import VectorBatch
 from executor.core.operator import Operator
@@ -7,7 +7,7 @@ from storage.types import DataType
 
 
 class LimitOperator(Operator):
-    """跳过 offset 行后，最多输出 limit 行。"""
+    """流式 LIMIT/OFFSET，不物化全部数据。"""
 
     def __init__(self, child: Operator, limit: Optional[int],
                  offset: int = 0) -> None:
@@ -35,7 +35,7 @@ class LimitOperator(Operator):
             self._closed = True
 
     def next_batch(self) -> Optional[VectorBatch]:
-        # 已达 limit 上限
+        # 已达 LIMIT 上限，直接结束
         if self._limit is not None and self._rows_emitted >= self._limit:
             return None
 
@@ -46,7 +46,7 @@ class LimitOperator(Operator):
                 return None
             n = batch.row_count
 
-            # OFFSET: 跳过行
+            # OFFSET：跳过前 offset 行
             if self._rows_skipped < self._offset:
                 skip = self._offset - self._rows_skipped
                 if n <= skip:
@@ -56,7 +56,7 @@ class LimitOperator(Operator):
                 self._rows_skipped = self._offset
                 n = batch.row_count
 
-            # LIMIT: 截断
+            # LIMIT：截断多余行
             if self._limit is not None:
                 remaining = self._limit - self._rows_emitted
                 if remaining <= 0:

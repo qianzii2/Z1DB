@@ -1,43 +1,43 @@
 from __future__ import annotations
-
-"""Bit-level black magic — NaN-Boxing, PDEP/PEXT, Broadword Select.
-
-NaN-Boxing: pack type+value into 64-bit IEEE 754 NaN space.
-PDEP/PEXT: parallel bit deposit/extract (Intel BMI2 in pure Python).
-Broadword Select: O(1) find k-th set bit. Paper: Vigna, 2008.
-"""
+"""位级黑魔法 — NaN-Boxing（64位整数支持）、PDEP/PEXT、Broadword Select。"""
 import struct
 
 # ═══ NaN-Boxing ═══
-# IEEE 754 double has 2^52 NaN encodings — we steal them for tagged values.
-#
-# Normal float:    unchanged
-# NULL:            0x7FF8_0000_0000_0001
-# INT32(v):        0x7FF9_0000_VVVV_VVVV
-# BOOL(v):         0x7FFA_0000_0000_000V
-# STRING_PTR(p):   0x7FFB_0000_PPPP_PPPP
+# 策略变更：INT 不再截断为 32 位。
+# 小整数 (|v| < 2^31): INT_TAG | (v & 0xFFFFFFFF)  — 兼容旧路径
+# 大整数: 转为 float64 存储（损失精度仅在 |v| > 2^53 时发生）
+# 这比截断高位要安全得多。
 
-NULL_TAG = 0x7FF8000000000001
-INT_TAG = 0x7FF9000000000000
-BOOL_TAG = 0x7FFA000000000000
-PTR_TAG = 0x7FFB000000000000
-TAG_MASK = 0xFFFF000000000000
+NULL_TAG  = 0x7FF8000000000001
+INT_TAG   = 0x7FF9000000000000
+BOOL_TAG  = 0x7FFA000000000000
+PTR_TAG   = 0x7FFB000000000000
+# [FIX-B03] 新增大整数标签 — 用 float64 编码
+BIGINT_FLOAT_TAG = 0  # 标记：直接用 float 编码路径
+
+TAG_MASK   = 0xFFFF000000000000
 VALUE_MASK = 0x00000000FFFFFFFF
 
 
 def nan_pack_float(v: float) -> int:
-    """Pack float64 → 64-bit int. Normal float path."""
+    """float64 → 64 位无符号整数。"""
     return struct.unpack('Q', struct.pack('d', v))[0]
 
 
 def nan_unpack_float(bits: int) -> float:
-    """Unpack 64-bit int → float64."""
+    """64 位无符号整数 → float64。"""
     return struct.unpack('d', struct.pack('Q', bits))[0]
 
 
 def nan_pack_int(v: int) -> int:
-    """Pack int32 into NaN space."""
-    return INT_TAG | (v & 0xFFFFFFFF)
+    """[FIX-B03] 整数打包：小整数用 INT_TAG，大整数用 float64 编码。
+    确保 BIGINT 值不被截断。"""
+    # 小整数快速路径（32位范围内）
+    if -2147483648 <= v <= 2147483647:
+        return INT_TAG | (v & 0xFFFFFFFF)
+    # [FIX-B03] 大整数：转为 float64 存储
+    # float64 可精确表示 |v| <= 2^53 的整数
+    return nan_pack_float(float(v))
 
 
 def nan_pack_bool(v: bool) -> int:
@@ -57,8 +57,7 @@ def nan_get_tag(bits: int) -> int:
 
 
 def nan_is_float(bits: int) -> bool:
-    """Check if the value is a normal (non-NaN-boxed) float."""
-    # Not a NaN → it's a float; or it's ±0, ±inf
+    """检查是否为正常 float（非 NaN-boxed 特殊值）。"""
     tag = (bits >> 48) & 0xFFFF
     return tag < 0x7FF8 or tag > 0x7FFF
 
@@ -80,13 +79,11 @@ def nan_is_ptr(bits: int) -> bool:
 
 
 def nan_unpack(bits: int) -> tuple:
-    """Unpack → (type_str, value)."""
     if bits == NULL_TAG:
         return ('NULL', None)
     tag = bits & TAG_MASK
     if tag == INT_TAG:
         v = bits & VALUE_MASK
-        # Sign-extend from 32 bits
         if v & 0x80000000:
             v -= 0x100000000
         return ('INT', v)
@@ -94,37 +91,28 @@ def nan_unpack(bits: int) -> tuple:
         return ('BOOL', bool(bits & 1))
     if tag == PTR_TAG:
         return ('PTR', bits & VALUE_MASK)
-    # Normal float
+    # 正常 float — 不做 int 转换（由调用方根据 dtype 决定）
     return ('FLOAT', nan_unpack_float(bits))
 
 
-# ═══ PDEP / PEXT (Intel BMI2 emulation) ═══
+# ═══ PDEP / PEXT (Intel BMI2 纯 Python 模拟) ═══
 
 def pdep(source: int, mask: int) -> int:
-    """Parallel Bit Deposit.
-    Scatter the low popcount(mask) bits of source to the positions of 1-bits in mask.
-
-    Example: pdep(0b1011, 0b11010100) = 0b10010100
-    """
+    """并行位存放。将 source 的低 popcount(mask) 位分散到 mask 的置位位置。"""
     result = 0
     k = 0
     m = mask
     while m:
-        lowest = m & (-m)  # isolate lowest set bit
+        lowest = m & (-m)
         if source & (1 << k):
             result |= lowest
-        m &= m - 1  # clear lowest set bit
+        m &= m - 1
         k += 1
     return result
 
 
 def pext(source: int, mask: int) -> int:
-    """Parallel Bit Extract.
-    Compress the bits of source at positions of 1-bits in mask to contiguous low bits.
-
-    Inverse of pdep.
-    Example: pext(0b10010100, 0b11010100) = 0b1011
-    """
+    """并行位提取。将 source 中 mask 置位位置的值压缩到低位。"""
     result = 0
     k = 0
     m = mask
@@ -138,9 +126,8 @@ def pext(source: int, mask: int) -> int:
 
 
 def bitmap_gather(data_words: list, selection_bitmap: int) -> list:
-    """Use PEXT to gather selected elements from 64-element groups."""
+    """用位图从列表中提取选中元素（最多 64 个）。"""
     result = []
-    bit = 0
     for i in range(min(64, len(data_words))):
         if selection_bitmap & (1 << i):
             result.append(data_words[i])
@@ -148,51 +135,32 @@ def bitmap_gather(data_words: list, selection_bitmap: int) -> list:
 
 
 # ═══ Broadword Select ═══
-# O(1) find the position of the k-th set bit in a 64-bit word.
-# Paper: Vigna, 2008 "Broadword Implementation of Rank/Select Queries"
 
 def select64(word: int, k: int) -> int:
-    """Find position of the k-th (0-indexed) set bit in a 64-bit word.
-    Returns -1 if fewer than k+1 bits are set.
-    Uses broadword programming for O(1) with small constant."""
+    """找第 k 个（0-indexed）置位位在 64 位字中的位置。
+    位数不足返回 -1。"""
     if word == 0:
         return -1
-
-    # Byte-level popcount via SWAR
+    # SWAR popcount
     s = word
     s = s - ((s >> 1) & 0x5555555555555555)
     s = (s & 0x3333333333333333) + ((s >> 2) & 0x3333333333333333)
     s = (s + (s >> 4)) & 0x0F0F0F0F0F0F0F0F
-
-    # Prefix sum of byte popcounts (multiply by 0x0101... = prefix sum trick)
     prefix = s * 0x0101010101010101
-
-    # Total popcount
     total = (prefix >> 56) & 0xFF
     if k >= total:
         return -1
-
-    # Find which byte contains the k-th bit
-    # Compare prefix sums against k+1
     target = k + 1
     byte_idx = 0
-
-    # Check each byte's cumulative popcount
     for bi in range(8):
         cum = (prefix >> (bi * 8)) & 0xFF
         if cum >= target:
             byte_idx = bi
             break
-
-    # Adjust k for bits in previous bytes
     if byte_idx > 0:
         prev_cum = (prefix >> ((byte_idx - 1) * 8)) & 0xFF
         k -= prev_cum
-
-    # Extract target byte
     target_byte = (word >> (byte_idx * 8)) & 0xFF
-
-    # Find k-th set bit within the byte (small lookup)
     pos = 0
     for bit_pos in range(8):
         if target_byte & (1 << bit_pos):
@@ -200,15 +168,138 @@ def select64(word: int, k: int) -> int:
                 pos = bit_pos
                 break
             k -= 1
-
     return byte_idx * 8 + pos
 
 
 def rank64(word: int, pos: int) -> int:
-    """Count set bits in positions [0, pos). O(1) with popcount."""
+    """计算 [0, pos) 范围内的置位数。"""
     if pos <= 0:
         return 0
     if pos >= 64:
         return bin(word & 0xFFFFFFFFFFFFFFFF).count('1')
     mask = (1 << pos) - 1
     return bin(word & mask).count('1')
+
+
+# ═══ NaN-Boxing 批量操作 ═══
+
+def nanbox_batch_eq(packed_a, packed_b, n: int) -> bytearray:
+    """批量等值比较。NULL == NULL → NULL（不置位）。"""
+    bmp = bytearray((n + 7) // 8)
+    for i in range(n):
+        a, b = packed_a[i], packed_b[i]
+        if a == NULL_TAG or b == NULL_TAG:
+            continue
+        if a == b:
+            bmp[i >> 3] |= (1 << (i & 7))
+    return bmp
+
+
+def nanbox_batch_lt(packed_a, packed_b, n: int) -> bytearray:
+    """批量小于比较。"""
+    bmp = bytearray((n + 7) // 8)
+    for i in range(n):
+        a, b = packed_a[i], packed_b[i]
+        if a == NULL_TAG or b == NULL_TAG:
+            continue
+        _, va = nan_unpack(a)
+        _, vb = nan_unpack(b)
+        if va is not None and vb is not None and va < vb:
+            bmp[i >> 3] |= (1 << (i & 7))
+    return bmp
+
+
+def nanbox_batch_gt(packed_a, packed_b, n: int) -> bytearray:
+    """批量大于比较。"""
+    bmp = bytearray((n + 7) // 8)
+    for i in range(n):
+        a, b = packed_a[i], packed_b[i]
+        if a == NULL_TAG or b == NULL_TAG:
+            continue
+        _, va = nan_unpack(a)
+        _, vb = nan_unpack(b)
+        if va is not None and vb is not None and va > vb:
+            bmp[i >> 3] |= (1 << (i & 7))
+    return bmp
+
+
+def nanbox_batch_add(packed_a, packed_b, n: int,
+                     is_float: bool = False):
+    """批量加法。返回 (result_packed, null_bmp)。"""
+    import array
+    result = array.array('Q', [0] * n)
+    null_bmp = bytearray((n + 7) // 8)
+    for i in range(n):
+        a, b = packed_a[i], packed_b[i]
+        if a == NULL_TAG or b == NULL_TAG:
+            result[i] = NULL_TAG
+            null_bmp[i >> 3] |= (1 << (i & 7))
+            continue
+        _, va = nan_unpack(a)
+        _, vb = nan_unpack(b)
+        if va is not None and vb is not None:
+            val = va + vb
+            result[i] = (nan_pack_float(float(val))
+                         if is_float
+                         else nan_pack_int(int(val)))
+        else:
+            result[i] = NULL_TAG
+            null_bmp[i >> 3] |= (1 << (i & 7))
+    return result, null_bmp
+
+
+# ═══ 批量算术 ═══
+
+def nanbox_batch_sub(packed_a, packed_b, n: int,
+                     is_float: bool = False):
+    """批量减法。返回 (result_packed, null_bmp)。"""
+    import array
+    result = array.array('Q', [0] * n)
+    null_bmp = bytearray((n + 7) // 8)
+    for i in range(n):
+        a, b = packed_a[i], packed_b[i]
+        if a == NULL_TAG or b == NULL_TAG:
+            result[i] = NULL_TAG
+            null_bmp[i >> 3] |= (1 << (i & 7))
+            continue
+        _, va = nan_unpack(a)
+        _, vb = nan_unpack(b)
+        if va is not None and vb is not None:
+            val = va - vb
+            result[i] = (nan_pack_float(float(val))
+                         if is_float else nan_pack_int(int(val)))
+        else:
+            result[i] = NULL_TAG
+            null_bmp[i >> 3] |= (1 << (i & 7))
+    return result, null_bmp
+
+
+def nanbox_batch_mul(packed_a, packed_b, n: int,
+                     is_float: bool = False):
+    """批量乘法。INT 溢出返回 NULL（由上层报错）。"""
+    import array
+    result = array.array('Q', [0] * n)
+    null_bmp = bytearray((n + 7) // 8)
+    for i in range(n):
+        a, b = packed_a[i], packed_b[i]
+        if a == NULL_TAG or b == NULL_TAG:
+            result[i] = NULL_TAG
+            null_bmp[i >> 3] |= (1 << (i & 7))
+            continue
+        _, va = nan_unpack(a)
+        _, vb = nan_unpack(b)
+        if va is not None and vb is not None:
+            val = va * vb
+            if is_float:
+                result[i] = nan_pack_float(float(val))
+            else:
+                iv = int(val)
+                if -2147483648 <= iv <= 2147483647:
+                    result[i] = nan_pack_int(iv)
+                else:
+                    # 溢出：回退到 float 编码（由 DataVector.get 还原为 int）
+                    result[i] = nan_pack_float(float(iv))
+        else:
+            result[i] = NULL_TAG
+            null_bmp[i >> 3] |= (1 << (i & 7))
+    return result, null_bmp

@@ -1,10 +1,13 @@
 from __future__ import annotations
-"""Result formatting and table rendering."""
+"""结果格式化和表格渲染 — 委托到 utils/table_renderer.py。"""
 import datetime
 from typing import Any
 
+from utils.table_renderer import print_table
+
 
 def format_value(val: Any, dtype: Any) -> str:
+    """将内部值格式化为可显示字符串。"""
     if val is None:
         return 'NULL'
     name = dtype.name if hasattr(dtype, 'name') else str(dtype)
@@ -18,86 +21,57 @@ def format_value(val: Any, dtype: Any) -> str:
             return str(val)
     if name == 'TIMESTAMP':
         try:
-            dt = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=int(val))
+            dt = datetime.datetime(1970, 1, 1) + datetime.timedelta(
+                microseconds=int(val))
             return dt.isoformat()
         except Exception:
             return str(val)
     if name in ('FLOAT', 'DOUBLE'):
         s = str(val)
-        if '.' not in s and 'e' not in s and 'E' not in s and 'inf' not in s.lower() and 'nan' not in s.lower():
+        if ('.' not in s and 'e' not in s and 'E' not in s
+                and 'inf' not in s.lower() and 'nan' not in s.lower()):
             s += '.0'
         return s
     return str(val)
 
 
 def print_result(result: Any) -> None:
+    """打印查询结果（非 REPL 模式）。"""
+    timing = getattr(result, 'timing', 0.0)
+    time_str = f" ({timing:.3f} sec)" if timing > 0 else ""
+
     if getattr(result, 'message', '') and not getattr(result, 'columns', []):
-        timing = getattr(result, 'timing', 0.0)
-        if timing > 0:
-            print(f"{result.message} ({_fmt_time(timing)})")
-        else:
-            print(f"{result.message}")
+        print(f"{result.message}{time_str}")
         return
 
     if getattr(result, 'affected_rows', 0) > 0 and not getattr(result, 'columns', []):
         n = result.affected_rows
         word = 'row' if n == 1 else 'rows'
-        timing = getattr(result, 'timing', 0.0)
-        if timing > 0:
-            print(f"Inserted {n} {word} ({_fmt_time(timing)})")
-        else:
-            print(f"Inserted {n} {word}")
+        msg = result.message or f'Inserted {n} {word}'
+        print(f"{msg}{time_str}")
         return
 
     columns = getattr(result, 'columns', [])
     if columns:
         col_types = getattr(result, 'column_types', [None] * len(columns))
         rows = getattr(result, 'rows', [])
-        timing = getattr(result, 'timing', 0.0)
 
-        str_rows: list[list[str]] = []
+        # 格式化为字符串
+        str_rows: list = []
         for row in rows:
-            str_row: list[str] = []
+            str_row = []
             for ci, val in enumerate(row):
                 dt = col_types[ci] if ci < len(col_types) else None
-                str_row.append(format_value(val, dt) if dt else str(val) if val is not None else 'NULL')
+                str_row.append(
+                    format_value(val, dt) if dt
+                    else (str(val) if val is not None else 'NULL'))
             str_rows.append(str_row)
 
-        widths = [len(c) for c in columns]
-        for sr in str_rows:
-            for ci, s in enumerate(sr):
-                if ci < len(widths):
-                    widths[ci] = max(widths[ci], len(s))
-
-        def line(left: str, mid: str, right: str, fill: str = '─') -> str:
-            return left + mid.join(fill * (w + 2) for w in widths) + right
-
-        print(line('┌', '┬', '┐'))
-        header = '│' + '│'.join(f' {columns[i]:<{widths[i]}} ' for i in range(len(columns))) + '│'
-        print(header)
-        print(line('├', '┼', '┤'))
-        for sr in str_rows:
-            row_str = '│' + '│'.join(
-                f' {sr[i]:<{widths[i]}} ' if i < len(sr) else ' ' * (widths[i] + 2)
-                for i in range(len(columns))
-            ) + '│'
-            print(row_str)
-        print(line('└', '┴', '┘'))
+        print_table(columns, str_rows)
 
         n = len(rows)
         word = 'row' if n == 1 else 'rows'
-        if timing > 0:
-            print(f"{n} {word} ({_fmt_time(timing)})")
-        else:
-            print(f"{n} {word}")
+        print(f"{n} {word}{time_str}")
     else:
-        timing = getattr(result, 'timing', 0.0)
         msg = getattr(result, 'message', '') or 'OK'
-        if timing > 0:
-            print(f"{msg} ({_fmt_time(timing)})")
-        else:
-            print(msg)
-
-
-def _fmt_time(t: float) -> str:
-    return f"{t:.3f} sec"
+        print(f"{msg}{time_str}")

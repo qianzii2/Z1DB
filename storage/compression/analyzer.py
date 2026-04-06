@@ -1,61 +1,72 @@
 from __future__ import annotations
-"""Compression analyzer — samples data and selects optimal codec per column."""
+"""压缩分析器 — 采样数据选择最优编解码器。
+集成 ALP：浮点列分析 ALP 压缩可行性。"""
 from typing import Any, List, Optional
 from storage.types import DataType
+
+try:
+    from storage.compression.alp import alp_compression_ratio
+    _HAS_ALP = True
+except ImportError:
+    _HAS_ALP = False
 
 
 def analyze_and_choose(values: list, dtype: DataType,
                        sample_size: int = 1024) -> str:
-    """Sample values and choose the best compression method.
-    Returns codec name: 'NONE', 'RLE', 'DICT', 'DELTA', 'FOR', 'GORILLA'."""
+    """采样并选择最佳压缩方法。
+    返回：'NONE','RLE','DICT','DELTA','FOR','GORILLA','ALP'。"""
     if not values:
         return 'NONE'
-
     sample = values[:sample_size]
     non_null = [v for v in sample if v is not None]
     if not non_null:
         return 'NONE'
 
-    # String columns
+    # 字符串列
     if dtype in (DataType.VARCHAR, DataType.TEXT):
         ndv = len(set(non_null))
         if ndv < min(len(non_null), 65536):
             return 'DICT'
         return 'NONE'
 
-    # Boolean
+    # 布尔
     if dtype == DataType.BOOLEAN:
-        return 'NONE'  # Already compact as bitmap
+        return 'NONE'
 
-    # Float columns
+    # 浮点列
     if dtype in (DataType.FLOAT, DataType.DOUBLE):
+        # 优先尝试 ALP（科学/金融数据压缩率更好）
+        if _HAS_ALP and len(non_null) > 10:
+            try:
+                alp_ratio = alp_compression_ratio(
+                    [float(v) for v in non_null])
+                if alp_ratio < 0.4:
+                    return 'ALP'
+            except Exception:
+                pass
+        # 回退 Gorilla
         ratio = _try_gorilla(non_null)
         if ratio < 0.5:
             return 'GORILLA'
         return 'NONE'
 
-    # Integer columns
-    if dtype in (DataType.INT, DataType.BIGINT, DataType.DATE, DataType.TIMESTAMP):
-        # Check if sorted (good for delta)
-        sorted_check = all(non_null[i] <= non_null[i + 1] for i in range(len(non_null) - 1))
+    # 整数列
+    if dtype in (DataType.INT, DataType.BIGINT,
+                 DataType.DATE, DataType.TIMESTAMP):
+        sorted_check = all(
+            non_null[i] <= non_null[i + 1]
+            for i in range(len(non_null) - 1))
         if sorted_check:
             return 'DELTA'
-
-        # Check RLE ratio
         rle_ratio = _try_rle(non_null)
         if rle_ratio < 0.3:
             return 'RLE'
-
-        # Check FOR ratio
         for_ratio = _try_for(non_null)
         if for_ratio < 0.5:
             return 'FOR'
-
-        # Check NDV for dict
         ndv = len(set(non_null))
         if ndv < min(len(non_null) // 2, 65536):
             return 'DICT'
-
         return 'NONE'
 
     return 'NONE'
@@ -78,7 +89,7 @@ def _try_for(values: list) -> float:
     max_v = max(values)
     range_v = max_v - min_v
     if range_v == 0:
-        return 1.0 / 64  # 1 bit per value
+        return 1.0 / 64
     bit_width = max(1, range_v.bit_length())
     return bit_width / 64
 
@@ -87,7 +98,8 @@ def _try_gorilla(values: list) -> float:
     if len(values) < 2:
         return 1.0
     try:
-        from storage.compression.gorilla import gorilla_compression_ratio
+        from storage.compression.gorilla import (
+            gorilla_compression_ratio)
         return gorilla_compression_ratio(values)
     except Exception:
         return 1.0
