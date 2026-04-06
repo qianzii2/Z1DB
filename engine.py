@@ -41,6 +41,12 @@ _DML_TYPES = (InsertStmt, UpdateStmt, DeleteStmt)
 _MUTATING_TYPES = (InsertStmt, UpdateStmt, DeleteStmt,
                    CreateTableStmt, DropTableStmt, AlterTableStmt,
                    CopyStmt)
+# 需要 resolve/validate/optimize 的语句类型
+_NEEDS_RESOLVE = (SelectStmt, ExplainStmt, SetOperationStmt,
+                  InsertStmt, UpdateStmt, DeleteStmt)
+# 不需要任何语义处理的语句类型
+_SKIP_SEMANTIC = (CopyStmt, CreateTableStmt, DropTableStmt,
+                  AlterTableStmt)
 
 
 class Engine:
@@ -99,13 +105,14 @@ class Engine:
             cte_tables = self._materialize_ctes(ast)
             try:
                 if cte_tables: ast = self._strip_ctes(ast)
-                # CopyStmt 不需要 resolve/validate
-                if not isinstance(ast, CopyStmt):
+                # 语义处理：resolve → validate → optimize
+                if isinstance(ast, _NEEDS_RESOLVE):
                     ast = Resolver().resolve(ast, self._catalog)
                     ast = Validator().validate(ast, self._catalog)
-                    ast = self._optimize_ast(ast)
+                    ast = self._optimize_ast(ast)  # ← CopyStmt 已被排除
                     if _HAS_COORDINATOR and isinstance(ast, SelectStmt):
                         ast = self._optimize_subqueries(ast)
+                # _SKIP_SEMANTIC 类型直接跳过所有语义处理
                 is_dml = isinstance(ast, _DML_TYPES)
                 if is_dml:
                     table = getattr(ast, 'table', None)
@@ -268,6 +275,23 @@ class Engine:
     def get_table_names(self): return [t for t in self._catalog.list_tables() if not t.startswith(_CTE_PREFIX)]
     def get_table_schema(self, name): return self._catalog.get_table(name)
     def get_table_row_count(self, name): return self._catalog.get_store(name).row_count
+
+    def get_catalog(self) -> Catalog:
+        """公共接口：获取 catalog 引用。"""
+        return self._catalog
+
+    def get_store(self, table_name: str) -> object:
+        """公共接口：获取表的存储引擎。"""
+        return self._catalog.get_store(table_name)
+
+    def table_exists(self, name: str) -> bool:
+        """公共接口：检查表是否存在。"""
+        return self._catalog.table_exists(name)
+
+    def create_table_from_schema(self, schema: TableSchema,
+                                 if_not_exists: bool = False) -> None:
+        """公共接口：从 schema 创建表。"""
+        self._catalog.create_table(schema, if_not_exists)
 
     def close(self):
         if self._merge_worker:

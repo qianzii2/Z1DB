@@ -93,17 +93,25 @@ class ColumnChunk:
         self.null_bitmap.ensure_capacity(idx + 1)
         if value is None:
             self.null_bitmap.set_bit(idx)
-            if isinstance(self.data, TypedVector): self.data.append(0)
-            elif _HAS_INLINE and isinstance(self.data, InlineStringStore): self.data.append('')
-            elif isinstance(self.data, list): self.data.append('')
-            elif isinstance(self.data, Bitmap): self.data.ensure_capacity(idx + 1)
-        else:
-            if isinstance(self.data, TypedVector): self.data.append(value)
-            elif _HAS_INLINE and isinstance(self.data, InlineStringStore): self.data.append(str(value))
-            elif isinstance(self.data, list): self.data.append(str(value))
+            if isinstance(self.data, TypedVector):
+                self.data.append(0)
+            elif _HAS_INLINE and isinstance(self.data, InlineStringStore):
+                self.data.append('')  # NULL 占位
+            elif isinstance(self.data, list):
+                self.data.append('')
             elif isinstance(self.data, Bitmap):
                 self.data.ensure_capacity(idx + 1)
-                if value: self.data.set_bit(idx)
+        else:
+            if isinstance(self.data, TypedVector):
+                self.data.append(value)
+            elif _HAS_INLINE and isinstance(self.data, InlineStringStore):
+                self.data.append(str(value))
+            elif isinstance(self.data, list):
+                self.data.append(str(value))
+            elif isinstance(self.data, Bitmap):
+                self.data.ensure_capacity(idx + 1)
+                if value:
+                    self.data.set_bit(idx)
         self.row_count += 1
         self._update_zone_map(value)
 
@@ -111,14 +119,15 @@ class ColumnChunk:
         if self.null_bitmap.get_bit(row_idx):
             return None
         if not self._raw_released:
-            if self.dtype == DataType.BOOLEAN: return self.data.get_bit(row_idx)
+            if self.dtype == DataType.BOOLEAN:
+                return self.data.get_bit(row_idx)
             if _HAS_INLINE and isinstance(self.data, InlineStringStore):
-                try: return self.data.get(row_idx)
-                except Exception: pass
-            if isinstance(self.data, TypedVector): return self.data[row_idx]
-            if isinstance(self.data, list): return self.data[row_idx]
+                return self.data.get(row_idx)
+            if isinstance(self.data, TypedVector):
+                return self.data[row_idx]
+            if isinstance(self.data, list):
+                return self.data[row_idx] if row_idx < len(self.data) else None
             return None
-        # [P10] 原始数据已释放 → 分段解压
         return self._get_from_segment(row_idx)
 
     def _get_from_segment(self, row_idx: int) -> object:

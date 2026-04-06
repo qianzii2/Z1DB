@@ -1,10 +1,22 @@
 from __future__ import annotations
-"""UNION / INTERSECT / EXCEPT 算子。使用统一的NullSentinel。"""
+"""UNION / INTERSECT / EXCEPT 算子。"""
 from typing import List, Optional, Tuple
 from executor.core.batch import VectorBatch
 from executor.core.operator import Operator
 from executor.operators.distinct import null_safe_row_key
 from storage.types import DataType
+
+
+def _drain_to_rows(op: Operator) -> list:
+    """排空算子收集所有行。所有集合算子共用此函数。"""
+    rows = []
+    while True:
+        b = Operator._ensure_batch(op.next_batch())
+        if b is None:
+            break
+        rows.extend(b.to_rows())
+    op.close()
+    return rows
 
 
 class UnionOperator(Operator):
@@ -26,8 +38,8 @@ class UnionOperator(Operator):
     def open(self) -> None:
         self.left.open()
         self.right.open()
-        left_rows = self._drain(self.left)
-        right_rows = self._drain(self.right)
+        left_rows = _drain_to_rows(self.left)
+        right_rows = _drain_to_rows(self.right)
 
         combined = left_rows + right_rows
         if not self._all:
@@ -57,16 +69,6 @@ class UnionOperator(Operator):
     def close(self) -> None:
         pass
 
-    def _drain(self, op: Operator) -> list:
-        rows = []
-        while True:
-            b = self._ensure_batch(op.next_batch())
-            if b is None:
-                break
-            rows.extend(b.to_rows())
-        op.close()
-        return rows
-
 
 class IntersectOperator(Operator):
     """INTERSECT [ALL]。"""
@@ -87,8 +89,8 @@ class IntersectOperator(Operator):
     def open(self) -> None:
         self.left.open()
         self.right.open()
-        lr = self._drain(self.left)
-        rr = self._drain(self.right)
+        lr = _drain_to_rows(self.left)
+        rr = _drain_to_rows(self.right)
 
         right_set: dict = {}
         for row in rr:
@@ -122,16 +124,6 @@ class IntersectOperator(Operator):
     def close(self) -> None:
         pass
 
-    def _drain(self, op: Operator) -> list:
-        rows = []
-        while True:
-            b = self._ensure_batch(op.next_batch())
-            if b is None:
-                break
-            rows.extend(b.to_rows())
-        op.close()
-        return rows
-
 
 class ExceptOperator(Operator):
     """EXCEPT [ALL]。"""
@@ -152,8 +144,8 @@ class ExceptOperator(Operator):
     def open(self) -> None:
         self.left.open()
         self.right.open()
-        lr = self._drain(self.left)
-        rr = self._drain(self.right)
+        lr = _drain_to_rows(self.left)
+        rr = _drain_to_rows(self.right)
 
         right_set: dict = {}
         for row in rr:
@@ -187,13 +179,3 @@ class ExceptOperator(Operator):
 
     def close(self) -> None:
         pass
-
-    def _drain(self, op: Operator) -> list:
-        rows = []
-        while True:
-            b = self._ensure_batch(op.next_batch())
-            if b is None:
-                break
-            rows.extend(b.to_rows())
-        op.close()
-        return rows

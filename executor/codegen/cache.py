@@ -1,12 +1,12 @@
 from __future__ import annotations
-"""LRU compile cache — reuse compiled functions for repeated query patterns."""
+"""LRU 编译缓存 — 复用已编译的表达式函数。"""
 from typing import Any, Callable, Dict, Optional
 from collections import OrderedDict
-from metal.hash import murmur3_64
+from metal.hash import z1hash64  # ← 改
 
 
 class CompileCache:
-    """LRU cache for compiled expressions. Key = AST content hash."""
+    """编译缓存。key = AST 内容哈希。"""
 
     def __init__(self, max_size: int = 256) -> None:
         self._cache: OrderedDict[int, Callable] = OrderedDict()
@@ -28,7 +28,7 @@ class CompileCache:
             self._cache[expr_hash] = fn
             return
         if len(self._cache) >= self._max_size:
-            self._cache.popitem(last=False)  # evict LRU
+            self._cache.popitem(last=False)
         self._cache[expr_hash] = fn
 
     @property
@@ -38,5 +38,5 @@ class CompileCache:
 
     @staticmethod
     def hash_expr(expr: Any) -> int:
-        """Hash an AST expression for cache lookup."""
-        return murmur3_64(repr(expr).encode('utf-8'))
+        """哈希 AST 表达式用于缓存查找。"""
+        return z1hash64(repr(expr).encode('utf-8'))  # ← 改

@@ -24,70 +24,101 @@ class SortMergeJoinOperator(Operator):
         self._right_key = right_key or ''
 
     def output_schema(self) -> List[Tuple[str, DataType]]:
+        if self._join_type in ('SEMI', 'ANTI'):
+            return self.left.output_schema()
         return self.left.output_schema() + self.right.output_schema()
 
     def open(self) -> None:
-        self.left.open(); self.right.open()
+        self.left.open()
+        self.right.open()
         schema = self.output_schema()
         self._out_names = [n for n, _ in schema]
         self._out_types = [t for _, t in schema]
         l_names = [n for n, _ in self.left.output_schema()]
         r_names = [n for n, _ in self.right.output_schema()]
         left_col_count = len(l_names)
-        l_rows = self._collect_and_sort(self.left, l_names, self._left_key)
-        r_rows = self._collect_and_sort(self.right, r_names, self._right_key)
-        self.left.close(); self.right.close()
+        l_rows = self._collect_and_sort(
+            self.left, l_names, self._left_key)
+        r_rows = self._collect_and_sort(
+            self.right, r_names, self._right_key)
+        self.left.close()
+        self.right.close()
 
         self._result_rows = []
         li = ri = 0
         right_matched: set = set()
 
         while li < len(l_rows) and ri < len(r_rows):
-            lk = l_rows[li][0]; rk = r_rows[ri][0]
+            lk = l_rows[li][0]
+            rk = r_rows[ri][0]
             if lk is None:
-                if self._join_type in ('LEFT', 'FULL'):
-                    self._result_rows.append(l_rows[li][1] + [None] * len(r_names))
-                li += 1; continue
+                if self._join_type in ('LEFT', 'FULL', 'ANTI'):
+                    if self._join_type == 'ANTI':
+                        self._result_rows.append(l_rows[li][1])
+                    elif self._join_type != 'ANTI':
+                        self._result_rows.append(
+                            l_rows[li][1] + [None] * len(r_names))
+                li += 1
+                continue
             if rk is None:
                 if self._join_type in ('RIGHT', 'FULL'):
-                    self._result_rows.append([None] * left_col_count + r_rows[ri][1])
+                    self._result_rows.append(
+                        [None] * left_col_count + r_rows[ri][1])
                     right_matched.add(ri)
-                ri += 1; continue
+                ri += 1
+                continue
             cmp = self._safe_cmp(lk, rk)
             if cmp < 0:
                 if self._join_type in ('LEFT', 'FULL'):
-                    self._result_rows.append(l_rows[li][1] + [None] * len(r_names))
+                    self._result_rows.append(
+                        l_rows[li][1] + [None] * len(r_names))
+                elif self._join_type == 'ANTI':
+                    self._result_rows.append(l_rows[li][1])
                 li += 1
             elif cmp > 0:
                 if self._join_type in ('RIGHT', 'FULL'):
-                    self._result_rows.append([None] * left_col_count + r_rows[ri][1])
+                    self._result_rows.append(
+                        [None] * left_col_count + r_rows[ri][1])
                     right_matched.add(ri)
                 ri += 1
             else:
+                # 匹配区间
                 li_start = li
-                while li < len(l_rows) and self._safe_cmp(l_rows[li][0], lk) == 0:
+                while (li < len(l_rows)
+                       and self._safe_cmp(l_rows[li][0], lk) == 0):
                     li += 1
                 ri_start = ri
-                while ri < len(r_rows) and self._safe_cmp(r_rows[ri][0], rk) == 0:
+                while (ri < len(r_rows)
+                       and self._safe_cmp(r_rows[ri][0], rk) == 0):
                     ri += 1
-                for lj in range(li_start, li):
-                    for rj in range(ri_start, ri):
-                        self._result_rows.append(l_rows[lj][1] + r_rows[rj][1])
-                        right_matched.add(rj)
+
+                if self._join_type == 'SEMI':
+                    for lj in range(li_start, li):
+                        self._result_rows.append(l_rows[lj][1])
+                elif self._join_type == 'ANTI':
+                    pass  # 有匹配则不输出
+                else:
+                    for lj in range(li_start, li):
+                        for rj in range(ri_start, ri):
+                            self._result_rows.append(
+                                l_rows[lj][1] + r_rows[rj][1])
+                            right_matched.add(rj)
+
+        # 尾部未匹配行
         while li < len(l_rows):
             if self._join_type in ('LEFT', 'FULL'):
-                self._result_rows.append(l_rows[li][1] + [None] * len(r_names))
+                self._result_rows.append(
+                    l_rows[li][1] + [None] * len(r_names))
+            elif self._join_type == 'ANTI':
+                self._result_rows.append(l_rows[li][1])
             li += 1
         while ri < len(r_rows):
             if self._join_type in ('RIGHT', 'FULL'):
                 if ri not in right_matched:
-                    self._result_rows.append([None] * left_col_count + r_rows[ri][1])
-                    right_matched.add(ri)
+                    self._result_rows.append(
+                        [None] * left_col_count + r_rows[ri][1])
             ri += 1
-        if self._join_type in ('RIGHT', 'FULL'):
-            for rj in range(len(r_rows)):
-                if rj not in right_matched:
-                    self._result_rows.append([None] * left_col_count + r_rows[rj][1])
+
         self._emitted = False
 
     def _collect_and_sort(self, op, names, key_col):

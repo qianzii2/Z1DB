@@ -84,77 +84,79 @@ class FilterOperator(Operator):
                 self._jit_attempted = True
                 self._jit_fn = self._try_compile()
 
-            # JIT 路径
+            # JIT 路径 — 统一 (type, fn) 格式
             if self._jit_fn is not None:
                 jit_type, jit_fn = self._jit_fn
-                if jit_type == 'columnar':
-                    # [P12] 列式 JIT：直接在列向量上操作
-                    from metal.bitmap import Bitmap
-                    try:
-                        mask = jit_fn(batch.columns, batch.row_count, Bitmap)
-                        if mask.popcount() == 0:
-                            continue
-                        if mask.popcount() == batch.row_count:
-                            return batch
-                        if self._enable_lazy and _HAS_LAZY:
-                            return LazyBatch(batch, mask)
-                        filtered = batch.filter_by_bitmap(mask)
-                        if filtered.row_count > 0:
-                            return filtered
+                try:
+                    if jit_type == 'columnar':
+                        from metal.bitmap import Bitmap
+                        mask = jit_fn(batch.columns,
+                                      batch.row_count, Bitmap)
+                    else:
+                        # 行式 JIT
+                        from metal.bitmap import Bitmap
+                        mask = Bitmap(batch.row_count)
+                        col_names = batch.column_names
+                        for i in range(batch.row_count):
+                            row_dict = {n: batch.columns[n].get(i)
+                                        for n in col_names}
+                            if jit_fn(row_dict):
+                                mask.set_bit(i)
+
+                    if mask.popcount() == 0:
                         continue
-                    except Exception:
-                        self._jit_fn = None  # 列式失败，禁用
-                else:
-                    # 行式 JIT
-                    from metal.bitmap import Bitmap
-                    mask = Bitmap(batch.row_count)
-                    col_names = batch.column_names
-                    hit = 0
-                    for i in range(batch.row_count):
-                        row_dict = {n: batch.columns[n].get(i) for n in col_names}
-                        if jit_fn(row_dict):
-                            mask.set_bit(i); hit += 1
-                    if hit == 0: continue
-                    if hit == batch.row_count: return batch
+                    if mask.popcount() == batch.row_count:
+                        return batch
                     if self._enable_lazy and _HAS_LAZY:
                         return LazyBatch(batch, mask)
                     filtered = batch.filter_by_bitmap(mask)
-                    if filtered.row_count > 0: return filtered
+                    if filtered.row_count > 0:
+                        return filtered
                     continue
+                except Exception:
+                    self._jit_fn = None  # JIT 失败，禁用
 
             # 向量化评估路径
-            mask = self._evaluator.evaluate_predicate(self._predicate, batch)
-            if mask.popcount() == 0: continue
-            if mask.popcount() == batch.row_count: return batch
+            mask = self._evaluator.evaluate_predicate(
+                self._predicate, batch)
+            if mask.popcount() == 0:
+                continue
+            if mask.popcount() == batch.row_count:
+                return batch
             if self._enable_lazy and _HAS_LAZY:
                 return LazyBatch(batch, mask)
             filtered = batch.filter_by_bitmap(mask)
-            if filtered.row_count > 0: return filtered
-            continue
+            if filtered.row_count > 0:
+                return filtered
 
-    def _try_compile(self) -> Optional[Any]:
-        """优先列式 JIT，回退行式 JIT。"""
+    def _try_compile(self) -> Optional[tuple]:
+        """编译谓词。返回 (type_str, callable) 或 None。
+        type_str: 'columnar' 或 'row'。"""
         cache = _get_compile_cache()
         if cache is None:
             return None
         expr_hash = cache.hash_expr(self._predicate)
         cached_fn = cache.get(expr_hash)
         if cached_fn is not None:
-            return cached_fn
-        # [P12] 优先列式编译
-        col_fn = ExprCompiler.compile_columnar_predicate(self._predicate)
+            # 缓存中已是 (type_str, callable) 格式
+            if isinstance(cached_fn, tuple) and len(cached_fn) == 2:
+                return cached_fn
+            # 旧格式兼容：裸 callable → 假定行式
+            return ('row', cached_fn)
+
+        # 优先列式编译
+        col_fn = ExprCompiler.compile_columnar_predicate(
+            self._predicate)
         if col_fn is not None:
-            # 包装为统一接口
-            def wrapper(batch_or_dict):
-                if isinstance(batch_or_dict, dict):
-                    # 行式回退
-                    return None
-                return '__columnar__', col_fn
-            cache.put(expr_hash, ('columnar', col_fn))
-            return ('columnar', col_fn)
+            entry = ('columnar', col_fn)
+            cache.put(expr_hash, entry)
+            return entry
+
         # 回退行式编译
         fn = ExprCompiler.compile_predicate(self._predicate)
         if fn is not None:
-            cache.put(expr_hash, ('row', fn))
-            return ('row', fn)
+            entry = ('row', fn)
+            cache.put(expr_hash, entry)
+            return entry
+
         return None

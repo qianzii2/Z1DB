@@ -140,20 +140,21 @@ class VectorBatch:
             # NaN-Boxing 路径（INT/FLOAT/DOUBLE/DATE）
             if code is not None and _HAS_NANBOX and ctype in _NANBOX_TYPES:
                 is_float = ctype in (DataType.FLOAT, DataType.DOUBLE)
-                import array as _array
-                from metal.bitmagic import nan_pack_float, nan_pack_int
-                packed = _array.array('Q', [0] * n)
-                for ri in range(n):
-                    val = col_values[ri]
-                    if val is None:
-                        packed[ri] = NULL_TAG
-                    elif is_float:
-                        packed[ri] = nan_pack_float(float(val))
-                    else:
-                        packed[ri] = nan_pack_int(int(val))
+                from metal.bitmagic import (
+                    nanbox_batch_pack_int, nanbox_batch_pack_float)
+
+                null_set = set(null_indices)
+                if is_float:
+                    packed = nanbox_batch_pack_float(
+                        col_values, null_set, n)
+                else:
+                    packed = nanbox_batch_pack_int(
+                        col_values, null_set, n)
+
                 lazy_data = _unpack_to_typed(ctype, packed, n)
-                cols[cname] = DataVector(dtype=ctype, data=lazy_data,
-                                         nulls=nulls, _length=n, _packed=packed)
+                cols[cname] = DataVector(
+                    dtype=ctype, data=lazy_data,
+                    nulls=nulls, _length=n, _packed=packed)
                 continue
 
             # BIGINT/TIMESTAMP + 其他数值：直接 TypedVector

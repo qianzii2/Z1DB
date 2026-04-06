@@ -5,7 +5,7 @@ import dataclasses, functools, time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from catalog.catalog import Catalog
 from executor.core.batch import VectorBatch
-from executor.core.operator import Operator
+from executor.core.operator import Operator, drain_operator
 from executor.core.result import ExecutionResult
 from executor.core.vector import DataVector
 from executor.expression.evaluator import ExpressionEvaluator
@@ -333,7 +333,16 @@ class IntegratedPlanner:
                     batches = [r for r in results if r is not None]
                     if batches:
                         return _PrecomputedOperator(batches, ordered, store)
-                except Exception: pass
+                except ImportError:
+                    import sys
+                    print("[警告] MorselDriver 不可用，"
+                      "TURBO 退化为顺序扫描",
+                      file=sys.stderr)
+                except Exception as e:
+                    import sys
+                    print(f"[警告] Morsel 并行失败: {e}，"
+                      f"退化为顺序扫描",
+                      file=sys.stderr)
 
         # 回退到 ZoneMap 扫描（未被策略选中但条件满足时）
         if _HAS_ZONEMAP_SCAN and ast.where and rc > MICRO_THRESHOLD:
@@ -518,38 +527,23 @@ class IntegratedPlanner:
         return HashJoinOperator(left, right, jt, on)
 
     def _drain(self, op):
-        schema = op.output_schema()
-        cn = [n for n, _ in schema]; ct = [t for _, t in schema]
-        op.open(); rows = []
-        while True:
-            b = op.next_batch()
-            if b is None: break
-            b = Operator._ensure_batch(b)
-            if b is None: break
-            rows.extend(b.to_rows())
-        op.close()
-        return ExecutionResult(columns=cn, column_types=ct, rows=rows, row_count=len(rows))
+        return drain_operator(op)
 
     def _drain_with_monitoring(self, op, tier):
-        schema = op.output_schema()
-        cn = [n for n, _ in schema]; ct = [t for _, t in schema]
+        """带运行时监控的排空。复用 drain_operator 的排空逻辑。"""
+        import time
         start = time.perf_counter()
-        op.open(); rows = []
-        while True:
-            b = op.next_batch()
-            if b is None: break
-            b = Operator._ensure_batch(b)
-            if b is None: break
-            rows.extend(b.to_rows())
-        op.close()
+        result = drain_operator(op)
         elapsed = time.perf_counter() - start
-        result = ExecutionResult(columns=cn, column_types=ct, rows=rows, row_count=len(rows))
+        result.timing = elapsed
         if self._rt_opt and tier in ('STD', 'TURBO'):
-            rs = self._rt_opt.record(type(op).__name__, estimated_rows=1000,
-                actual_rows=len(rows), elapsed_ms=elapsed * 1000)
+            rs = self._rt_opt.record(
+                type(op).__name__, estimated_rows=1000,
+                actual_rows=len(result.rows),
+                elapsed_ms=elapsed * 1000)
             if rs.is_off and elapsed > 0.1:
                 suggestion = self._rt_opt.suggest_strategy_change(
-                    type(op).__name__, len(rows))
+                    type(op).__name__, len(result.rows))
                 if suggestion:
                     result.message = (
                         f"[{tier}] {elapsed:.3f}s ⚠️ 估算偏差 "

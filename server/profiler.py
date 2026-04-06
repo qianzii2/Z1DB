@@ -59,19 +59,21 @@ def run_benchmark(engine: Any, sql: str, iterations: int) -> Dict[str, float]:
 def memory_stats(engine: Any) -> List[tuple]:
     rows_data = []; total_bytes = 0
     for tname in engine.get_table_names():
-        store = engine._catalog.get_store(tname)
+        store = engine.get_store(tname)          # ← 改
         row_count = store.row_count
-        schema = engine._catalog.get_table(tname)
+        schema = engine.get_table_schema(tname)  # ← 改
         est_bytes = 0
         from storage.types import DTYPE_TO_ARRAY_CODE
         for col in schema.columns:
             code = DTYPE_TO_ARRAY_CODE.get(col.dtype)
-            if code: est_bytes += row_count * struct.calcsize(code)
-            else: est_bytes += row_count * 20
+            if code:
+                est_bytes += row_count * struct.calcsize(code)
+            else:
+                est_bytes += row_count * 20
             est_bytes += (row_count + 7) // 8
         total_bytes += est_bytes
         rows_data.append((tname, str(row_count), _fmt_bytes(est_bytes)))
-    rows_data.append(('─ TOTAL ─', '', _fmt_bytes(total_bytes)))
+    rows_data.append(('─ 合计 ─', '', _fmt_bytes(total_bytes)))
     return rows_data
 
 

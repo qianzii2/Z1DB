@@ -1,9 +1,8 @@
-# storage/table_store.py — 完整文件
-
 from __future__ import annotations
-"""内存列式存储 — 列式 chunk + Delta tombstone。
-[R6 修复] 写入直接进主存储（保证 SeqScan 可见性）。
-DeltaStore 仅用于 UPDATE/DELETE 的 tombstone 跟踪。"""
+"""内存列式存储 — 列式 chunk + 全局删除标记。
+写入直接进主存储（保证 SeqScan 可见性）。
+DELETE 通过 _deleted_global 位集标记，read_all_rows 跳过已标记行。
+COMPACT 物理清除已删除行。"""
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 from metal.config import CHUNK_SIZE
 from storage.column_chunk import ColumnChunk
@@ -26,10 +25,19 @@ class TableStore:
         self._row_count_main = 0
         self._delta: Optional[DeltaStore] = None
         self._deleted_global: Set[int] = set()
+        # 读缓存
+        self._read_cache: Optional[List[list]] = None
+        self._read_cache_version: int = 0
+        self._version: int = 0  # 每次写入/删除递增
         for col in schema.columns:
             self._chunks[col.name] = [ColumnChunk(col.dtype)]
         if _HAS_DELTA:
             self._delta = DeltaStore(schema.column_names)
+
+    def _invalidate_cache(self) -> None:
+        """写入/删除后失效缓存。"""
+        self._version += 1
+        self._read_cache = None
 
     @property
     def row_count(self) -> int:
@@ -37,7 +45,7 @@ class TableStore:
         return self._row_count_main - len(self._deleted_global)
 
     def append_row(self, row: list) -> None:
-        """[R6] 直接追加到主存储（保证 SeqScan 立即可见）。"""
+        """追加一行。"""
         first_col = self.schema.columns[0].name
         current_chunk = self._chunks[first_col][-1]
         if current_chunk.row_count >= CHUNK_SIZE:
@@ -50,63 +58,56 @@ class TableStore:
             val = row[i] if i < len(row) else None
             self._chunks[col.name][-1].append(val)
         self._row_count_main += 1
+        self._invalidate_cache()
 
     def append_rows(self, rows: List[list]) -> int:
         for row in rows:
             self.append_row(row)
         return len(rows)
 
-    def delete_rows(self, indices_to_delete: Set[int]) -> int:
-        """按逻辑索引删除行。"""
-        if not indices_to_delete:
+    def delete_rows(self, indices: Set[int]) -> int:
+        if not indices:
             return 0
-        index_map = self._build_active_index_map()
+        active_map = self._build_active_index_map()
         count = 0
-        for logical_idx in sorted(indices_to_delete):
-            if logical_idx >= len(index_map):
-                continue
-            entry = index_map[logical_idx]
-            if entry is None:
-                continue
-            physical_idx = entry
-            if physical_idx not in self._deleted_global:
-                self._deleted_global.add(physical_idx)
-                count += 1
-        if (self._row_count_main > 0
-                and len(self._deleted_global) > self._row_count_main // 2):
-            self._compact()
+        for logical_idx in indices:
+            if 0 <= logical_idx < len(active_map):
+                physical_idx = active_map[logical_idx]
+                if physical_idx is not None:
+                    self._deleted_global.add(physical_idx)
+                    count += 1
+        self._invalidate_cache()
         return count
 
     def update_rows(self, indices: Set[int], col_idx: int,
                     new_values: dict) -> int:
-        """按逻辑索引更新。标记旧行删除 + 追加新行。"""
         if not new_values:
             return 0
-        index_map = self._build_active_index_map()
-        all_active = self.read_all_rows()
+        all_rows = self.read_all_rows()
+        active_map = self._build_active_index_map()
         count = 0
-        for logical_idx, val in new_values.items():
-            if logical_idx < 0 or logical_idx >= len(all_active):
-                continue
-            old_row = list(all_active[logical_idx])
-            old_row[col_idx] = val
-            # 标记旧行删除
-            if logical_idx < len(index_map) and index_map[logical_idx] is not None:
-                self._deleted_global.add(index_map[logical_idx])
-            # 追加新行到主存储
-            self.append_row(old_row)
-            count += 1
+        for logical_idx, new_val in new_values.items():
+            if 0 <= logical_idx < len(all_rows):
+                if logical_idx < len(active_map):
+                    physical_idx = active_map[logical_idx]
+                    if physical_idx is not None:
+                        self._deleted_global.add(physical_idx)
+                old_row = list(all_rows[logical_idx])
+                old_row[col_idx] = new_val
+                self.append_row(old_row)
+                count += 1
         return count
 
     def _build_active_index_map(self) -> List[Optional[int]]:
-        """构建逻辑索引→物理索引映射。
-        逻辑索引 = read_all_rows 返回列表的位置。
+        """构建逻辑索引 → 物理索引映射。
+        逻辑索引 = read_all_rows 返回列表中的位置。
         物理索引 = 主存储中的全局行号。"""
         result: List[Optional[int]] = []
         global_idx = 0
         chunk_count = self.get_chunk_count()
         for chunk_idx in range(chunk_count):
-            first = self._chunks[self.schema.columns[0].name][chunk_idx]
+            first = self._chunks[
+                self.schema.columns[0].name][chunk_idx]
             for row_idx in range(first.row_count):
                 if global_idx not in self._deleted_global:
                     result.append(global_idx)
@@ -128,11 +129,16 @@ class TableStore:
             self._chunks[col.name] = [ColumnChunk(col.dtype)]
         self._row_count_main = 0
         self._deleted_global.clear()
+        self._invalidate_cache()
         if _HAS_DELTA and self._delta:
             self._delta.clear()
 
     def read_all_rows(self) -> List[list]:
-        """读取所有活跃行（跳过已删除行）。"""
+        """读取所有活跃行。带缓存，写入/删除后自动失效。"""
+        if (self._read_cache is not None
+                and self._read_cache_version == self._version):
+            return [list(r) for r in self._read_cache]  # 返回副本
+
         rows: List[list] = []
         global_idx = 0
         chunk_count = self.get_chunk_count()
@@ -146,9 +152,13 @@ class TableStore:
                             self._chunks[col.name][chunk_idx].get(row_idx))
                     rows.append(row)
                 global_idx += 1
-        return rows
+
+        self._read_cache = rows
+        self._read_cache_version = self._version
+        return [list(r) for r in rows]  # 返回副本防止外部修改
 
     def read_rows_by_indices(self, indices: List[int]) -> List[list]:
+        """按逻辑索引读取行。"""
         if not indices:
             return []
         all_rows = self.read_all_rows()
@@ -156,7 +166,7 @@ class TableStore:
                 if 0 <= idx < len(all_rows)]
 
     def _compact(self) -> None:
-        """合并：重建主存储，清除删除标记。"""
+        """合并：重建主存储，物理清除已删除行。"""
         active = self.read_all_rows()
         self._chunks = {}
         for col in self.schema.columns:

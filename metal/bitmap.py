@@ -181,15 +181,34 @@ class Bitmap:
         return r
 
     def popcount(self) -> int:
-        full = self._logical_size // 8
-        count = 0
+        """统计置位数。64 位字批量处理 + 尾部字节查表。"""
+        total = 0
+        data = self._data
+        byte_count = self._logical_size // 8
+        tail_bits = self._logical_size % 8
         pc = _BYTE_POPCOUNT
-        for i in range(full):
-            count += pc[self._data[i]]
-        tail = self._logical_size % 8
-        if tail and full < len(self._data):
-            count += pc[self._data[full] & ((1 << tail) - 1)]
-        return count
+
+        # 64 位字批量路径
+        i = 0
+        while i + 8 <= byte_count:
+            word = int.from_bytes(data[i:i + 8], 'little')
+            # SWAR popcount (Hamming weight)
+            word = word - ((word >> 1) & 0x5555555555555555)
+            word = (word & 0x3333333333333333) + ((word >> 2) & 0x3333333333333333)
+            word = (word + (word >> 4)) & 0x0F0F0F0F0F0F0F0F
+            total += ((word * 0x0101010101010101) >> 56) & 0xFF
+            i += 8
+
+        # 剩余字节逐字节查表
+        while i < byte_count:
+            total += pc[data[i]]
+            i += 1
+
+        # 尾部不足一字节
+        if tail_bits and byte_count < len(data):
+            total += pc[data[byte_count] & ((1 << tail_bits) - 1)]
+
+        return total
 
     def to_indices(self) -> List[int]:
         result = []

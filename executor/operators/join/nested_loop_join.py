@@ -26,6 +26,9 @@ class NestedLoopJoinOperator(Operator):
         self._emitted = False
 
     def output_schema(self) -> List[Tuple[str, DataType]]:
+        # SEMI/ANTI 只输出左表列
+        if self._join_type in ('SEMI', 'ANTI'):
+            return self.left.output_schema()
         return self.left.output_schema() + self.right.output_schema()
 
     def open(self) -> None:
@@ -34,7 +37,9 @@ class NestedLoopJoinOperator(Operator):
         schema = self.output_schema()
         self._out_names = [n for n, _ in schema]
         self._out_types = [t for _, t in schema]
-        left_col_count = len(self.left.output_schema())
+        left_schema = self.left.output_schema()
+        left_col_count = len(left_schema)
+        left_names = [n for n, _ in left_schema]
 
         # 物化右表
         right_rows: list = []
@@ -55,20 +60,38 @@ class NestedLoopJoinOperator(Operator):
             if lb is None:
                 break
             for li in range(lb.row_count):
-                l_row = {n: lb.columns[n].get(li) for n in lb.column_names}
+                l_row = {n: lb.columns[n].get(li)
+                         for n in lb.column_names}
                 found = False
                 for ri, r_row in enumerate(right_rows):
                     combined = {**l_row, **r_row}
                     if self._on_expr is None or self._eval_cond(combined):
-                        out = [combined.get(n) for n in self._out_names]
-                        self._result_rows.append(out)
-                        found = True
-                        right_matched.add(ri)
-                if not found and self._join_type in ('LEFT', 'FULL'):
-                    row = [l_row.get(n)
-                           for n in self._out_names[:left_col_count]]
-                    row += [None] * (len(self._out_names) - left_col_count)
-                    self._result_rows.append(row)
+                        if self._join_type == 'SEMI':
+                            # SEMI: 找到一个匹配即输出左行并停止
+                            self._result_rows.append(
+                                [l_row.get(n) for n in self._out_names])
+                            found = True
+                            break
+                        elif self._join_type == 'ANTI':
+                            # ANTI: 找到匹配则不输出
+                            found = True
+                            break
+                        else:
+                            out = [combined.get(n)
+                                   for n in self._out_names]
+                            self._result_rows.append(out)
+                            found = True
+                            right_matched.add(ri)
+                if not found:
+                    if self._join_type in ('LEFT', 'FULL'):
+                        row = [l_row.get(n)
+                               for n in self._out_names[:left_col_count]]
+                        row += [None] * (len(self._out_names) - left_col_count)
+                        self._result_rows.append(row)
+                    elif self._join_type == 'ANTI':
+                        # ANTI: 没找到匹配则输出左行
+                        self._result_rows.append(
+                            [l_row.get(n) for n in self._out_names])
         self.left.close()
 
         if self._join_type in ('RIGHT', 'FULL'):

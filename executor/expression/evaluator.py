@@ -42,11 +42,6 @@ try:
 except ImportError:
     _HAS_VEC_OPS = False
 try:
-    from executor.expression.scalar_registry import ScalarFunctionRegistry
-    _HAS_SCALAR_REG = True
-except ImportError:
-    _HAS_SCALAR_REG = False
-try:
     from metal.bitmagic import (
         nanbox_batch_eq, nanbox_batch_lt, nanbox_batch_gt,
         nanbox_batch_add, NULL_TAG as _NANBOX_NULL_TAG)
@@ -525,18 +520,17 @@ class ExpressionEvaluator(EvalHelpers):
 
     def _eval_function(self, expr, batch):
         name = expr.name.upper(); n = batch.row_count
-        if name == 'IF' and len(expr.args) >= 3: return self._if_fn_lazy(expr, batch)
-        if name == 'COALESCE' and expr.args: return self._coalesce_lazy(expr, batch)
+        # 短路：IF 和 COALESCE 需要惰性求值
+        if name == 'IF' and len(expr.args) >= 3:
+            return self._if_fn_lazy(expr, batch)
+        if name == 'COALESCE' and expr.args:
+            return self._coalesce_lazy(expr, batch)
+        # 求值所有参数
         args = [self.evaluate(a, batch) for a in expr.args]
-        if _HAS_SCALAR_REG:
-            entry = ScalarFunctionRegistry.get(name)
-            if entry is not None:
-                fn_impl, _ = entry
-                try: return fn_impl(args, n, self)
-                except Exception: pass
+        # 统一 dispatch_table 查找
         handler = self._get_dispatch().get(name)
         if handler is not None:
-            return handler(self, args, n, expr)  # _safe 内部做参数校验
+            return handler(self, args, n, expr)
         raise ExecutionError(f"未知函数: {expr.name}")
 
     def _if_fn_lazy(self, expr, batch):

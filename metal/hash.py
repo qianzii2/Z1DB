@@ -104,10 +104,6 @@ def z1hash128(key: bytes, seed: int = 0) -> tuple[int, int]:
     return h1, h2
 
 
-# ═══ 兼容别名（全项目逐步迁移后可删除）═══
-murmur3_64 = z1hash64
-murmur3_128 = z1hash128
-
 
 def fibonacci_hash(key: int, shift: int) -> int:
     return ((key * 11400714819323198485)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 """位级黑魔法 — NaN-Boxing（64位整数支持）、PDEP/PEXT、Broadword Select。"""
 import struct
-
+import warnings
 # ═══ NaN-Boxing ═══
 # 策略变更：INT 不再截断为 32 位。
 # 小整数 (|v| < 2^31): INT_TAG | (v & 0xFFFFFFFF)  — 兼容旧路径
@@ -30,13 +30,17 @@ def nan_unpack_float(bits: int) -> float:
 
 
 def nan_pack_int(v: int) -> int:
-    """[FIX-B03] 整数打包：小整数用 INT_TAG，大整数用 float64 编码。
-    确保 BIGINT 值不被截断。"""
+    """整数打包：小整数用 INT_TAG，大整数用 float64 编码。
+    |v| > 2^53 时精度可能丢失并发出告警。"""
     # 小整数快速路径（32位范围内）
     if -2147483648 <= v <= 2147483647:
         return INT_TAG | (v & 0xFFFFFFFF)
-    # [FIX-B03] 大整数：转为 float64 存储
-    # float64 可精确表示 |v| <= 2^53 的整数
+    # 大整数：转为 float64 存储
+    if abs(v) > (1 << 53):
+        warnings.warn(
+            f"NaN-Boxing: 整数 {v} 超过 2^53，"
+            f"转为 float64 可能丢失精度",
+            RuntimeWarning, stacklevel=2)
     return nan_pack_float(float(v))
 
 
@@ -303,3 +307,29 @@ def nanbox_batch_mul(packed_a, packed_b, n: int,
             result[i] = NULL_TAG
             null_bmp[i >> 3] |= (1 << (i & 7))
     return result, null_bmp
+
+
+def nanbox_batch_pack_int(values: list, null_indices: set,
+                          n: int):
+    """批量整数打包。返回 packed array.array('Q')。"""
+    import array
+    packed = array.array('Q', [0] * n)
+    for i in range(n):
+        if i in null_indices:
+            packed[i] = NULL_TAG
+        else:
+            packed[i] = nan_pack_int(values[i])
+    return packed
+
+
+def nanbox_batch_pack_float(values: list, null_indices: set,
+                            n: int):
+    """批量浮点打包。返回 packed array.array('Q')。"""
+    import array
+    packed = array.array('Q', [0] * n)
+    for i in range(n):
+        if i in null_indices:
+            packed[i] = NULL_TAG
+        else:
+            packed[i] = nan_pack_float(float(values[i]))
+    return packed

@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Set, Tuple
 from catalog.catalog import Catalog, ColumnSchema, TableSchema
 from executor.core.result import ExecutionResult
-from metal.hash import murmur3_64
+from metal.hash import z1hash64
 from utils.errors import ExecutionError, RecursionLimitError
 
 MAX_ITERATIONS = 1000
@@ -98,14 +98,23 @@ class RecursiveCTEExecutor:
         except Exception as e:
             raise ExecutionError(f"Recursive CTE execution failed: {e}")
 
-    def _materialize_working_table(self, name: str, columns: List[str],
-                                   col_types: list, rows: List[list],
+    def _materialize_working_table(self, name: str,
+                                   columns: List[str],
+                                   col_types: list,
+                                   rows: List[list],
                                    already_exists: bool) -> None:
-        """物化工作表。已存在时truncate重填，不存在时create。"""
+        """物化工作表。批量写入减少不一致窗口。"""
         if already_exists and self._catalog.table_exists(name):
-            # 直接清空重填，避免drop+create开销
             store = self._catalog.get_store(name)
+            # 构建全部新行后一次性替换
+            # 策略：truncate + batch append
+            # 不一致窗口仅在 truncate→append 之间
             store.truncate()
+            if hasattr(store, 'append_rows'):
+                store.append_rows(rows)
+            else:
+                for row in rows:
+                    store.append_row(list(row))
         else:
             # 首次创建
             if self._catalog.table_exists(name):
@@ -115,16 +124,11 @@ class RecursiveCTEExecutor:
             schema = TableSchema(name=name, columns=cols)
             self._catalog.create_table(schema)
             store = self._catalog.get_store(name)
-        # 填充数据
-        for row in rows:
-            store.append_row(list(row))
-
-    def _cleanup(self, name: str) -> None:
-        if self._catalog.table_exists(name):
-            try:
-                self._catalog.drop_table(name)
-            except Exception:
-                pass
+            if hasattr(store, 'append_rows'):
+                store.append_rows(rows)
+            else:
+                for row in rows:
+                    store.append_row(list(row))
 
     @staticmethod
     def _row_hash(row: list) -> int:
@@ -146,4 +150,4 @@ class RecursiveCTEExecutor:
                 encoded = str(val).encode('utf-8')
                 parts.append(b'\x04' + len(encoded).to_bytes(4, 'little')
                              + encoded)
-        return murmur3_64(b''.join(parts))
+        return z1hash64(b''.join(parts))
