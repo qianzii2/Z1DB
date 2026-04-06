@@ -94,32 +94,27 @@ class SortOperator(Operator):
         self._emitted = False
 
     def _build_inline_stores(self, key_columns, key_dtypes, n):
-        """构建 InlineStringStore（NULL 用集合跟踪）。
-        0.2 修复后 InlineStringStore 可用。"""
-        try:
-            from metal.inline_string import InlineStringStore
-        except ImportError:
-            return {}
-
+        if not _HAS_INLINE_STRING: return {}
         stores = {}
+        null_sets = {}  # [P19] 记录哪些行是 NULL
         for ki, (values, _, _) in enumerate(key_columns):
-            if key_dtypes[ki] not in (DataType.VARCHAR, DataType.TEXT):
-                continue
-            if n < 100:
-                continue  # 太小不值得
+            if key_dtypes[ki] not in (DataType.VARCHAR, DataType.TEXT): continue
+            if n < 100: continue
             try:
                 iss = InlineStringStore(capacity=n)
-                null_set: set = set()
+                ns = set()
                 for idx, val in enumerate(values):
                     if val is None:
-                        iss.append('')  # 占位
-                        null_set.add(idx)
+                        iss.append(_NULL_SENTINEL)  # [P19] NULL 哨兵
+                        ns.add(idx)
                     else:
                         iss.append(str(val))
-                stores[ki] = (iss, null_set)
-            except Exception:
-                # 构建失败回退到标准比较
-                continue
+                stores[ki] = iss
+                null_sets[ki] = ns
+            except Exception: pass
+        # 将 null_sets 附加到 stores 字典
+        for ki in stores:
+            stores[ki] = (stores[ki], null_sets.get(ki, set()))
         return stores
 
     def _make_compare_fn(self, key_columns, inline_stores):

@@ -136,41 +136,20 @@ class Catalog:
     def list_tables(self) -> list[str]:
         return list(self._schemas.keys())
 
-    def alter_drop_column(self, table: str,
-                          col_name: str) -> None:
+    def alter_add_column(self, table: str,
+                         col: ColumnSchema) -> None:
         if table not in self._schemas:
             raise TableNotFoundError(table)
         schema = self._schemas[table]
-        idx = None
-        for i, c in enumerate(schema.columns):
-            if c.name == col_name:
-                idx = i
-                break
-        if idx is None:
-            raise ColumnNotFoundError(col_name)
-        if len(schema.columns) <= 1:
-            raise ExecutionError("无法删除唯一的列")
-
+        if any(c.name == col.name for c in schema.columns):
+            raise DuplicateError(
+                f"column '{col.name}' already exists")
         store = self._stores[table]
-
-        # LSMStore：先 flush 确保 MemTable 数据落盘
-        if self.use_lsm and hasattr(store, 'flush'):
-            store.flush()
-
-        # 先读行（此时 schema 尚未修改，列数一致）
         all_rows = store.read_all_rows()
-
-        # 从每行中移除目标列
-        for row in all_rows:
-            if idx < len(row):
-                row.pop(idx)
-
-        # 再修改 schema
-        schema.columns.pop(idx)
-
+        schema.columns.append(col)
         # 重建存储
-        self._rebuild_store(table, schema, all_rows)
-
+        self._rebuild_store(table, schema, all_rows,
+                            add_column=True)
         if self.is_persistent:
             self._save_schema()
 

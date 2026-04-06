@@ -47,7 +47,7 @@ ALL_MODULES = [
     'test_ddl', 'test_dml', 'test_select', 'test_join',
     'test_agg', 'test_window', 'test_set_ops', 'test_subquery',
     'test_copy', 'test_index', 'test_storage', 'test_compression',
-    'test_column_chunk', 'test_wal', 'test_txn', #'test_structures',
+    'test_column_chunk', 'test_wal', 'test_txn', 'test_structures',
     'test_nanboxing', 'test_bitmap', 'test_performance',
     'test_null', 'test_edge_cases', 'test_persistence', 'test_concurrent',
 ]

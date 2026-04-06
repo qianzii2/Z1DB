@@ -25,8 +25,9 @@ try:
 except ImportError: _HAS_SORTED = False
 
 
-def compute_agg_window(fn, frame, indices, batch, results, ho,
-                       evaluator):
+def compute_agg_window(fn: Any, frame: Any, indices: List[int],
+                       batch: Any, results: list, ho: bool,
+                       evaluator: Any) -> None:
     """聚合窗口函数入口。自动选择最优计算路径。"""
     from parser.ast import StarExpr
     name = fn.name.upper()
@@ -36,8 +37,8 @@ def compute_agg_window(fn, frame, indices, batch, results, ho,
         av = None
     ps = len(indices)
 
-    vals = []
-    has_nulls = False
+    # 构建值数组（NULL → 0，同时检测 NULL）
+    vals = []; has_nulls = False
     for p in range(ps):
         if av is not None:
             v = av[indices[p]]
@@ -58,10 +59,35 @@ def compute_agg_window(fn, frame, indices, batch, results, ho,
     if fst == 'UNBOUNDED_PRECEDING' and fen == 'CURRENT_ROW':
         _agg_prefix(name, vals, indices, results, av, ps); return
 
-    # ★ 新增：滑动窗口路径（SUM/COUNT/AVG，O(N)）
-    if _can_use_sliding(name, frame, has_nulls) and ps > 16:
-        _agg_sliding(name, vals, indices, results, av, frame, ps, ho)
-        return
+    # 有 NULL 时回退暴力
+    if has_nulls:
+        _agg_brute(name, vals, indices, results, av, frame, ps, ho); return
+
+    # 帧大小
+    fs = frame.start.offset if frame and frame.start and frame.start.type == 'N_PRECEDING' else None
+    fe = frame.end.offset if frame and frame.end and frame.end.type == 'N_FOLLOWING' else None
+    if fs is not None or fe is not None:
+        fsz = (fs or 0) + (fe or 0) + 1
+        # MEDIAN → WaveletTree
+        if name in ('MEDIAN', 'PERCENTILE_CONT', 'APPROX_PERCENTILE') and _HAS_WAVELET and ps > 16:
+            _agg_wavelet(name, vals, indices, results, frame, ps, ho); return
+        # MIN/MAX → SparseTable
+        if name in ('MIN', 'MAX') and _HAS_SPARSE and ps > 16:
+            _agg_sparse(name, vals, indices, results, frame, ps, ho); return
+        # SUM/COUNT/AVG → FenwickTree
+        if name in ('SUM', 'AVG', 'COUNT') and ps > 16:
+            if _HAS_FENWICK:
+                _agg_fenwick(name, vals, indices, results, frame, ps, ho); return
+            if _HAS_SEGTREE:
+                _agg_segtree(name, vals, indices, results, frame, ps, ho); return
+        # 小帧暴力
+        if fsz <= 8:
+            _agg_brute(name, vals, indices, results, av, frame, ps, ho); return
+        # MEDIAN 滑动窗口 → SortedContainer
+        if name == 'MEDIAN' and _HAS_SORTED and ps > 16:
+            _agg_mos_median(vals, indices, results, frame, ps, ho); return
+
+    _agg_brute(name, vals, indices, results, av, frame, ps, ho)
 
 
 # ═══ 分区全量 ═══
@@ -225,83 +251,3 @@ def _agg_brute(name, vals, indices, results, av, frame, ps, ho):
                 wv.sort(); m = len(wv)
                 results[indices[p]] = wv[m // 2] if m % 2 == 1 else (wv[m // 2 - 1] + wv[m // 2]) / 2
             else: results[indices[p]] = None
-
-def _agg_sliding(name, vals, indices, results, av, frame, ps, ho):
-    """SUM/COUNT/AVG 的滑动窗口 O(N) 计算。
-    当帧是 N PRECEDING 到 M FOLLOWING 形式时使用。"""
-    # 计算首个窗口
-    s0, e0 = frame_bounds(frame, 0, ps, ho)
-    window_sum = 0.0
-    window_count = 0
-    for wp in range(s0, min(e0 + 1, ps)):
-        if av is not None:
-            v = av[indices[wp]]
-            if v is not None:
-                window_sum += v
-                window_count += 1
-        else:
-            window_sum += 1
-            window_count += 1
-
-    _emit(name, indices[0], results, window_sum, window_count)
-
-    # 滑动：每步加入新元素、移除旧元素
-    for p in range(1, ps):
-        s_new, e_new = frame_bounds(frame, p, ps, ho)
-        s_old, e_old = frame_bounds(frame, p - 1, ps, ho)
-
-        # 移除离开帧的元素
-        for wp in range(s_old, s_new):
-            if 0 <= wp < ps:
-                if av is not None:
-                    v = av[indices[wp]]
-                    if v is not None:
-                        window_sum -= v
-                        window_count -= 1
-                else:
-                    window_sum -= 1
-                    window_count -= 1
-
-        # 加入进入帧的元素
-        for wp in range(e_old + 1, e_new + 1):
-            if 0 <= wp < ps:
-                if av is not None:
-                    v = av[indices[wp]]
-                    if v is not None:
-                        window_sum += v
-                        window_count += 1
-                else:
-                    window_sum += 1
-                    window_count += 1
-
-        _emit(name, indices[p], results, window_sum, window_count)
-
-
-def _emit(name, idx, results, window_sum, window_count):
-    """写入聚合结果。"""
-    if name == 'SUM':
-        results[idx] = window_sum
-    elif name == 'COUNT':
-        results[idx] = window_count
-    elif name == 'AVG':
-        results[idx] = (window_sum / window_count
-                        if window_count > 0 else None)
-
-
-def _can_use_sliding(name, frame, has_nulls):
-    """判断是否可用滑动窗口。"""
-    if name not in ('SUM', 'COUNT', 'AVG'):
-        return False
-    if has_nulls and name in ('SUM', 'AVG'):
-        # 有 NULL 时滑动窗口的加减可能不精确（NULL 值需特殊处理）
-        # 实际上上面的实现已处理 NULL，可以启用
-        pass
-    if frame is None:
-        return False
-    # 只有固定偏移帧才能用滑动
-    fs = frame.start
-    fe = frame.end
-    if fs and fs.type in ('N_PRECEDING', 'CURRENT_ROW'):
-        if fe and fe.type in ('N_FOLLOWING', 'CURRENT_ROW'):
-            return True
-    return False

@@ -277,7 +277,8 @@ class HashAggOperator(Operator):
 
     def _try_dict_group_agg(self, key_vec, agg_vec, agg_call,
                             groups, group_order) -> bool:
-        """字典编码 GROUP BY。AVG 路径加类型安全检查。"""
+        """[集成] 字典编码 GROUP BY。
+        [R8] AVG 返回 (sum,count) 元组，直接操作 state。"""
         try:
             de = key_vec.dict_encoded
             n = len(key_vec)
@@ -311,21 +312,12 @@ class HashAggOperator(Operator):
                     func, state = gs._states[name]
 
                     if agg_upper == 'AVG' and isinstance(agg_val, tuple):
-                        # 类型安全检查：确保 state 是 (sum, count) 格式
-                        if (isinstance(state, tuple)
-                                and len(state) == 2
-                                and isinstance(state[0], (int, float))
-                                and isinstance(state[1], (int,))):
-                            partial_sum, partial_count = agg_val
-                            old_sum, old_count = state
-                            state = (old_sum + partial_sum,
-                                     old_count + partial_count)
-                        else:
-                            # state 格式不兼容，回退到标准路径
-                            vec = DataVector.from_scalar(
-                                agg_val[0] / agg_val[1] if agg_val[1] > 0 else None,
-                                DataType.DOUBLE)
-                            state = func.update(state, vec, 1)
+                        # [R8] AVG: dict_group_aggregate 返回 (sum, count)
+                        # AvgAgg.update 忽略 rc 参数，直接操作 state
+                        partial_sum, partial_count = agg_val
+                        old_sum, old_count = state
+                        state = (old_sum + partial_sum,
+                                 old_count + partial_count)
                     else:
                         vec = DataVector.from_scalar(
                             agg_val,

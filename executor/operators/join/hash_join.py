@@ -156,42 +156,20 @@ class HashJoinOperator(Operator):
             # 本 batch 无匹配行，继续读下一个
 
     def _probe_batch(self, lb: VectorBatch) -> List[list]:
-        """批量 probe：预提取所有列值避免逐行构建 dict。"""
+        """对一个左 batch 执行 probe，返回匹配行列表。"""
         result_rows: List[list] = []
         left_col_count = self._left_col_count
-        left_names = lb.column_names
-        n = lb.row_count
 
-        # ═══ 预提取列值为 Python list（一次性） ═══
-        left_cols = {name: lb.columns[name].to_python_list()
-                     for name in left_names}
-
-        # 预计算 probe key 列（如果有）
-        probe_keys = None
-        if self._use_ht and self._left_key:
-            if self._left_key in left_cols:
-                probe_keys = left_cols[self._left_key]
-            else:
-                # 限定名尝试
-                for name in left_names:
-                    if name.endswith('.' + self._left_key.split('.')[-1]):
-                        probe_keys = left_cols[name]
-                        break
-
-        for li in range(n):
-            # O(1) 构建行 dict（从预提取列中索引）
-            l_row = {name: left_cols[name][li] for name in left_names}
+        for li in range(lb.row_count):
+            l_row = {n: lb.columns[n].get(li) for n in lb.column_names}
 
             if self._use_ht:
-                probe_key = (probe_keys[li] if probe_keys is not None
-                             else l_row.get(self._left_key))
+                probe_key = l_row.get(self._left_key)
                 # BloomFilter 预过滤
-                if (self._bloom is not None
-                        and probe_key is not None
+                if (self._bloom is not None and probe_key is not None
                         and not self._bloom.contains(probe_key)):
                     if self.join_type in ('LEFT', 'FULL'):
-                        result_rows.append(
-                            self._left_null_row(l_row, left_col_count))
+                        result_rows.append(self._left_null_row(l_row, left_col_count))
                     elif self.join_type == 'ANTI':
                         result_rows.append(self._left_only_row(l_row))
                     continue
@@ -201,18 +179,18 @@ class HashJoinOperator(Operator):
 
             if not candidates:
                 if self.join_type in ('LEFT', 'FULL'):
-                    result_rows.append(
-                        self._left_null_row(l_row, left_col_count))
+                    result_rows.append(self._left_null_row(l_row, left_col_count))
                 elif self.join_type == 'ANTI':
                     result_rows.append(self._left_only_row(l_row))
                 continue
 
+            # 有额外条件时批量评估
             if self._has_extra and self._on_expr is not None:
-                self._probe_with_eval(
-                    l_row, candidates, left_col_count, result_rows)
+                self._probe_with_eval(l_row, candidates, left_col_count,
+                                       result_rows)
             else:
-                self._probe_direct(
-                    l_row, candidates, left_col_count, result_rows)
+                self._probe_direct(l_row, candidates, left_col_count,
+                                    result_rows)
 
         return result_rows
 

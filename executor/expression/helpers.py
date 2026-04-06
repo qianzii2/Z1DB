@@ -11,10 +11,7 @@ from metal.typed_vector import TypedVector
 from storage.types import (
     DTYPE_TO_ARRAY_CODE, DataType, is_numeric, resolve_type_name)
 from utils.errors import ExecutionError
-from executor.expression.vec_ops import (
-    map_unary_numeric, map_binary_numeric,
-    map_unary_string, map_binary_string, map_ternary_string,
-    map_str_int, map_binary_bool, values_to_vector)
+
 try:
     from executor.string_algo.compiled_date import ISO_DATE_PARSER, parse_date_auto as _parse_date_auto
     _HAS_COMPILED_DATE = True
@@ -34,16 +31,32 @@ class EvalHelpers:
     # ═══ 字符串 ═══
 
     def _str1(self, v, n, fn):
-        return map_unary_string(v, n, fn)
+        rd=[]; rn=Bitmap(n)
+        for i in range(n):
+            if v.is_null(i): rn.set_bit(i); rd.append('')
+            else: rd.append(fn(str(v.get(i))))
+        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
     def _str2(self, a, b, n, fn):
-        return map_binary_string(a, b, n, fn)
+        rd=[]; rn=Bitmap(n)
+        for i in range(n):
+            if a.is_null(i) or b.is_null(i): rn.set_bit(i); rd.append('')
+            else: rd.append(fn(str(a.get(i)), str(b.get(i))))
+        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
     def _str3(self, a, b, c, n, fn):
-        return map_ternary_string(a, b, c, n, fn)
+        rd=[]; rn=Bitmap(n)
+        for i in range(n):
+            if a.is_null(i) or b.is_null(i) or c.is_null(i): rn.set_bit(i); rd.append('')
+            else: rd.append(fn(str(a.get(i)), str(b.get(i)), str(c.get(i))))
+        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
     def _str_int(self, sv, iv, n, fn):
-        return map_str_int(sv, iv, n, fn)
+        rd=[]; rn=Bitmap(n)
+        for i in range(n):
+            if sv.is_null(i) or iv.is_null(i): rn.set_bit(i); rd.append('')
+            else: rd.append(fn(str(sv.get(i)), int(iv.get(i))))
+        return DataVector(dtype=DataType.VARCHAR, data=rd, nulls=rn, _length=n)
 
     def _substr(self, args, n):
         sv=args[0]; rd=[]; rn=Bitmap(n)
@@ -89,13 +102,31 @@ class EvalHelpers:
     # ═══ 数值 ═══
 
     def _num1(self, v, n, fn, dt):
-        return map_unary_numeric(v, n, fn, dt)
+        code=DTYPE_TO_ARRAY_CODE.get(dt); rd=TypedVector(code) if code else []; rn=Bitmap(n)
+        for i in range(n):
+            if v.is_null(i): rn.set_bit(i); rd.append(0 if isinstance(rd,TypedVector) else None)
+            else:
+                val=fn(v.get(i))
+                if val is None: rn.set_bit(i); rd.append(0 if isinstance(rd,TypedVector) else None)
+                else: rd.append(val)
+        return DataVector(dtype=dt, data=rd, nulls=rn, _length=n)
 
     def _num2(self, a, b, n, fn, dt):
-        return map_binary_numeric(a, b, n, fn, dt)
+        code=DTYPE_TO_ARRAY_CODE.get(dt); rd=TypedVector(code) if code else []; rn=Bitmap(n)
+        for i in range(n):
+            if a.is_null(i) or b.is_null(i): rn.set_bit(i); rd.append(0 if isinstance(rd,TypedVector) else None)
+            else:
+                val=fn(a.get(i),b.get(i))
+                if val is None: rn.set_bit(i); rd.append(0 if isinstance(rd,TypedVector) else None)
+                else: rd.append(val)
+        return DataVector(dtype=dt, data=rd, nulls=rn, _length=n)
 
     def _bool2(self, a, b, n, fn):
-        return map_binary_bool(a, b, n, fn)
+        rd=Bitmap(n); rn=Bitmap(n)
+        for i in range(n):
+            if a.is_null(i) or b.is_null(i): rn.set_bit(i)
+            elif fn(a.get(i),b.get(i)): rd.set_bit(i)
+        return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
 
     def _variadic(self, args, n, fn, dt):
         results=[fn([a.get(i) for a in args]) for i in range(n)]
@@ -341,7 +372,28 @@ class EvalHelpers:
     # ═══ 通用 ═══
 
     def _list_to_vec(self, values, dtype, n):
-        return values_to_vector(values, dtype, n)
+        if dtype==DataType.UNKNOWN: dtype=DataType.INT
+        code=DTYPE_TO_ARRAY_CODE.get(dtype); nulls=Bitmap(n)
+        if dtype==DataType.BOOLEAN:
+            data=Bitmap(n)
+            for i in range(n):
+                if values[i] is None: nulls.set_bit(i)
+                elif values[i]: data.set_bit(i)
+        elif dtype in (DataType.VARCHAR,DataType.TEXT):
+            data=['' if values[i] is None else str(values[i]) for i in range(n)]
+            for i in range(n):
+                if values[i] is None: nulls.set_bit(i)
+        elif code:
+            data=TypedVector(code)
+            for i in range(n):
+                if values[i] is None: nulls.set_bit(i); data.append(0)
+                else: data.append(values[i])
+        else:
+            data=TypedVector('q')
+            for i in range(n):
+                if values[i] is None: nulls.set_bit(i); data.append(0)
+                else: data.append(int(values[i]))
+        return DataVector(dtype=dtype, data=data, nulls=nulls, _length=n)
 
     def _to_bool(self, vec):
         if vec.dtype==DataType.BOOLEAN: return vec

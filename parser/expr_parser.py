@@ -135,18 +135,12 @@ class ExprParser:
         self._p.advance()
         if name.lower() in _NOARG_FUNCS:
             if self._p.current_token().type == TokenType.LPAREN:
-                self._p.advance();
-                self._p.expect(TokenType.RPAREN)
+                self._p.advance(); self._p.expect(TokenType.RPAREN)
             return FunctionCall(name=name.upper(), args=[])
         if self._p.current_token().type == TokenType.LPAREN:
             return self._parse_function_call(name)
         if self._p.current_token().type == TokenType.DOT:
-            self._p.advance()
-            # [修复] 检查 * 而非期望标识符
-            if self._p.current_token().type == TokenType.STAR:
-                self._p.advance()
-                return ColumnRef(table=name, column='*')  # 表示 table.*
-            return ColumnRef(table=name, column=self._p.accept_identifier())
+            self._p.advance(); return ColumnRef(table=name, column=self._p.accept_identifier())
         return ColumnRef(table=None, column=name)
 
     def _parse_function_call(self, name):

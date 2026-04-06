@@ -5,7 +5,7 @@ import dataclasses
 from typing import Any, Dict, List, Optional, Set, Tuple
 from catalog.catalog import Catalog
 from executor.core.batch import VectorBatch
-from executor.core.operator import Operator, drain_operator
+from executor.core.operator import Operator
 from executor.core.result import ExecutionResult
 from executor.core.vector import DataVector
 from executor.expression.evaluator import ExpressionEvaluator
@@ -130,7 +130,7 @@ class SimplePlanner:
         elif n == 'INTERSECT': op = IntersectOperator(lo, ro, ast.all)
         elif n == 'EXCEPT': op = ExceptOperator(lo, ro, ast.all)
         else: raise ExecutionError(f"未知集合操作: {n}")
-        return drain_operator(op)
+        return self._drain(op)
 
     def _plan_any(self, ast, catalog):
         if isinstance(ast, SetOperationStmt):
@@ -154,9 +154,9 @@ class SimplePlanner:
         ast = self._resolve_subqueries(ast, catalog)
         ha = any(self._contains_agg(e) for e in ast.select_list)
         hw = any(self._contains_window(e) for e in ast.select_list)
-        if ha or ast.group_by: return drain_operator(self._plan_grouped(ast, catalog))
-        if hw: return drain_operator(self._plan_windowed(ast, catalog))
-        return drain_operator(self._plan_select(ast, catalog))
+        if ha or ast.group_by: return self._drain(self._plan_grouped(ast, catalog))
+        if hw: return self._drain(self._plan_windowed(ast, catalog))
+        return self._drain(self._plan_select(ast, catalog))
 
     def _resolve_subqueries(self, ast, catalog):
         ch = {}
@@ -486,29 +486,14 @@ class SimplePlanner:
         return r
 
     def _build_proj(self, ast):
-        """构建投影列表。[修复] 处理 StarExpr。"""
-        if not ast.select_list:
-            return []
-        result = []
-        for item in ast.select_list:
-            if isinstance(item, StarExpr):
-                # [修复] StarExpr 应在 Resolver 中展开
-                # 如果到这里仍是 StarExpr，说明是 SELECT * 且无 FROM
-                # 此时应返回空投影（由 Resolver 处理）
-                continue
-            if isinstance(item, AliasExpr):
-                result.append((item.alias or self._expr_name(item.expr), item.expr))
-            else:
-                result.append((self._expr_name(item), item))
-        return result
-
-    def _expr_name(self, expr):
-        """提取表达式的名称。"""
-        if isinstance(expr, ColumnRef):
-            return expr.column
-        if isinstance(expr, Literal):
-            return str(expr.value)
-        return 'expr'
+        proj = []
+        for expr in ast.select_list:
+            nm = self._out_name(expr)
+            inner = expr.expr if isinstance(expr, AliasExpr) else expr
+            if isinstance(inner, StarExpr):
+                raise ExecutionError("内部错误: StarExpr 未展开")
+            proj.append((nm, inner))
+        return proj
 
     def _out_name(self, expr):
         if isinstance(expr, AliasExpr): return expr.alias
@@ -527,3 +512,15 @@ class SimplePlanner:
         v = int(v)
         if v < 0: raise ExecutionError("LIMIT/OFFSET 必须非负")
         return v
+
+    def _drain(self, op):
+        s = op.output_schema(); cn = [n for n, _ in s]; ct = [t for _, t in s]
+        op.open(); rows = []
+        while True:
+            b = op.next_batch()
+            if b is None: break
+            b = Operator._ensure_batch(b)
+            if b is None: break
+            rows.extend(b.to_rows())
+        op.close()
+        return ExecutionResult(columns=cn, column_types=ct, rows=rows, row_count=len(rows))

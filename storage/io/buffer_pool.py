@@ -132,7 +132,7 @@ class BufferPool:
         return bytes(result) if result else None
 
     def invalidate(self, file_or_page: Any) -> None:
-        """失效文件或页面的缓存。[修复] 安全删除。"""
+        """失效文件或页面的缓存。"""
         if isinstance(file_or_page, str):
             # 失效文件的所有页
             to_remove = [k for k in self._cache
@@ -142,9 +142,9 @@ class BufferPool:
             if old_key in self._cache:
                 to_remove.append(old_key)
             for k in to_remove:
-                self._cache.pop(k, None)  # [修复] 用 pop 避免 KeyError
+                del self._cache[k]
         elif isinstance(file_or_page, PageId):
-            self._cache.pop(file_or_page, None)  # [修复] 用 pop
+            self._cache.pop(file_or_page, None)
 
     def _evict(self) -> None:
         """LRU-K(2) 淘汰：优先淘汰访问次数最少的页。"""

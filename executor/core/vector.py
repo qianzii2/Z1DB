@@ -26,14 +26,6 @@ try:
 except ImportError:
     _HAS_NANBOX = False
 
-try:
-    from metal.inline_string import InlineStringStore
-    _HAS_INLINE = True
-except ImportError:
-    _HAS_INLINE = False
-    InlineStringStore = None  # type: ignore
-
-
 # NaN-Boxing 仅用于这些类型（INT 32位安全，FLOAT/DOUBLE 原生 float64）
 # BIGINT/TIMESTAMP 不走 NaN-Boxing（值可能超过 2^53）
 _NANBOX_TYPES = frozenset({
@@ -71,24 +63,18 @@ class DataVector:
         return self._length
 
     def get(self, i: int) -> Any:
-        # NaN-Boxing 路径
+        # NaN-Boxing 路径（INT/FLOAT/DOUBLE/DATE）
         if self._packed is not None:
             bits = self._packed[i]
             if bits == NULL_TAG:
                 return None
             _, val = nan_unpack(bits)
-            # INT/DATE 列：float 值强制还原为 int
-            if val is not None and self.dtype in (DataType.INT, DataType.DATE):
-                if isinstance(val, float):
-                    return int(val)
-                return val
-            # BIGINT 也可能走 float 编码（大整数回退）
-            if val is not None and self.dtype == DataType.BIGINT:
-                if isinstance(val, float):
-                    return int(val)
-                return val
+            # INT/DATE 列：float 值还原为 int（大整数回退场景）
+            if (val is not None and isinstance(val, float)
+                    and self.dtype in (DataType.INT, DataType.DATE)):
+                return int(val)
             return val
-        # 直接路径（不变）
+        # 直接路径（BIGINT/TIMESTAMP/VARCHAR/BOOLEAN）
         if self.nulls.get_bit(i):
             return None
         if self.dtype == DataType.BOOLEAN:
@@ -159,15 +145,11 @@ class DataVector:
 
     @staticmethod
     def from_column_chunk(chunk: Any) -> 'DataVector':
-        """[修复] 支持 InlineStringStore。"""
+        """[Arena] Bitmap 使用池化分配。"""
         from storage.column_chunk import ColumnChunk
         n = chunk.row_count
-
-        # [修复] 处理 InlineStringStore
-        if _HAS_INLINE and isinstance(chunk.data, InlineStringStore):
-            data = [chunk.data.get(i) for i in range(n)]
-        elif isinstance(chunk.data, TypedVector):
-            data = chunk.data.copy()
+        if isinstance(chunk.data, TypedVector):
+            data: Any = chunk.data.copy()
         elif isinstance(chunk.data, list):
             data = list(chunk.data[:n])
         elif isinstance(chunk.data, Bitmap):
@@ -176,12 +158,11 @@ class DataVector:
             data = [chunk.get(i) for i in range(n)]
         else:
             raise ExecutionError(f"错误的 chunk 数据: {type(chunk.data)}")
-
-        nulls = Bitmap(n)
+        # [Slab] 池化 null bitmap
+        nulls = Bitmap.pooled(n)
         for i in range(n):
             if chunk.null_bitmap.get_bit(i):
                 nulls.set_bit(i)
-
         de = chunk.dict_encoded
         packed = _build_packed(chunk.dtype, data, nulls, n)
         return DataVector(dtype=chunk.dtype, data=data, nulls=nulls,
