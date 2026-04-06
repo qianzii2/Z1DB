@@ -8,7 +8,6 @@ from executor.core.vector import DataVector
 from storage.types import DataType
 from utils.errors import ExecutionError
 
-
 class AggregateFunction(ABC):
     name: str = ''
     @abstractmethod

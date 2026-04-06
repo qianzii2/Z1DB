@@ -1,24 +1,26 @@
 from __future__ import annotations
-"""Gorilla 压缩（浮点）— XOR 相邻值，只存变化位。
-修复 M16：_clz64/_ctz64 改用 metal.bitwise 避免重复。"""
+"""Gorilla 压缩 — 浮点数 XOR 编码。
+论文: Pelkonen et al., 2015 "Gorilla: A Fast, Scalable, In-Memory Time Series Database"
+XOR 相邻 float64 值，仅存储变化的位。时序数据压缩率可达 12x。"""
 import struct
-from typing import List, Tuple
+from typing import List
 from metal.bitwise import clz64, ctz64
 
 
 def gorilla_encode(values: list) -> bytes:
-    """Gorilla XOR 编码 float64 值。"""
+    """Gorilla XOR 编码 float64 值序列。"""
     if not values:
         return b''
     bits: list = []
     prev = struct.unpack('Q', struct.pack('d', float(values[0])))[0]
-    # 首个值：存储全部 64 位
+    # 首值：存全部 64 位
     for i in range(63, -1, -1):
         bits.append((prev >> i) & 1)
     for idx in range(1, len(values)):
         curr = struct.unpack('Q', struct.pack('d', float(values[idx])))[0]
         xor = prev ^ curr
         if xor == 0:
+            # 与前值相同：1 位标记
             bits.append(0)
         else:
             bits.append(1)
@@ -27,6 +29,7 @@ def gorilla_encode(values: list) -> bytes:
             sig_bits = 64 - leading - trailing
             if sig_bits <= 0:
                 sig_bits = 1
+            # 控制位 + 前导零数(6位) + 有效位数(6位) + 有效位
             bits.append(1)
             for i in range(5, -1, -1):
                 bits.append((leading >> i) & 1)
@@ -47,7 +50,7 @@ def gorilla_encode(values: list) -> bytes:
 
 
 def gorilla_decode(data: bytes) -> list:
-    """解码 Gorilla 压缩的 float64 值。"""
+    """解码 Gorilla 压缩数据。"""
     if len(data) < 4:
         return []
     count = struct.unpack('I', data[:4])[0]

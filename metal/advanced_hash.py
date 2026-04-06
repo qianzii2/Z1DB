@@ -1,5 +1,10 @@
 from __future__ import annotations
-"""高级哈希 — Zobrist 增量哈希 / CuckooHashMap / WriteCombiningBuffer。"""
+"""高级哈希结构 — Zobrist 增量哈希 / CuckooHashMap / WriteCombiningBuffer。
+
+Zobrist：更新单列时 O(1) 重算行哈希（关联子查询缓存用）。
+CuckooHashMap：int64 key → value 的 O(1) 确定性查找。
+WriteCombiningBuffer：分区写入缓冲，减少缓存行竞争（Radix JOIN 用）。
+"""
 import random
 from typing import Any, Dict, List, Optional, Tuple
 from metal.hash import z1hash64
@@ -8,17 +13,20 @@ from metal.hash import z1hash64
 # ═══ Zobrist 增量哈希 ═══
 
 class ZobristHasher:
-    """增量哈希：更新单列值时 O(1) 重算行哈希。"""
+    """增量哈希器。修改一列时 O(1) 更新行哈希（XOR 消去 + 重加）。
+    用于关联子查询缓存：外层行只改一列时无需重算整行哈希。"""
 
     def __init__(self, num_columns: int,
                  seed: int = 42) -> None:
         self._num_cols = num_columns
         self._rng = random.Random(seed)
+        # 每列一个随机盐值
         self._salt: List[int] = [
             self._rng.getrandbits(64)
             for _ in range(num_columns)]
 
     def hash_value(self, col: int, value: Any) -> int:
+        """单列值哈希。None → 0（不贡献哈希值）。"""
         if value is None:
             return 0
         return z1hash64(
@@ -26,13 +34,16 @@ class ZobristHasher:
             seed=self._salt[col])
 
     def hash_row(self, values: list) -> int:
+        """整行哈希 = 各列哈希的 XOR。"""
         h = 0
         for col, val in enumerate(values):
             h ^= self.hash_value(col, val)
         return h
 
     def update_hash(self, old_hash: int, col: int,
-                    old_value: Any, new_value: Any) -> int:
+                    old_value: Any,
+                    new_value: Any) -> int:
+        """O(1) 增量更新：XOR 消去旧值 + XOR 加入新值。"""
         return (old_hash
                 ^ self.hash_value(col, old_value)
                 ^ self.hash_value(col, new_value))
@@ -41,18 +52,26 @@ class ZobristHasher:
 # ═══ Cuckoo Hash Map ═══
 
 class CuckooHashMap:
-    """int64 key → value 的 O(1) 确定性查找哈希表。"""
+    """int64 key → value 的 O(1) 确定性查找哈希表。
+    双表 + 踢出机制：最坏查找 2 次探测。
+    与 RobinHoodHashTable 对比：
+      - Cuckoo：查找更快（确定性 O(1)），但插入可能触发级联踢出
+      - RobinHood：查找略慢（平均 O(1) 但最坏 O(log n)），插入更稳定
+    """
     MAX_KICKS = 500
 
     def __init__(self, capacity: int = 256) -> None:
         self._cap = max(16, capacity)
-        self._table1: List[Optional[Tuple[int, Any]]] = [None] * self._cap
-        self._table2: List[Optional[Tuple[int, Any]]] = [None] * self._cap
+        self._table1: List[Optional[Tuple[int, Any]]] = [
+            None] * self._cap
+        self._table2: List[Optional[Tuple[int, Any]]] = [
+            None] * self._cap
         self._size = 0
         self._seed1 = 0
         self._seed2 = 0x9E3779B97F4A7C15
 
     def get(self, key: int) -> Optional[Any]:
+        """O(1) 查找。最多 2 次探测。"""
         h1 = self._hash1(key)
         entry = self._table1[h1]
         if entry is not None and entry[0] == key:
@@ -67,14 +86,19 @@ class CuckooHashMap:
         return self.get(key) is not None
 
     def put(self, key: int, value: Any) -> None:
+        """插入。满载时自动扩容。"""
+        # 先检查是否已存在（更新值）
         h1 = self._hash1(key)
-        if self._table1[h1] is not None and self._table1[h1][0] == key:
+        if (self._table1[h1] is not None
+                and self._table1[h1][0] == key):
             self._table1[h1] = (key, value)
             return
         h2 = self._hash2(key)
-        if self._table2[h2] is not None and self._table2[h2][0] == key:
+        if (self._table2[h2] is not None
+                and self._table2[h2][0] == key):
             self._table2[h2] = (key, value)
             return
+        # 插入新 key
         entry = (key, value)
         for _ in range(self.MAX_KICKS):
             h1 = self._hash1(entry[0])
@@ -82,24 +106,29 @@ class CuckooHashMap:
                 self._table1[h1] = entry
                 self._size += 1
                 return
-            entry, self._table1[h1] = self._table1[h1], entry
+            entry, self._table1[h1] = (
+                self._table1[h1], entry)
             h2 = self._hash2(entry[0])
             if self._table2[h2] is None:
                 self._table2[h2] = entry
                 self._size += 1
                 return
-            entry, self._table2[h2] = self._table2[h2], entry
+            entry, self._table2[h2] = (
+                self._table2[h2], entry)
+        # 踢出次数耗尽 → 扩容重试
         self._rehash()
         self.put(entry[0], entry[1])
 
     def remove(self, key: int) -> bool:
         h1 = self._hash1(key)
-        if self._table1[h1] is not None and self._table1[h1][0] == key:
+        if (self._table1[h1] is not None
+                and self._table1[h1][0] == key):
             self._table1[h1] = None
             self._size -= 1
             return True
         h2 = self._hash2(key)
-        if self._table2[h2] is not None and self._table2[h2][0] == key:
+        if (self._table2[h2] is not None
+                and self._table2[h2][0] == key):
             self._table2[h2] = None
             self._size -= 1
             return True
@@ -120,6 +149,7 @@ class CuckooHashMap:
             seed=self._seed2) % self._cap
 
     def _rehash(self) -> None:
+        """扩容并重新哈希。"""
         old1, old2 = self._table1, self._table2
         self._cap *= 2
         self._table1 = [None] * self._cap
@@ -138,30 +168,37 @@ class CuckooHashMap:
 # ═══ WriteCombiningBuffer ═══
 
 class WriteCombiningBuffer:
-    """分区写入缓冲，减少缓存行竞争。用于 Radix JOIN 分区阶段。"""
+    """分区写入缓冲。积累到 BUFFER_SIZE 后一次性刷出。
+    减少缓存行竞争，用于 Radix JOIN 的分区阶段。"""
     BUFFER_SIZE = 8
 
     def __init__(self, num_partitions: int) -> None:
         self._num_parts = num_partitions
-        self._buffers: List[List[Any]] = [[] for _ in range(num_partitions)]
-        self._outputs: List[List[Any]] = [[] for _ in range(num_partitions)]
+        self._buffers: List[List[Any]] = [
+            [] for _ in range(num_partitions)]
+        self._outputs: List[List[Any]] = [
+            [] for _ in range(num_partitions)]
 
     def write(self, partition: int, value: Any) -> None:
+        """写入缓冲。满 BUFFER_SIZE 时自动刷出。"""
         buf = self._buffers[partition]
         buf.append(value)
         if len(buf) >= self.BUFFER_SIZE:
             self._flush(partition)
 
     def _flush(self, partition: int) -> None:
-        self._outputs[partition].extend(self._buffers[partition])
+        self._outputs[partition].extend(
+            self._buffers[partition])
         self._buffers[partition] = []
 
     def flush_all(self) -> None:
+        """刷出所有分区的缓冲。"""
         for i in range(self._num_parts):
             if self._buffers[i]:
                 self._flush(i)
 
     def get_partition(self, partition: int) -> List[Any]:
+        """获取指定分区的全部数据。自动先刷出。"""
         self.flush_all()
         return self._outputs[partition]
 

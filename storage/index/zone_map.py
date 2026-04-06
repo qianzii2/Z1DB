@@ -1,30 +1,32 @@
 from __future__ import annotations
-"""Zone Map — chunk-level min/max/null_count for predicate pruning.
-Skips 80-95% of chunks for selective predicates."""
+"""ZoneMap — chunk 级 min/max/null_count，用于谓词裁剪。
+对选择性谓词可跳过 80-95% 的 chunk。"""
 from typing import Any, List, Optional
 from enum import Enum
 
 
 class PruneResult(Enum):
-    ALWAYS_TRUE = 'ALWAYS_TRUE'    # All rows satisfy
-    ALWAYS_FALSE = 'ALWAYS_FALSE'  # No rows satisfy → skip chunk
-    MAYBE = 'MAYBE'                # Need to scan
+    """裁剪结果。"""
+    ALWAYS_TRUE = 'ALWAYS_TRUE'    # 所有行满足 → 不需过滤
+    ALWAYS_FALSE = 'ALWAYS_FALSE'  # 无行满足 → 跳过整个 chunk
+    MAYBE = 'MAYBE'                # 需要逐行扫描
 
 
 class ZoneMap:
-    """Per-chunk zone map with min/max/null_count."""
+    """单个 chunk 的 ZoneMap。"""
 
     __slots__ = ('min_val', 'max_val', 'null_count', 'row_count')
 
-    def __init__(self, min_val: Any = None, max_val: Any = None,
-                 null_count: int = 0, row_count: int = 0) -> None:
+    def __init__(self, min_val: Any = None,
+                 max_val: Any = None,
+                 null_count: int = 0,
+                 row_count: int = 0) -> None:
         self.min_val = min_val
         self.max_val = max_val
         self.null_count = null_count
         self.row_count = row_count
 
     def check_gt(self, value: Any) -> PruneResult:
-        """Check: column > value."""
         if self.min_val is None:
             return PruneResult.MAYBE
         try:
@@ -107,19 +109,15 @@ class ZoneMap:
         return PruneResult.MAYBE
 
     def check(self, op: str, value: Any) -> PruneResult:
-        """Unified check interface."""
-        if op == '>':
-            return self.check_gt(value)
-        if op == '>=':
-            return self.check_gte(value)
-        if op == '<':
-            return self.check_lt(value)
-        if op == '<=':
-            return self.check_lte(value)
-        if op == '=':
-            return self.check_eq(value)
-        if op == '!=':
-            return self.check_ne(value)
+        """统一检查接口。"""
+        dispatch = {
+            '>': self.check_gt, '>=': self.check_gte,
+            '<': self.check_lt, '<=': self.check_lte,
+            '=': self.check_eq, '!=': self.check_ne,
+        }
+        fn = dispatch.get(op)
+        if fn:
+            return fn(value)
         if op == 'IS_NULL':
             return self.check_is_null()
         if op == 'IS_NOT_NULL':
@@ -127,10 +125,9 @@ class ZoneMap:
         return PruneResult.MAYBE
 
     @staticmethod
-    def from_values(values: list) -> ZoneMap:
-        """Build zone map from a list of values."""
-        min_v = None
-        max_v = None
+    def from_values(values: list) -> 'ZoneMap':
+        """从值列表构建 ZoneMap。"""
+        min_v = max_v = None
         null_count = 0
         for v in values:
             if v is None:
@@ -144,14 +141,12 @@ class ZoneMap:
             except TypeError:
                 pass
         return ZoneMap(min_val=min_v, max_val=max_v,
-                       null_count=null_count, row_count=len(values))
+                       null_count=null_count,
+                       row_count=len(values))
 
 
-def prune_chunks(zone_maps: List[ZoneMap], op: str, value: Any) -> List[int]:
-    """Return indices of chunks that MIGHT contain matching rows.
-    Chunks with ALWAYS_FALSE result are skipped entirely."""
-    result = []
-    for i, zm in enumerate(zone_maps):
-        if zm.check(op, value) != PruneResult.ALWAYS_FALSE:
-            result.append(i)
-    return result
+def prune_chunks(zone_maps: List[ZoneMap], op: str,
+                 value: Any) -> List[int]:
+    """返回可能包含匹配行的 chunk 索引。ALWAYS_FALSE 的 chunk 被跳过。"""
+    return [i for i, zm in enumerate(zone_maps)
+            if zm.check(op, value) != PruneResult.ALWAYS_FALSE]

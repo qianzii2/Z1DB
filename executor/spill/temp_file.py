@@ -79,3 +79,64 @@ class TempFile:
             self.close()
         except Exception:
             pass
+
+class BinaryTempFile:
+    """二进制追加写入临时文件。比 JSON 快 5-10x。
+    格式：每行 = [row_len:4B][pickled_row]"""
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._count = 0
+        self._fh = open(path, 'wb')
+        self._closed = False
+
+    def write_row(self, row: list) -> None:
+        import pickle
+        data = pickle.dumps(row, protocol=4)
+        self._fh.write(len(data).to_bytes(4, 'little'))
+        self._fh.write(data)
+        self._count += 1
+
+    def write_rows(self, rows) -> None:
+        for row in rows:
+            self.write_row(row)
+
+    def flush(self) -> None:
+        if not self._closed:
+            self._fh.flush()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._fh.close()
+            self._closed = True
+
+    def read_all(self) -> list:
+        self.close()
+        import pickle
+        rows = []
+        try:
+            with open(self._path, 'rb') as f:
+                while True:
+                    len_bytes = f.read(4)
+                    if len(len_bytes) < 4:
+                        break
+                    data_len = int.from_bytes(len_bytes, 'little')
+                    data = f.read(data_len)
+                    if len(data) < data_len:
+                        break
+                    rows.append(pickle.loads(data))
+        except FileNotFoundError:
+            pass
+        return rows
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def delete(self) -> None:
+        self.close()
+        import os
+        try:
+            os.unlink(self._path)
+        except OSError:
+            pass

@@ -156,19 +156,8 @@ class RadixJoinOperator(Operator):
         return z1hash64(str(val).encode('utf-8'))
 
     def _eval_cond(self, combined, schema):
-        cols = {}
-        for cn, ct in schema:
-            val = combined.get(cn)
-            cols[cn] = DataVector.from_scalar(
-                val, ct if val is not None else DataType.INT)
-        batch = VectorBatch(
-            columns=cols,
-            _column_order=[n for n, _ in schema],
-            _row_count=1)
-        try:
-            return self._evaluator.evaluate_predicate(
-                self._on_expr, batch).get_bit(0)
-        except Exception: return False
+        from executor.operators.join.join_utils import eval_join_condition
+        return eval_join_condition(combined, schema, self._on_expr)
 
     def next_batch(self):
         if self._emitted: return None

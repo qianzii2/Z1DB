@@ -1,12 +1,14 @@
 from __future__ import annotations
 """LSM Compaction — 合并多个 SSTable 为一个。
-[FIX-S03] 先写新 SSTable + 更新 MANIFEST，再删旧文件。"""
-import os
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+N 路归并，同 key 取最新版本，tombstone 被丢弃。
+先写新 SSTable，由调用方更新 MANIFEST 后再删旧文件。"""
+from typing import Any, Iterator, List, Optional, Tuple
 from storage.lsm.sstable import SSTableWriter, SSTableReader
 
 
 class Compactor:
+    """SSTable 合并器。"""
+
     def __init__(self, data_dir: str) -> None:
         self._data_dir = data_dir
 
@@ -14,11 +16,11 @@ class Compactor:
                 output_path: str,
                 columns: List[str]) -> SSTableReader:
         """合并 N 个 SSTable 为 1 个。
-        [FIX-S03] 返回新 SSTable，调用方负责更新 MANIFEST 后再删旧文件。"""
+        返回新 SSTable，调用方负责更新 MANIFEST 后删旧文件。"""
         writer = SSTableWriter(output_path, columns)
 
         # N 路归并
-        iters: List[Iterator] = [st.scan() for st in sstables]
+        iters = [st.scan() for st in sstables]
         heads: List[Optional[Tuple[Any, Any]]] = []
         for it in iters:
             try:
@@ -47,7 +49,7 @@ class Compactor:
             if min_idx == -1:
                 break
 
-            # 同 key 取最后一个版本（后面的 SSTable 更新）
+            # 同 key 取最后一个版本
             final_row = None
             for i, head in enumerate(heads):
                 if head is None:
@@ -64,7 +66,4 @@ class Compactor:
                 writer.add(min_key, final_row)
 
         writer.finish()
-
-        # [FIX-S03] 不在此处删除旧文件！
-        # 调用方应在更新 MANIFEST 后再删除
         return SSTableReader(output_path)

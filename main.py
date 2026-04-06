@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Z1DB entry point. Supports REPL and TCP server modes."""
+"""Z1DB 入口。支持 REPL 和 TCP 服务器模式。"""
 import sys
 from engine import Engine
 
@@ -15,7 +15,8 @@ def main() -> None:
     while i < len(args):
         if args[i] == '--server':
             server_mode = True
-            if i + 1 < len(args) and not args[i + 1].startswith('-'):
+            if (i + 1 < len(args)
+                    and not args[i + 1].startswith('-')):
                 addr = args[i + 1]
                 if ':' in addr:
                     host, port_str = addr.rsplit(':', 1)

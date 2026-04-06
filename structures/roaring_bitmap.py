@@ -1,13 +1,15 @@
 from __future__ import annotations
-"""Roaring Bitmap — compressed bitmap. Paper: Chambi et al., 2016.
-Sparse regions: sorted uint16 arrays. Dense regions: 8KB bitmaps.
-AND/OR 10-100x faster than bytearray for large sparse sets."""
+"""Roaring Bitmap — 自适应压缩位图。
+论文: Chambi et al., 2016
+稀疏区域用 uint16 有序数组，稠密区域用 8KB 位图。
+AND/OR 操作比 bytearray 快 10-100x（大稀疏集合）。
+容器切换阈值：4096 个元素。"""
 import bisect
 from typing import List, Optional
 
 
 class _ArrayContainer:
-    """Sparse container — sorted uint16 array. Used when cardinality < 4096."""
+    """稀疏容器 — uint16 有序数组。基数 < 4096 时使用。"""
     __slots__ = ('_data',)
 
     def __init__(self) -> None:
@@ -37,7 +39,7 @@ class _ArrayContainer:
     def to_list(self) -> list[int]:
         return list(self._data)
 
-    def and_op(self, other: _ArrayContainer) -> _ArrayContainer:
+    def and_op(self, other: '_ArrayContainer') -> '_ArrayContainer':
         r = _ArrayContainer()
         i = j = 0
         while i < len(self._data) and j < len(other._data):
@@ -49,7 +51,7 @@ class _ArrayContainer:
                 j += 1
         return r
 
-    def or_op(self, other: _ArrayContainer) -> _ArrayContainer:
+    def or_op(self, other: '_ArrayContainer') -> '_ArrayContainer':
         r = _ArrayContainer()
         i = j = 0
         while i < len(self._data) and j < len(other._data):
@@ -64,15 +66,16 @@ class _ArrayContainer:
         return r
 
     def should_convert(self) -> bool:
+        """基数 >= 4096 时应切换为位图容器。"""
         return len(self._data) >= 4096
 
 
 class _BitmapContainer:
-    """Dense container — 8KB bitmap for 65536 bits."""
+    """稠密容器 — 8KB 位图（65536 位）。"""
     __slots__ = ('_bits',)
 
     def __init__(self) -> None:
-        self._bits = bytearray(8192)  # 65536 bits
+        self._bits = bytearray(8192)
 
     def add(self, value: int) -> None:
         self._bits[value >> 3] |= (1 << (value & 7))
@@ -101,19 +104,20 @@ class _BitmapContainer:
                         result.append(base + bit)
         return result
 
-    def and_op(self, other: _BitmapContainer) -> _BitmapContainer:
+    def and_op(self, other: '_BitmapContainer') -> '_BitmapContainer':
         r = _BitmapContainer()
         for i in range(8192):
             r._bits[i] = self._bits[i] & other._bits[i]
         return r
 
-    def or_op(self, other: _BitmapContainer) -> _BitmapContainer:
+    def or_op(self, other: '_BitmapContainer') -> '_BitmapContainer':
         r = _BitmapContainer()
         for i in range(8192):
             r._bits[i] = self._bits[i] | other._bits[i]
         return r
 
     def should_convert(self) -> bool:
+        """基数 < 4096 时应切回数组容器。"""
         return self.cardinality < 4096
 
 
@@ -133,14 +137,14 @@ def _to_array(bc: _BitmapContainer) -> _ArrayContainer:
     return ac
 
 
-def _op_containers(a: _Container, b: _Container, op: str) -> _Container:
-    """Combine two containers, auto-converting types as needed."""
+def _op_containers(a: _Container, b: _Container,
+                   op: str) -> _Container:
+    """组合两个容器，自动转换类型。"""
     if isinstance(a, _ArrayContainer) and isinstance(b, _ArrayContainer):
         r = a.and_op(b) if op == 'AND' else a.or_op(b)
         if r.should_convert():
             return _to_bitmap(r)
         return r
-    # Convert to bitmap for operation
     ba = a if isinstance(a, _BitmapContainer) else _to_bitmap(a)
     bb = b if isinstance(b, _BitmapContainer) else _to_bitmap(b)
     r = ba.and_op(bb) if op == 'AND' else ba.or_op(bb)
@@ -150,7 +154,8 @@ def _op_containers(a: _Container, b: _Container, op: str) -> _Container:
 
 
 class RoaringBitmap:
-    """Roaring Bitmap — adaptive compressed bitmap."""
+    """Roaring Bitmap — 自适应压缩位图。
+    按高 16 位分区，每个分区用 Array 或 Bitmap 容器。"""
 
     __slots__ = ('_containers',)
 
@@ -186,7 +191,7 @@ class RoaringBitmap:
         return self._containers[high].contains(value & 0xFFFF)
 
     def add_range(self, start: int, end: int) -> None:
-        """Add all values in [start, end)."""
+        """添加 [start, end) 范围所有值。"""
         for v in range(start, end):
             self.add(v)
 
@@ -197,25 +202,28 @@ class RoaringBitmap:
         result = []
         for high in sorted(self._containers.keys()):
             base = high << 16
-            result.extend(base + v for v in self._containers[high].to_list())
+            result.extend(
+                base + v for v in self._containers[high].to_list())
         return result
 
-    def and_op(self, other: RoaringBitmap) -> RoaringBitmap:
+    def and_op(self, other: 'RoaringBitmap') -> 'RoaringBitmap':
         r = RoaringBitmap()
         for high in self._containers:
             if high in other._containers:
-                c = _op_containers(self._containers[high],
-                                   other._containers[high], 'AND')
+                c = _op_containers(
+                    self._containers[high],
+                    other._containers[high], 'AND')
                 if c.cardinality > 0:
                     r._containers[high] = c
         return r
 
-    def or_op(self, other: RoaringBitmap) -> RoaringBitmap:
+    def or_op(self, other: 'RoaringBitmap') -> 'RoaringBitmap':
         r = RoaringBitmap()
         for high in self._containers:
             if high in other._containers:
                 r._containers[high] = _op_containers(
-                    self._containers[high], other._containers[high], 'OR')
+                    self._containers[high],
+                    other._containers[high], 'OR')
             else:
                 r._containers[high] = self._containers[high]
         for high in other._containers:
@@ -223,8 +231,8 @@ class RoaringBitmap:
                 r._containers[high] = other._containers[high]
         return r
 
-    def not_op(self, universe: int) -> RoaringBitmap:
-        """Complement within [0, universe)."""
+    def not_op(self, universe: int) -> 'RoaringBitmap':
+        """取补集（相对于 [0, universe)）。"""
         r = RoaringBitmap()
         for v in range(universe):
             if not self.contains(v):

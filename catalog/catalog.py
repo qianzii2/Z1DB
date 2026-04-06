@@ -1,6 +1,8 @@
 from __future__ import annotations
 """系统目录 — Schema 注册 + 存储管理 + 索引管理。
-持久化模式使用 LSM-Tree，内存模式使用 TableStore。"""
+持久化模式使用 LSM-Tree，内存模式使用 TableStore。
+[B01] 修复重复的 alter_drop_column。
+[B02] 实现缺失的 alter_add_column。"""
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -24,6 +26,7 @@ except ImportError:
 
 @dataclass
 class ColumnSchema:
+    """列定义。"""
     name: str
     dtype: DataType
     nullable: bool = True
@@ -33,6 +36,7 @@ class ColumnSchema:
 
 @dataclass
 class TableSchema:
+    """表定义。"""
     name: str
     columns: List[ColumnSchema] = field(default_factory=list)
 
@@ -49,9 +53,11 @@ class TableSchema:
 
 
 class Catalog:
+    """系统目录。管理所有表的 schema 和存储引擎。"""
+
     def __init__(self, data_dir: str = ':memory:') -> None:
         self._schemas: dict[str, TableSchema] = {}
-        self._stores: dict[str, object] = {}  # TableStore 或 LSMStore
+        self._stores: dict[str, object] = {}
         self.data_dir = data_dir
         self._index_manager: Optional[IndexManager] = (
             IndexManager() if _HAS_INDEX else None)
@@ -79,6 +85,8 @@ class Catalog:
     def table_exists(self, table: str) -> bool:
         return table in self._schemas
 
+    # ═══ DDL ═══
+
     def create_table(self, schema: TableSchema,
                      if_not_exists: bool = False) -> None:
         if schema.name in self._schemas:
@@ -87,13 +95,11 @@ class Catalog:
             raise DuplicateError(
                 f"table '{schema.name}' already exists")
         self._schemas[schema.name] = schema
-        # 持久化模式用 LSM，内存模式用 TableStore
         if self.use_lsm:
             self._stores[schema.name] = LSMStore(
                 schema, self.data_dir)
         else:
             self._stores[schema.name] = TableStore(schema)
-        # 持久化 schema
         if self.is_persistent:
             self._save_schema()
 
@@ -103,7 +109,6 @@ class Catalog:
             if if_exists:
                 return
             raise TableNotFoundError(name)
-        # 关闭 LSMStore
         store = self._stores.get(name)
         if isinstance(store, LSMStore):
             store.close()
@@ -113,14 +118,13 @@ class Catalog:
             self._index_manager.invalidate_table(name)
         if self.is_persistent:
             self._save_schema()
-            # 清理 LSM 数据目录
             import shutil
             lsm_dir = Path(self.data_dir) / f'lsm_{name}'
             if lsm_dir.exists():
                 shutil.rmtree(lsm_dir, ignore_errors=True)
-            # 清理旧格式文件
             from catalog import persist
-            persist.remove_table_data(name, Path(self.data_dir))
+            persist.remove_table_data(
+                name, Path(self.data_dir))
 
     def get_table(self, name: str) -> TableSchema:
         if name not in self._schemas:
@@ -128,7 +132,6 @@ class Catalog:
         return self._schemas[name]
 
     def get_store(self, name: str) -> object:
-        """返回 TableStore 或 LSMStore。"""
         if name not in self._stores:
             raise TableNotFoundError(name)
         return self._stores[name]
@@ -136,18 +139,25 @@ class Catalog:
     def list_tables(self) -> list[str]:
         return list(self._schemas.keys())
 
+    # ═══ ALTER TABLE [B01][B02] ═══
+
     def alter_add_column(self, table: str,
-                         col: ColumnSchema) -> None:
+                         col_schema: ColumnSchema) -> None:
+        """[B02] 添加列。新列所有现有行填充 NULL。"""
         if table not in self._schemas:
             raise TableNotFoundError(table)
         schema = self._schemas[table]
-        if any(c.name == col.name for c in schema.columns):
+        if any(c.name == col_schema.name
+               for c in schema.columns):
             raise DuplicateError(
-                f"column '{col.name}' already exists")
+                f"column '{col_schema.name}' already exists")
         store = self._stores[table]
+        # LSMStore：先 flush
+        if self.use_lsm and hasattr(store, 'flush'):
+            store.flush()
         all_rows = store.read_all_rows()
-        schema.columns.append(col)
-        # 重建存储
+        schema.columns.append(col_schema)
+        # 重建存储，每行末尾追加 NULL
         self._rebuild_store(table, schema, all_rows,
                             add_column=True)
         if self.is_persistent:
@@ -155,23 +165,29 @@ class Catalog:
 
     def alter_drop_column(self, table: str,
                           col_name: str) -> None:
+        """[B01] 删除列。仅保留一个实现。"""
         if table not in self._schemas:
             raise TableNotFoundError(table)
         schema = self._schemas[table]
         idx = None
         for i, c in enumerate(schema.columns):
             if c.name == col_name:
-                idx = i; break
+                idx = i
+                break
         if idx is None:
             raise ColumnNotFoundError(col_name)
         if len(schema.columns) <= 1:
             raise ExecutionError(
                 "cannot drop the only column")
         store = self._stores[table]
+        # LSMStore：先 flush
+        if self.use_lsm and hasattr(store, 'flush'):
+            store.flush()
         all_rows = store.read_all_rows()
         schema.columns.pop(idx)
         for row in all_rows:
-            row.pop(idx)
+            if idx < len(row):
+                row.pop(idx)
         self._rebuild_store(table, schema, all_rows)
         if self.is_persistent:
             self._save_schema()
@@ -192,12 +208,14 @@ class Catalog:
         all_rows = store.read_all_rows()
         for c in schema.columns:
             if c.name == old_name:
-                c.name = new_name; break
+                c.name = new_name
+                break
         self._rebuild_store(table, schema, all_rows)
         if self.is_persistent:
             self._save_schema()
 
-    def _rebuild_store(self, table: str, schema: TableSchema,
+    def _rebuild_store(self, table: str,
+                       schema: TableSchema,
                        rows: List[list],
                        add_column: bool = False) -> None:
         """重建存储（ALTER 后调用）。"""
@@ -205,7 +223,6 @@ class Catalog:
         if isinstance(old_store, LSMStore):
             old_store.close()
         if self.use_lsm:
-            # 清理旧 LSM 目录
             import shutil
             lsm_dir = Path(self.data_dir) / f'lsm_{table}'
             if lsm_dir.exists():
@@ -218,9 +235,10 @@ class Catalog:
             if add_column:
                 row.append(None)
             new_store.append_row(row)
-        # LSM 刷盘
         if isinstance(new_store, LSMStore):
             new_store.flush()
+
+    # ═══ 持久化 ═══
 
     def persist(self) -> None:
         """持久化。LSM 模式只存 schema，数据已在 SSTable 中。"""
@@ -228,12 +246,10 @@ class Catalog:
             return
         self._save_schema()
         if self.use_lsm:
-            # LSM：强制刷盘所有表的 MemTable
             for name, store in self._stores.items():
                 if isinstance(store, LSMStore):
                     store.flush()
         else:
-            # 旧模式：TableStore 数据也要存
             from catalog import persist as _persist
             _persist.save_data(
                 self._stores, Path(self.data_dir))
@@ -242,35 +258,27 @@ class Catalog:
         self.persist()
 
     def _save_schema(self) -> None:
-        """只保存 schema 到 catalog.json。"""
         from catalog import persist as _persist
         _persist.save(
             self._schemas,
             Path(self.data_dir) / 'catalog.json')
 
     def _load(self) -> None:
-        """加载。schema 从 JSON，数据从 LSM 或旧格式。"""
         path = Path(self.data_dir) / 'catalog.json'
         if not path.exists():
             return
         from catalog import persist as _persist
         self._schemas = _persist.load(path)
-
         for name, schema in self._schemas.items():
             lsm_dir = Path(self.data_dir) / f'lsm_{name}'
             if self.use_lsm and lsm_dir.exists():
-                # LSM 模式：从 SSTable 恢复
                 self._stores[name] = LSMStore(
                     schema, self.data_dir)
             elif self.use_lsm:
-                # LSM 可用但无旧数据：创建空 LSM
-                # 检查是否有旧格式数据需要迁移
                 old_store = TableStore(schema)
                 _persist.load_data(
-                    {name: old_store},
-                    Path(self.data_dir))
+                    {name: old_store}, Path(self.data_dir))
                 if old_store.row_count > 0:
-                    # 迁移旧数据到 LSM
                     lsm = LSMStore(schema, self.data_dir)
                     for row in old_store.read_all_rows():
                         lsm.append_row(row)
@@ -280,7 +288,6 @@ class Catalog:
                     self._stores[name] = LSMStore(
                         schema, self.data_dir)
             else:
-                # 无 LSM：用 TableStore + 旧格式加载
                 self._stores[name] = TableStore(schema)
                 _persist.load_data(
                     {name: self._stores[name]},

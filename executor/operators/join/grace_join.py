@@ -61,42 +61,44 @@ class GraceHashJoinOperator(Operator):
         self._cleanup(); self._emitted = False
 
     def _partition_to_disk(self, op, prefix, key_name):
-        files = []; handles = []
+        """[P08] 二进制分区写入。"""
+        from executor.spill.temp_file import BinaryTempFile
+        files = []
+        handles = []
         try:
             for p in range(self.NUM_PARTITIONS):
                 path = os.path.join(
-                    self._temp_dir, f'{prefix}_{p}.json')
+                    self._temp_dir, f'{prefix}_{p}.bin')
                 files.append(path)
-                handles.append(open(path, 'w'))
+                handles.append(BinaryTempFile(path))
             while True:
                 batch = op.next_batch()
-                if batch is None: break
+                if batch is None:
+                    break
                 batch = _ensure(batch)
                 col_names = batch.column_names
                 for i in range(batch.row_count):
                     row = {n: batch.columns[n].get(i)
                            for n in col_names}
-                    val = (row.get(key_name)
-                           if key_name else None)
+                    val = row.get(key_name) if key_name else None
                     h = z1hash64(
                         str(val).encode('utf-8')
                     ) % self.NUM_PARTITIONS
-                    handles[h].write(
-                        json.dumps(row, default=str) + '\n')
+                    handles[h].write_row(row)
         finally:
-            for fh in handles: fh.close()
+            for fh in handles:
+                fh.close()
         self._temp_files.extend(files)
         return files
 
     def _read_partition(self, path):
-        rows = []
-        try:
-            with open(path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line: rows.append(json.loads(line))
-        except FileNotFoundError: pass
-        return rows
+        """[P08] 二进制分区读取。"""
+        from executor.spill.temp_file import BinaryTempFile
+        btf = BinaryTempFile.__new__(BinaryTempFile)
+        btf._path = path
+        btf._closed = True
+        btf._count = 0
+        return btf.read_all()
 
     def _join_partition(self, l_rows, r_rows, schema):
         if (not r_rows
@@ -137,19 +139,8 @@ class GraceHashJoinOperator(Operator):
                          for n in self._out_names])
 
     def _eval_cond(self, combined, schema):
-        cols = {}
-        for cn, ct in schema:
-            val = combined.get(cn)
-            cols[cn] = DataVector.from_scalar(
-                val, ct if val is not None else DataType.INT)
-        batch = VectorBatch(
-            columns=cols,
-            _column_order=[n for n, _ in schema],
-            _row_count=1)
-        try:
-            return self._evaluator.evaluate_predicate(
-                self._on_expr, batch).get_bit(0)
-        except Exception: return False
+        from executor.operators.join.join_utils import eval_join_condition
+        return eval_join_condition(combined, schema, self._on_expr)
 
     def _cleanup(self):
         for path in self._temp_files:

@@ -1,16 +1,14 @@
 from __future__ import annotations
-"""Minimal TCP server for Z1DB. Single-threaded event loop."""
+"""TCP 服务器。[M04] 每连接独立事务上下文。"""
 import json
 import selectors
 import socket
-import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 
 class Z1TCPServer:
-    """Simple TCP server using selectors for async I/O."""
-
-    def __init__(self, engine: Any, host: str = '0.0.0.0', port: int = 5433) -> None:
+    def __init__(self, engine: Any, host: str = '0.0.0.0',
+                 port: int = 5433) -> None:
         self._engine = engine
         self._host = host
         self._port = port
@@ -25,7 +23,7 @@ class Z1TCPServer:
         sock.setblocking(False)
         self._sel.register(sock, selectors.EVENT_READ, data=None)
         self._running = True
-        print(f"Z1DB TCP server listening on {self._host}:{self._port}")
+        print(f"Z1DB TCP 服务器监听 {self._host}:{self._port}")
         try:
             while self._running:
                 events = self._sel.select(timeout=1.0)
@@ -35,7 +33,7 @@ class Z1TCPServer:
                     else:
                         self._handle(key, mask)
         except KeyboardInterrupt:
-            print("\nServer shutting down.")
+            print("\n服务器关闭。")
         finally:
             self._sel.close()
             sock.close()
@@ -43,19 +41,23 @@ class Z1TCPServer:
     def stop(self) -> None:
         self._running = False
 
-    def _accept(self, sock: socket.socket) -> None:
+    def _accept(self, sock) -> None:
         conn, addr = sock.accept()
         conn.setblocking(False)
+        # [M04] 每连接独立会话
         session = _Session(conn, addr, self._engine)
-        self._sel.register(conn, selectors.EVENT_READ | selectors.EVENT_WRITE, data=session)
+        self._sel.register(
+            conn,
+            selectors.EVENT_READ | selectors.EVENT_WRITE,
+            data=session)
 
-    def _handle(self, key: selectors.SelectorKey, mask: int) -> None:
-        session: _Session = key.data
+    def _handle(self, key, mask) -> None:
+        session = key.data
         try:
             if mask & selectors.EVENT_READ:
                 data = session.conn.recv(65536)
                 if not data:
-                    self._close(key)
+                    self._close_session(key)
                     return
                 session.buffer += data
                 self._process(session)
@@ -64,45 +66,80 @@ class Z1TCPServer:
                     sent = session.conn.send(session.outgoing)
                     session.outgoing = session.outgoing[sent:]
         except (ConnectionResetError, BrokenPipeError, OSError):
-            self._close(key)
+            self._close_session(key)
 
-    def _process(self, session: _Session) -> None:
+    def _process(self, session) -> None:
         while b'\n' in session.buffer:
             line, session.buffer = session.buffer.split(b'\n', 1)
             sql = line.decode('utf-8', errors='replace').strip()
             if not sql:
                 continue
             try:
-                result = session.engine.execute(sql)
-                response = {
-                    'status': 'ok',
-                    'columns': result.columns,
-                    'column_types': [dt.name for dt in result.column_types] if result.column_types else [],
-                    'rows': result.rows,
-                    'row_count': result.row_count,
-                    'affected_rows': result.affected_rows,
-                    'message': result.message,
-                    'timing': result.timing,
-                }
+                # [M04] 会话级事务命令隔离
+                upper = sql.strip().rstrip(';').strip().upper()
+                if upper == 'BEGIN' and session.in_txn:
+                    response = {'status': 'error',
+                                'message': '会话已有活跃事务'}
+                elif upper == 'BEGIN':
+                    session.in_txn = True
+                    result = session.engine.execute(sql)
+                    session.txn_sql_count = 0
+                    response = self._result_to_dict(result)
+                elif upper in ('COMMIT', 'ROLLBACK'):
+                    result = session.engine.execute(sql)
+                    session.in_txn = False
+                    session.txn_sql_count = 0
+                    response = self._result_to_dict(result)
+                else:
+                    if session.in_txn:
+                        session.txn_sql_count += 1
+                    result = session.engine.execute(sql)
+                    response = self._result_to_dict(result)
             except Exception as e:
                 response = {
                     'status': 'error',
                     'message': str(e),
                 }
-            resp_bytes = json.dumps(response, default=str).encode('utf-8') + b'\n'
+            resp_bytes = (json.dumps(response, default=str)
+                          .encode('utf-8') + b'\n')
             session.outgoing += resp_bytes
 
-    def _close(self, key: selectors.SelectorKey) -> None:
+    @staticmethod
+    def _result_to_dict(result) -> dict:
+        return {
+            'status': 'ok',
+            'columns': result.columns,
+            'column_types': ([dt.name for dt in result.column_types]
+                             if result.column_types else []),
+            'rows': result.rows,
+            'row_count': result.row_count,
+            'affected_rows': result.affected_rows,
+            'message': result.message,
+            'timing': result.timing,
+        }
+
+    def _close_session(self, key) -> None:
+        """[M04] 关闭会话时如果有未提交事务，自动回滚。"""
+        session = key.data
+        if session.in_txn:
+            try:
+                session.engine.execute('ROLLBACK;')
+            except Exception:
+                pass
         self._sel.unregister(key.fileobj)
         key.fileobj.close()
 
 
 class _Session:
-    __slots__ = ('conn', 'addr', 'engine', 'buffer', 'outgoing')
+    """[M04] 每连接会话状态。"""
+    __slots__ = ('conn', 'addr', 'engine', 'buffer',
+                 'outgoing', 'in_txn', 'txn_sql_count')
 
-    def __init__(self, conn: socket.socket, addr: tuple, engine: Any) -> None:
+    def __init__(self, conn, addr, engine) -> None:
         self.conn = conn
         self.addr = addr
         self.engine = engine
         self.buffer = b''
         self.outgoing = b''
+        self.in_txn = False       # [M04] 会话事务状态
+        self.txn_sql_count = 0    # 当前事务中的语句数

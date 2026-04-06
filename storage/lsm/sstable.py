@@ -7,7 +7,8 @@ from __future__ import annotations
   [BloomSection] bloom_bytes
   [Footer 24B] data_end(8) + sparse_offset(8) + bloom_offset(8)
 
-对比 JSON 行格式: 2-5x 更小，10-50x 更快解码。"""
+对比 JSON 行格式: 2-5x 更小，10-50x 更快解码。
+旧版 JSON 格式兼容路径保留，标注"未来版本移除"。"""
 import json
 import os
 import struct

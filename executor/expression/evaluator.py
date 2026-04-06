@@ -188,6 +188,20 @@ class ExpressionEvaluator(EvalHelpers):
 
     def _eval_arith(self, op, left, right):
         """nanbox_batch 批量算术：+, -, * 都走批量路径。"""
+
+        if op in ('+', '-'):
+            if self._is_temporal_arith(left, right):
+                result = self._eval_temporal_arith(
+                    op, left, right, len(left))
+                if result is not None:
+                    return result
+            # 如果 _is_temporal_arith 返回 True 但 _eval_temporal_arith
+            # 返回 None（如 int - date），跳过 promote 直接报错
+            from storage.types import is_temporal
+            if (is_temporal(left.dtype) or is_temporal(right.dtype)):
+                raise ExecutionError(
+                    f"不支持的时间算术: {left.dtype.name} {op} {right.dtype.name}")
+
         target = promote(left.dtype, right.dtype)
         lv = cast_vector(left, target)
         rv = cast_vector(right, target)
@@ -235,6 +249,9 @@ class ExpressionEvaluator(EvalHelpers):
                 nd._array = ra
                 return DataVector(dtype=target, data=nd,
                                   nulls=Bitmap(n), _length=n)
+
+        if op in ('+', '-') and self._is_temporal_arith(lv, rv):
+            return self._eval_temporal_arith(op, lv, rv, n)
 
         # 通用逐行路径
         ops = {'+': _op.add, '-': _op.sub, '*': _op.mul}
@@ -572,6 +589,50 @@ class ExpressionEvaluator(EvalHelpers):
         if cls._FUNC_DISPATCH is not None: return cls._FUNC_DISPATCH
         cls._FUNC_DISPATCH = build_dispatch()
         return cls._FUNC_DISPATCH
+
+    @staticmethod
+    def _is_temporal_arith(lv, rv):
+        """检查是否为时间算术（date±int 或 timestamp±int）。"""
+        from storage.types import is_temporal, is_numeric
+        if is_temporal(lv.dtype) and is_numeric(rv.dtype):
+            return True
+        if is_numeric(lv.dtype) and is_temporal(rv.dtype):
+            return True
+        return False
+
+    def _eval_temporal_arith(self, op, lv, rv, n):
+        """[M07] DATE ± 天数 = DATE，TIMESTAMP ± 微秒数 = TIMESTAMP。"""
+        from storage.types import is_temporal, DataType
+        from metal.bitmap import Bitmap
+        from metal.typed_vector import TypedVector
+        from storage.types import DTYPE_TO_ARRAY_CODE
+
+        # 确定哪个是时间列、哪个是数值列
+        if is_temporal(lv.dtype):
+            time_vec, num_vec = lv, rv
+            out_dtype = lv.dtype
+        else:
+            time_vec, num_vec = rv, lv
+            out_dtype = rv.dtype
+            if op == '-':
+                # int - date 无意义 → 回退到通用路径
+                return None
+
+        code = DTYPE_TO_ARRAY_CODE.get(out_dtype)
+        rd = TypedVector(code) if code else []
+        rn = Bitmap(n)
+        for i in range(n):
+            if time_vec.is_null(i) or num_vec.is_null(i):
+                rn.set_bit(i)
+                rd.append(0)
+                continue
+            tv = time_vec.get(i)
+            nv = int(num_vec.get(i))
+            if op == '+':
+                rd.append(tv + nv)
+            else:  # '-'
+                rd.append(tv - nv)
+        return DataVector(dtype=out_dtype, data=rd, nulls=rn, _length=n)
 
     # ═══ 委托到 type_inference 模块 ═══
 

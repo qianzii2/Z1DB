@@ -1,46 +1,41 @@
 from __future__ import annotations
-"""Merge Worker — background thread that merges Delta into Main.
-Paper: Sikka et al., 2012 "SAP HANA"
-
-Periodically:
-  1. Freeze current Delta Store
-  2. Merge frozen Delta + Main → new Main
-  3. Swap in new Main, discard old
-  4. Clear frozen Delta"""
+"""后台合并线程 — 定时将 Delta Store 合并到 Main Store。
+论文: Sikka et al., 2012 "SAP HANA"
+以 daemon 线程运行，可安全 stop。"""
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Optional
 
 
 class MergeWorker:
-    """Background merge worker. Runs in a daemon thread."""
+    """后台合并工作线程。"""
 
-    def __init__(self, merge_fn: Callable, interval: float = 30.0,
+    def __init__(self, merge_fn: Callable,
+                 interval: float = 30.0,
                  threshold: int = 10000) -> None:
         self._merge_fn = merge_fn
         self._interval = interval
-        self._threshold = threshold  # Merge when delta has this many rows
+        self._threshold = threshold
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._stats = {'merges': 0, 'total_rows_merged': 0}
 
     def start(self) -> None:
-        """Start background merge thread."""
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop background merge thread."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=5.0)
             self._thread = None
 
     def trigger_merge(self) -> None:
-        """Trigger an immediate merge."""
+        """手动触发合并。"""
         try:
             rows_merged = self._merge_fn()
             self._stats['merges'] += 1
@@ -49,7 +44,7 @@ class MergeWorker:
             pass
 
     def _run(self) -> None:
-        """Main loop: check delta size, merge if needed."""
+        """主循环：定时检查并合并。"""
         while self._running:
             try:
                 rows_merged = self._merge_fn()
@@ -58,7 +53,7 @@ class MergeWorker:
                     self._stats['total_rows_merged'] += rows_merged
             except Exception:
                 pass
-            # Sleep in small increments for responsive shutdown
+            # 分段睡眠，便于快速停止
             for _ in range(int(self._interval * 10)):
                 if not self._running:
                     break

@@ -1,15 +1,15 @@
 from __future__ import annotations
-"""External Sort — handles data larger than memory.
-Generate sorted runs → K-way merge with LoserTree."""
-import tempfile
-import json
+"""External Sort — 磁盘排序。
+[P09] run 文件使用 pickle 二进制格式替代 JSON。"""
 import os
-from typing import Any, Iterator, List, Optional, Tuple
+import pickle
+import tempfile
+from typing import Any, Iterator, List, Optional
 from structures.tournament_tree import LoserTree
 
 
 class ExternalSort:
-    """Disk-based sort for datasets exceeding memory limit."""
+    """磁盘排序。数据量超过内存限制时使用。"""
 
     def __init__(self, memory_limit: int = 64 * 1024 * 1024,
                  temp_dir: Optional[str] = None) -> None:
@@ -17,15 +17,15 @@ class ExternalSort:
         self._temp_dir = temp_dir or tempfile.gettempdir()
         self._run_files: list = []
 
-    def sort(self, rows: list, key_fn: Any = None) -> list:
-        """Sort rows, spilling to disk if needed.
-        Estimated memory per row: 200 bytes (conservative)."""
+    def sort(self, rows: list,
+             key_fn: Any = None) -> list:
+        """排序。内存不足时溢写到磁盘。"""
         estimated_mem = len(rows) * 200
         if estimated_mem <= self._memory_limit:
             rows.sort(key=key_fn)
             return rows
 
-        # Phase 1: Generate sorted runs
+        # 阶段 1：生成排序 run
         chunk_size = max(1, self._memory_limit // 200)
         self._run_files = []
         for start in range(0, len(rows), chunk_size):
@@ -34,34 +34,34 @@ class ExternalSort:
             chunk.sort(key=key_fn)
             self._write_run(chunk)
 
-        # Phase 2: K-way merge
+        # 阶段 2：K 路归并
         return self._merge_runs(key_fn)
 
     def _write_run(self, sorted_chunk: list) -> None:
-        fd, path = tempfile.mkstemp(suffix='.run', dir=self._temp_dir)
+        """[P09] 二进制 run 文件。"""
+        fd, path = tempfile.mkstemp(
+            suffix='.run', dir=self._temp_dir)
         try:
-            with os.fdopen(fd, 'w') as f:
+            with os.fdopen(fd, 'wb') as f:
                 for row in sorted_chunk:
-                    f.write(json.dumps(row) + '\n')
+                    data = pickle.dumps(row, protocol=4)
+                    f.write(len(data).to_bytes(4, 'little'))
+                    f.write(data)
         except Exception:
             os.close(fd)
             raise
         self._run_files.append(path)
 
-    def _merge_runs(self, key_fn: Any) -> list:
+    def _merge_runs(self, key_fn) -> list:
         if not self._run_files:
             return []
-
-        # Open all run files as iterators
         file_handles = []
         iterators = []
         for path in self._run_files:
-            fh = open(path, 'r')
+            fh = open(path, 'rb')
             file_handles.append(fh)
             iterators.append(self._run_iterator(fh))
-
         try:
-            # Use LoserTree for K-way merge
             if key_fn:
                 tree = LoserTree(iterators, key_fn=key_fn)
             else:
@@ -71,15 +71,20 @@ class ExternalSort:
             for fh in file_handles:
                 fh.close()
             self._cleanup()
-
         return result
 
     @staticmethod
-    def _run_iterator(fh: Any) -> Iterator:
-        for line in fh:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
+    def _run_iterator(fh) -> Iterator:
+        """[P09] 二进制 run 迭代器。"""
+        while True:
+            len_bytes = fh.read(4)
+            if len(len_bytes) < 4:
+                break
+            data_len = int.from_bytes(len_bytes, 'little')
+            data = fh.read(data_len)
+            if len(data) < data_len:
+                break
+            yield pickle.loads(data)
 
     def _cleanup(self) -> None:
         for path in self._run_files:

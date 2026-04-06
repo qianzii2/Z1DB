@@ -1,9 +1,9 @@
 from __future__ import annotations
-"""Bit manipulation primitives."""
+"""位操作原语 — clz/ctz/popcount/2的幂次。"""
 
 
 def clz64(x: int) -> int:
-    """Count leading zeros for a 64-bit value."""
+    """计算 64 位值的前导零数量。x=0 返回 64。"""
     if x <= 0:
         return 64 if x == 0 else 0
     n = 0
@@ -23,7 +23,7 @@ def clz64(x: int) -> int:
 
 
 def ctz64(x: int) -> int:
-    """Count trailing zeros for a 64-bit value."""
+    """计算 64 位值的尾部零数量。x=0 返回 64。"""
     if x == 0:
         return 64
     n = 0
@@ -44,16 +44,18 @@ def ctz64(x: int) -> int:
 
 
 def popcount64(x: int) -> int:
-    """Population count (number of set bits) for a 64-bit value."""
+    """64 位值的置位数（Hamming 权重）。"""
     x &= 0xFFFFFFFFFFFFFFFF
     return bin(x).count('1')
 
 
 def next_power_of_2(x: int) -> int:
+    """大于等于 x 的最小 2 的幂次。"""
     if x <= 1:
         return 1
     return 1 << (x - 1).bit_length()
 
 
 def is_power_of_2(x: int) -> bool:
+    """判断 x 是否为 2 的幂次。"""
     return x > 0 and (x & (x - 1)) == 0

@@ -36,6 +36,7 @@ class MetaCommandHandler:
             '.memory': self._memory,
             '.import': self._import_csv,
             '.export': self._export_csv,
+            '.vacuum': self._vacuum,
         }
         fn = dispatch.get(name)
         if fn is None:
@@ -269,3 +270,13 @@ class MetaCommandHandler:
         str_rows = [[str(v) for v in r] for r in rows]
         for line in render_table(headers, str_rows, header_fmt=c_header):
             print(line)
+
+    def _vacuum(self, parts) -> bool:
+        table = parts[1] if len(parts) > 1 else None
+        sql = f"VACUUM {table};" if table else "VACUUM;"
+        try:
+            result = self._engine.execute(sql)
+            print(c_ok(result.message))
+        except Z1Error as e:
+            print(f"{c_error('错误')}: {e.message}")
+        return False

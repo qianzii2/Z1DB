@@ -1,19 +1,19 @@
 from __future__ import annotations
-"""Delta Store — row-oriented append buffer for writes.
-Paper: Grund et al., 2010 "HYRISE"
+"""Delta Store — 行式追加写缓冲。
+论文: Grund et al., 2010 "HYRISE"
 
-INSERT → append to delta.
-UPDATE → mark old row deleted + append new row to delta.
-DELETE → mark row deleted.
-Periodically merged into Main Store by background worker."""
+注意：当前版本中 TableStore 未使用 DeltaStore（功能由
+_deleted_global + append 机制覆盖）。
+此模块保留供 LSM 层和未来版本使用。"""
 from typing import Any, Dict, List, Optional, Set
 from metal.bitmap import Bitmap
 
 
 class DeltaStore:
-    """Append-only write buffer. Stores rows in insertion order."""
+    """追加写缓冲。按插入顺序存储行。支持逻辑删除（tombstone）。"""
 
-    __slots__ = ('_rows', '_column_names', '_delete_bitmap', '_next_id')
+    __slots__ = ('_rows', '_column_names',
+                 '_delete_bitmap', '_next_id')
 
     def __init__(self, column_names: List[str]) -> None:
         self._column_names = column_names
@@ -27,11 +27,11 @@ class DeltaStore:
 
     @property
     def active_row_count(self) -> int:
-        """Rows not marked as deleted."""
+        """未被标记删除的行数。"""
         return self.row_count - self._delete_bitmap.popcount()
 
     def insert(self, row: list) -> int:
-        """Append a row. Returns row_id within delta."""
+        """追加行，返回行 ID。"""
         row_id = self._next_id
         self._rows.append(list(row))
         self._delete_bitmap.ensure_capacity(row_id + 1)
@@ -39,7 +39,7 @@ class DeltaStore:
         return row_id
 
     def mark_deleted(self, row_id: int) -> None:
-        """Mark a row as deleted (tombstone)."""
+        """标记删除（tombstone）。"""
         if 0 <= row_id < len(self._rows):
             self._delete_bitmap.set_bit(row_id)
 
@@ -54,7 +54,7 @@ class DeltaStore:
         return self._rows[row_id]
 
     def scan_active(self) -> List[list]:
-        """Scan all non-deleted rows."""
+        """扫描所有未删除行。"""
         result = []
         for i, row in enumerate(self._rows):
             if not self._delete_bitmap.get_bit(i):
@@ -62,7 +62,7 @@ class DeltaStore:
         return result
 
     def drain(self) -> List[list]:
-        """Extract all active rows and clear the delta. Used during merge."""
+        """提取全部活跃行并清空。合并（merge）时使用。"""
         active = self.scan_active()
         self.clear()
         return active

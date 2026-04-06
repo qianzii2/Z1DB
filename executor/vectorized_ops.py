@@ -1,6 +1,11 @@
 from __future__ import annotations
-"""向量化原语 — 整列操作，减少Python解释器开销。
-提供batch级别的算术/比较/聚合操作。"""
+"""向量化原语 — 整列操作。
+⚠️ 废弃提醒：此模块的大部分功能已被以下模块替代：
+  - metal/bitmagic.py nanbox_batch_* → 批量算术/比较
+  - executor/expression/vec_ops.py   → 向量化模板
+  - metal/typed_vector.py            → 批量数据操作
+保留原因：evaluator.py 中仍有少量引用（try_vectorized_arith 等）。
+计划在后续版本中完全迁移引用后删除此文件。"""
 import array as _array
 from typing import Any, Callable, List, Optional, Tuple
 

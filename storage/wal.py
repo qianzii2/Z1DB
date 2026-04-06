@@ -1,14 +1,16 @@
 from __future__ import annotations
 """Write-Ahead Log — 崩溃恢复 + 自动轮转。
-[FIX-S01] truncate_before 使用原子 rename 防止数据丢失。"""
+[M02] 支持 DDL 操作（CREATE/DROP/ALTER TABLE）。
+使用原子 rename 防止截断时数据丢失。"""
 import json
 import os
-import tempfile
 import time
 from typing import Any, Dict, List, Optional
 
 
 class WALEntry:
+    """WAL 条目：LSN + 时间戳 + 操作类型 + 表名 + 数据。"""
+
     __slots__ = ('lsn', 'timestamp', 'op_type', 'table', 'data')
 
     def __init__(self, lsn: int, op_type: str, table: str,
@@ -36,10 +38,16 @@ class WALEntry:
         return entry
 
 
+# [M02] 支持的操作类型
+# DML: INSERT, UPDATE, DELETE
+# DDL: CREATE_TABLE, DROP_TABLE, ALTER_TABLE
+# 系统: CHECKPOINT
+
+
 class WriteAheadLog:
     """追加写入 WAL。checkpoint 时 fsync + 原子轮转。"""
 
-    MAX_WAL_BYTES = 10 * 1024 * 1024
+    MAX_WAL_BYTES = 10 * 1024 * 1024  # 10 MB 后轮转
 
     def __init__(self, data_dir: str) -> None:
         self._data_dir = data_dir
@@ -51,6 +59,7 @@ class WriteAheadLog:
         self._load_state()
 
     def _load_state(self) -> None:
+        """从现有 WAL 文件恢复 LSN 和 checkpoint 位置。"""
         if os.path.exists(self._path):
             try:
                 with open(self._path, 'r') as f:
@@ -78,6 +87,7 @@ class WriteAheadLog:
 
     def append(self, op_type: str, table: str,
                data: Optional[dict] = None) -> int:
+        """追加一条 WAL 记录。返回 LSN。"""
         self._lsn += 1
         entry = WALEntry(self._lsn, op_type, table, data)
         if self._fh is None:
@@ -88,6 +98,7 @@ class WriteAheadLog:
         return self._lsn
 
     def checkpoint(self) -> int:
+        """写入 CHECKPOINT 标记 + fsync + 可能轮转。"""
         lsn = self.append('CHECKPOINT', '',
                            {'checkpoint_lsn': self._lsn})
         self._fsync()
@@ -104,16 +115,17 @@ class WriteAheadLog:
                 pass
 
     def _maybe_rotate(self) -> None:
+        """WAL 文件过大时截断旧条目。"""
         try:
             if not os.path.exists(self._path):
                 return
-            size = os.path.getsize(self._path)
-            if size > self.MAX_WAL_BYTES:
+            if os.path.getsize(self._path) > self.MAX_WAL_BYTES:
                 self.truncate_before(self._checkpoint_lsn)
         except OSError:
             pass
 
     def recover(self) -> List[WALEntry]:
+        """恢复：读取 checkpoint 之后的所有条目。"""
         entries = []
         if not os.path.exists(self._path):
             return entries
@@ -132,14 +144,13 @@ class WriteAheadLog:
         return entries
 
     def truncate_before(self, lsn: int) -> None:
-        """[FIX-S01] 原子截断：先写临时文件再 rename，防止崩溃丢数据。"""
+        """原子截断：先写临时文件 → fsync → rename。"""
         if not os.path.exists(self._path):
             return
         was_open = self._fh is not None
         if was_open:
             self._fh.close()
             self._fh = None
-
         # 收集要保留的条目
         kept = []
         try:
@@ -158,8 +169,7 @@ class WriteAheadLog:
             if was_open:
                 self._fh = open(self._path, 'a')
             return
-
-        # [FIX-S01] 写临时文件 → fsync → 原子 rename
+        # 原子写入
         tmp_path = self._path + '.tmp'
         try:
             with open(tmp_path, 'w') as f:
@@ -167,14 +177,12 @@ class WriteAheadLog:
                     f.write(line + '\n')
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, self._path)  # 原子替换
+            os.replace(tmp_path, self._path)
         except Exception:
-            # 失败时清理临时文件
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
-
         if was_open:
             self._fh = open(self._path, 'a')
 

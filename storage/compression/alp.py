@@ -1,66 +1,60 @@
 from __future__ import annotations
-
-"""ALP — Adaptive Lossless floating Point compression.
-Paper: Afroozeh & Boncz, 2023.
-Decomposes floats into exponent + mantissa, encodes separately.
-Best for scientific/financial data with repeated decimal patterns."""
+"""ALP — 自适应无损浮点压缩。
+论文: Afroozeh & Boncz, 2023
+将浮点数分解为 10^k 倍整数 + 差分编码。
+最适合科学/金融数据（如 3.14、99.99 等重复小数模式）。"""
 import struct
-from typing import List, Tuple
+from typing import List
 
 
 def alp_encode(values: List[float]) -> bytes:
-    """Encode float64 values using ALP.
-
-    Strategy:
-    1. Find common decimal multiplier (e.g., values like 3.14 → multiply by 100)
-    2. Convert to integers
-    3. Delta-encode the integers
-    4. Store multiplier + deltas
-    """
+    """ALP 编码 float64 值序列。
+    策略：找最优 10^k 乘数使大部分值变整数 → 差分编码。"""
     if not values:
         return struct.pack('I', 0)
 
     n = len(values)
-    # Find best multiplier (power of 10 that makes most values integers)
+    # 找最优乘数：枚举 10^0 到 10^15
     best_mult = 1
     best_int_count = 0
     for exp in range(0, 16):
         mult = 10 ** exp
-        int_count = sum(1 for v in values[:min(100, n)]
-                        if abs(v * mult - round(v * mult)) < 1e-9)
+        int_count = sum(
+            1 for v in values[:min(100, n)]
+            if abs(v * mult - round(v * mult)) < 1e-9)
         if int_count > best_int_count:
             best_int_count = int_count
             best_mult = mult
 
-    # Convert to integers
+    # 转整数
     int_vals = [round(v * best_mult) for v in values]
 
-    # Check if all conversions are lossless
-    lossless = all(abs(values[i] - int_vals[i] / best_mult) < 1e-12
-                   for i in range(n))
+    # 检查无损性
+    lossless = all(
+        abs(values[i] - int_vals[i] / best_mult) < 1e-12
+        for i in range(n))
 
     if not lossless or best_mult == 1:
-        # Fallback: store raw float64
-        header = struct.pack('IBI', n, 0, 1)  # flag=0 means raw
+        # 回退：存原始 float64
+        header = struct.pack('IBI', n, 0, 1)  # flag=0 = 原始
         data = struct.pack(f'{n}d', *values)
         return header + data
 
-    # Delta encode the integer values
+    # 差分编码整数值
     base = int_vals[0]
     deltas = [0] * n
     for i in range(1, n):
         deltas[i] = int_vals[i] - int_vals[i - 1]
 
-    # Pack: header + base + multiplier + deltas
-    header = struct.pack('IBI', n, 1, best_mult)  # flag=1 means ALP
+    # 打包：header + base + 乘数 + zigzag varint 差分
+    header = struct.pack('IBI', n, 1, best_mult)  # flag=1 = ALP
     base_bytes = struct.pack('q', base)
 
-    # Variable-length encode deltas
     delta_bytes = bytearray()
     for d in deltas:
-        # Zigzag encoding for signed values
+        # Zigzag 编码有符号值
         zz = (d << 1) ^ (d >> 63) if d < 0 else d << 1
-        # Varint encoding
+        # Varint 编码
         while zz >= 0x80:
             delta_bytes.append((zz & 0x7F) | 0x80)
             zz >>= 7
@@ -70,7 +64,7 @@ def alp_encode(values: List[float]) -> bytes:
 
 
 def alp_decode(data: bytes) -> List[float]:
-    """Decode ALP-compressed float64 values."""
+    """解码 ALP 压缩数据。"""
     if len(data) < 9:
         return []
 
@@ -78,14 +72,14 @@ def alp_decode(data: bytes) -> List[float]:
     offset = struct.calcsize('IBI')
 
     if flag == 0:
-        # Raw float64
+        # 原始 float64
         return list(struct.unpack_from(f'{n}d', data, offset))
 
-    # ALP encoded
+    # ALP 编码
     base = struct.unpack_from('q', data, offset)[0]
     offset += 8
 
-    # Decode varint deltas
+    # 解码 varint 差分
     deltas = []
     for _ in range(n):
         zz = 0
@@ -97,11 +91,11 @@ def alp_decode(data: bytes) -> List[float]:
             if not (b & 0x80):
                 break
             shift += 7
-        # Zigzag decode
+        # Zigzag 解码
         d = -(zz >> 1) - 1 if (zz & 1) else (zz >> 1)
         deltas.append(d)
 
-    # Reconstruct
+    # 重建整数值
     int_vals = [base]
     for i in range(1, len(deltas)):
         int_vals.append(int_vals[-1] + deltas[i])
@@ -112,7 +106,8 @@ def alp_decode(data: bytes) -> List[float]:
 
 
 def alp_compression_ratio(values: List[float]) -> float:
-    if not values: return 1.0
+    if not values:
+        return 1.0
     encoded = alp_encode(values)
     original = len(values) * 8
     return len(encoded) / original

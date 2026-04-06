@@ -1,13 +1,15 @@
 from __future__ import annotations
 """LSM Manifest — 跟踪活跃 SSTable 及其层级。
-[FIX-S02] 使用原子 rename 防止崩溃时 MANIFEST 损坏。"""
+使用原子 rename 防止崩溃时 MANIFEST 损坏。"""
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
 from storage.lsm.sstable import SSTableReader
 
 
 class Manifest:
+    """SSTable 清单管理器。记录各层级的 SSTable 文件路径。"""
+
     def __init__(self, data_dir: str) -> None:
         self._data_dir = data_dir
         self._levels: Dict[int, List[str]] = {0: [], 1: [], 2: []}
@@ -50,12 +52,13 @@ class Manifest:
         return len(self._levels.get(level, []))
 
     def _save(self) -> None:
-        """[FIX-S02] 原子保存：写临时文件 → fsync → rename。"""
+        """原子保存：写临时文件 → fsync → rename。"""
         path = os.path.join(self._data_dir, 'MANIFEST.json')
         tmp_path = path + '.tmp'
         os.makedirs(self._data_dir, exist_ok=True)
         data = {
-            'levels': {str(k): v for k, v in self._levels.items()},
+            'levels': {str(k): v
+                       for k, v in self._levels.items()},
             'next_id': self._next_id,
         }
         try:
@@ -63,7 +66,7 @@ class Manifest:
                 json.dump(data, f)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, path)  # 原子替换
+            os.replace(tmp_path, path)
         except Exception:
             try:
                 os.unlink(tmp_path)

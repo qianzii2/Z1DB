@@ -1,12 +1,11 @@
 from __future__ import annotations
-"""表级读写锁。
-修复 M15：acquire_write 等待读者释放。"""
+"""表级读写锁。写锁等待读者释放后获取。"""
 import threading
 from typing import Dict
 
 
 class TableLockManager:
-    """表级锁，写锁等待读者释放后获取。"""
+    """表级锁管理器。读锁共享，写锁排他。"""
 
     def __init__(self) -> None:
         self._mutex = threading.Lock()
@@ -15,8 +14,8 @@ class TableLockManager:
         self._cond = threading.Condition(self._mutex)
 
     def acquire_read(self, table: str) -> None:
+        """获取读锁。等待写锁释放。"""
         with self._cond:
-            # 读者不阻塞其他读者，但要等写者释放
             while self._writers.get(table, False):
                 self._cond.wait()
             self._readers[table] = self._readers.get(table, 0) + 1
@@ -31,8 +30,8 @@ class TableLockManager:
             self._cond.notify_all()
 
     def acquire_write(self, table: str) -> None:
+        """获取写锁。等待所有读者和写者释放。"""
         with self._cond:
-            # M15 修复：等待所有写者和读者释放
             while (self._writers.get(table, False)
                    or self._readers.get(table, 0) > 0):
                 self._cond.wait()

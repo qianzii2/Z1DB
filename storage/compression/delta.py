@@ -1,11 +1,11 @@
 from __future__ import annotations
-"""Delta Encoding — best for sorted/incrementing integers (IDs, timestamps).
-Often combined with BitPacking for maximum compression."""
+"""差分编码 — 最适合有序/递增整数列（ID、时间戳）。
+存储相邻值的差值，差值通常很小，后续可用 BitPacking 进一步压缩。"""
 from typing import List, Tuple
 
 
 def delta_encode(values: list) -> Tuple[int, list]:
-    """Encode as (base, deltas). base = first value, deltas = differences."""
+    """编码为 (base, deltas)。base = 首值，deltas = 差值序列。"""
     if not values:
         return 0, []
     base = values[0]
@@ -17,6 +17,7 @@ def delta_encode(values: list) -> Tuple[int, list]:
 
 
 def delta_decode(base: int, deltas: list) -> list:
+    """解码回原始值。"""
     if not deltas:
         return []
     result = [base + deltas[0]]
@@ -26,8 +27,8 @@ def delta_decode(base: int, deltas: list) -> list:
 
 
 def delta_of_delta_encode(values: list) -> Tuple[int, int, list]:
-    """Delta-of-delta: best for near-constant-step sequences.
-    Example: timestamps with fixed interval → dod ≈ 0."""
+    """二阶差分：最适合近等步长序列（固定间隔时间戳等）。
+    二阶差分 ≈ 0 时压缩率极高。"""
     if len(values) < 2:
         return values[0] if values else 0, 0, []
     base = values[0]
@@ -41,7 +42,8 @@ def delta_of_delta_encode(values: list) -> Tuple[int, int, list]:
     return base, first_delta, dod
 
 
-def delta_of_delta_decode(base: int, first_delta: int, dod: list) -> list:
+def delta_of_delta_decode(base: int, first_delta: int,
+                          dod: list) -> list:
     if not dod:
         return [base]
     result = [base, base + first_delta]
@@ -53,14 +55,14 @@ def delta_of_delta_decode(base: int, first_delta: int, dod: list) -> list:
 
 
 def max_delta(deltas: list) -> int:
-    """Maximum absolute delta — determines bit width needed."""
+    """最大绝对差值 — 决定 BitPacking 所需位宽。"""
     if not deltas:
         return 0
     return max(abs(d) for d in deltas)
 
 
 def bits_needed(max_val: int) -> int:
-    """Minimum bits to represent a value."""
+    """表示一个值所需的最小位数。"""
     if max_val <= 0:
         return 1
-    return max_val.bit_length() + 1  # +1 for sign
+    return max_val.bit_length() + 1  # +1 用于符号位

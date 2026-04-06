@@ -1,6 +1,6 @@
 from __future__ import annotations
 """压缩分析器 — 采样数据选择最优编解码器。
-集成 ALP：浮点列分析 ALP 压缩可行性。"""
+对 chunk 中的非 NULL 值采样分析，返回推荐的压缩算法名。"""
 from typing import Any, List, Optional
 from storage.types import DataType
 
@@ -29,13 +29,13 @@ def analyze_and_choose(values: list, dtype: DataType,
             return 'DICT'
         return 'NONE'
 
-    # 布尔
+    # 布尔列：不压缩（Bitmap 已足够紧凑）
     if dtype == DataType.BOOLEAN:
         return 'NONE'
 
     # 浮点列
     if dtype in (DataType.FLOAT, DataType.DOUBLE):
-        # 优先尝试 ALP（科学/金融数据压缩率更好）
+        # 优先 ALP（科学/金融数据压缩率更好）
         if _HAS_ALP and len(non_null) > 10:
             try:
                 alp_ratio = alp_compression_ratio(
@@ -53,17 +53,21 @@ def analyze_and_choose(values: list, dtype: DataType,
     # 整数列
     if dtype in (DataType.INT, DataType.BIGINT,
                  DataType.DATE, DataType.TIMESTAMP):
+        # 已排序 → 差分编码
         sorted_check = all(
             non_null[i] <= non_null[i + 1]
             for i in range(len(non_null) - 1))
         if sorted_check:
             return 'DELTA'
+        # 大量重复 → RLE
         rle_ratio = _try_rle(non_null)
         if rle_ratio < 0.3:
             return 'RLE'
+        # 值域窄 → FOR
         for_ratio = _try_for(non_null)
         if for_ratio < 0.5:
             return 'FOR'
+        # 低基数 → DICT
         ndv = len(set(non_null))
         if ndv < min(len(non_null) // 2, 65536):
             return 'DICT'
@@ -98,8 +102,7 @@ def _try_gorilla(values: list) -> float:
     if len(values) < 2:
         return 1.0
     try:
-        from storage.compression.gorilla import (
-            gorilla_compression_ratio)
+        from storage.compression.gorilla import gorilla_compression_ratio
         return gorilla_compression_ratio(values)
     except Exception:
         return 1.0

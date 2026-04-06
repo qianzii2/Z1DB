@@ -351,19 +351,33 @@ class IntegratedPlanner:
         mgr = catalog.index_manager
         if mgr is None: return None
         pred = ast.where
-        if not isinstance(pred, BinaryExpr) or pred.op != '=': return None
+        if not isinstance(pred, BinaryExpr): return None
+
         col_name = val = None
         if isinstance(pred.left, ColumnRef) and isinstance(pred.right, Literal):
             col_name, val = pred.left.column, pred.right.value
         elif isinstance(pred.right, ColumnRef) and isinstance(pred.left, Literal):
             col_name, val = pred.right.column, pred.left.value
         if col_name is None or val is None: return None
+
         tname = ast.from_clause.table.name
-        if hasattr(mgr, 'might_contain') and not mgr.might_contain(tname, col_name, val):
-            return None
         index = mgr.get_index_for_column(tname, col_name)
         if index is None: return None
-        return IndexScanOperator(tname, store, columns, index, scan_type='EQ', key_value=val)
+
+        # [M10] 等值查询
+        if pred.op == '=':
+            if hasattr(mgr, 'might_contain') and not mgr.might_contain(tname, col_name, val):
+                return None
+            return IndexScanOperator(tname, store, columns, index,
+                                     scan_type='EQ', key_value=val)
+        # [M10] 范围查询（<, >, <=, >=）
+        if pred.op in ('<', '<='):
+            return IndexScanOperator(tname, store, columns, index,
+                                     scan_type='RANGE', range_hi=val)
+        if pred.op in ('>', '>='):
+            return IndexScanOperator(tname, store, columns, index,
+                                     scan_type='RANGE', range_lo=val)
+        return None
 
     def _build_optimized_joins(self, ast, catalog, tier):
         fc = ast.from_clause
@@ -485,7 +499,8 @@ class IntegratedPlanner:
         build = min(lr, rr)
 
         # [集成] 策略推荐
-        selector = self._strategy_selector  # 可能已在 _build_optimized_source 中初始化
+        selector = self._get_strategy_selector(
+            None)  # catalog 已在 _build_optimized_source 中传入
         recommended_join = None
         if selector and _HAS_STRATEGY:
             try:
