@@ -90,7 +90,7 @@ class DMLExecutor:
             matching = set(range(len(ar)))
         if not matching:
             return ExecutionResult(affected_rows=0, message="Updated 0 rows")
-        # 批量计算新值
+        # 批量计算新值 - evaluate ALL assignments on the ORIGINAL batch
         batch = VectorBatch.from_rows(ar, cn, ct)
         updates_by_col: Dict[int, Dict[int, Any]] = {}
         for a in ast.assignments:
@@ -100,18 +100,18 @@ class DMLExecutor:
                 raise ColumnNotFoundError(a.column)
             val_vec = self._evaluator.evaluate(a.value, batch)
             updates_by_col[ci] = {ri: val_vec.get(ri) for ri in matching}
+
+        # Apply all updates
         count = len(matching)
-        if hasattr(store, 'update_rows') and count > 0:
-            for ci, new_vals in updates_by_col.items():
-                store.update_rows(matching, ci, new_vals)
-        elif count > 0:
-            for ri in range(len(ar)):
-                for ci, new_vals in updates_by_col.items():
-                    if ri in new_vals:
-                        ar[ri][ci] = new_vals[ri]
-            store.truncate()
-            for r in ar:
-                store.append_row(r)
+        new_rows = [list(row) for row in ar]
+        for ci, new_vals in updates_by_col.items():
+            for ri, val in new_vals.items():
+                new_rows[ri][ci] = val
+
+        store.truncate()
+        for r in new_rows:
+            store.append_row(r)
+
         w = 'row' if count == 1 else 'rows'
         return ExecutionResult(affected_rows=count,
                                message=f"Updated {count} {w}")
@@ -134,16 +134,12 @@ class DMLExecutor:
         batch = VectorBatch.from_rows(ar, cn, ct)
         mask = self._evaluator.evaluate_predicate(ast.where, batch)
         to_delete = set(mask.to_indices())
-        count = 0
-        if to_delete:
-            if hasattr(store, 'delete_rows'):
-                count = store.delete_rows(to_delete)
-            else:
-                keep = [r for i, r in enumerate(ar) if i not in to_delete]
-                count = len(ar) - len(keep)
-                store.truncate()
-                for r in keep:
-                    store.append_row(r)
+        count = len(to_delete)
+        if count > 0:
+            keep = [r for i, r in enumerate(ar) if i not in to_delete]
+            store.truncate()
+            for r in keep:
+                store.append_row(r)
         return ExecutionResult(
             affected_rows=count,
             message=f"Deleted {count} {'row' if count == 1 else 'rows'}")

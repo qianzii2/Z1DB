@@ -72,6 +72,9 @@ _UNRESERVED = frozenset({
     TokenType.OVER, TokenType.COLUMN, TokenType.RENAME,
     TokenType.TO, TokenType.ADD, TokenType.INDEX,
     TokenType.UNIQUE, TokenType.USING, TokenType.NATURAL,
+    TokenType.IF, TokenType.LEFT, TokenType.RIGHT,
+    TokenType.FULL, TokenType.INNER, TokenType.OUTER,
+    TokenType.CROSS,
 })
 
 

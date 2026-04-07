@@ -175,8 +175,15 @@ class IntegratedPlanner:
         ast = self._simple._resolve_subqueries(ast, catalog)
         if ast.from_clause is None:
             return self._simple._exec_select(ast, catalog)
-        store = catalog.get_store(ast.from_clause.table.name)
-        schema = catalog.get_table(ast.from_clause.table.name)
+        tref = ast.from_clause.table
+        if tref.func_args is not None or tref.name.lower() == 'generate_series':
+            return self._simple._exec_select(ast, catalog)
+        if tref.subquery:
+            return self._simple._exec_select(ast, catalog)
+        if not catalog.table_exists(tref.name):
+            return self._simple._exec_select(ast, catalog)
+        store = catalog.get_store(tref.name)
+        schema = catalog.get_table(tref.name)
         all_rows = store.read_all_rows()
         cn = schema.column_names; ct = [c.dtype for c in schema.columns]
         if ast.where:
@@ -224,6 +231,10 @@ class IntegratedPlanner:
         if any(self._simple._contains_window(e) for e in ast.select_list): return None
         tref = ast.from_clause.table
         if tref.subquery: return None
+        if tref.func_args is not None or tref.name.lower() == 'generate_series':
+            return None
+        if not catalog.table_exists(tref.name):
+            return None
         store = catalog.get_store(tref.name)
         proj = self._simple._build_proj(ast)
         cs = dict(self._simple._build_source(ast, catalog).output_schema())
@@ -273,8 +284,13 @@ class IntegratedPlanner:
         fc = ast.from_clause; tref = fc.table
         if tref.subquery:
             return self._simple._plan_any(tref.subquery, catalog)
+        # Handle table functions (generate_series) BEFORE trying to get store
+        if tref.func_args is not None or tref.name.lower() == 'generate_series':
+            return self._simple._build_generate_series(ast)
         if fc.joins:
             return self._build_optimized_joins(ast, catalog, tier)
+        if not catalog.table_exists(tref.name):
+            return self._simple._build_source(ast, catalog)
         store = catalog.get_store(tref.name)
         needed = self._simple._collect_all_cols(ast)
         ordered = [c.name for c in store.schema.columns if c.name in needed]

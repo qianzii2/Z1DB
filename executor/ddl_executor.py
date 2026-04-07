@@ -4,7 +4,7 @@ from typing import Any
 from catalog.catalog import Catalog, ColumnSchema, TableSchema
 from executor.core.result import ExecutionResult
 from storage.types import resolve_type_name
-from utils.errors import ExecutionError
+from utils.errors import ExecutionError, SemanticError
 
 
 class DDLExecutor:
@@ -12,6 +12,12 @@ class DDLExecutor:
 
     @staticmethod
     def exec_create(ast: Any, catalog: Catalog) -> ExecutionResult:
+        # Check duplicate column names
+        seen = set()
+        for cd in ast.columns:
+            if cd.name in seen:
+                raise SemanticError(f"列名重复: '{cd.name}'")
+            seen.add(cd.name)
         cols = []
         for cd in ast.columns:
             dt, ml = resolve_type_name(cd.type_name.name, cd.type_name.params)

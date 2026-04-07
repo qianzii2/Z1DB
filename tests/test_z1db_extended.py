@@ -1174,16 +1174,11 @@ class TestRegressions:
         assert scalar(r) == 2
 
     def test_alter_drop_refreshes_system_tables(self, eng):
-        """回归：ALTER DROP COLUMN 后 z1db_columns 应更新。"""
         eng.execute("CREATE TABLE t (id INT, v INT, w INT);")
-        r0 = eng.execute(
-            "SELECT COUNT(*) FROM z1db_columns "
-            "WHERE table_name = 't';")
+        r0 = eng.execute("SELECT COUNT(*) FROM z1db_columns WHERE table_name = 't';")
         assert scalar(r0) == 3
         eng.execute("ALTER TABLE t DROP COLUMN v;")
-        r = eng.execute(
-            "SELECT COUNT(*) FROM z1db_columns "
-            "WHERE table_name = 't';")
+        r = eng.execute("SELECT COUNT(*) FROM z1db_columns WHERE table_name = 't';")
         assert scalar(r) == 2
 
     def test_alter_rename_refreshes_system_tables(self, eng):

@@ -27,6 +27,7 @@ except ImportError:
     SubqueryExpr = None
     ExistsExpr = None
 
+_CTE_PREFIX = '__cte_'
 
 class CatalogInfo(Protocol):
     def get_table_columns(self, table: str) -> list[str]: ...
@@ -37,7 +38,13 @@ class Validator:
     """语义验证器。检查 AST 的语义正确性。"""
 
     def validate(self, ast: Any,
-                 catalog_info: CatalogInfo) -> Any:
+                 catalog_info: CatalogInfo,
+                 cte_names: set = None) -> Any:
+        self._cte_names = cte_names or set()
+        # Collect CTE names from the AST itself
+        if isinstance(ast, SelectStmt) and ast.ctes:
+            for entry in ast.ctes:
+                self._cte_names.add(entry[0])
         if isinstance(ast, SelectStmt):
             self._validate_select(ast, catalog_info)
         elif isinstance(ast, InsertStmt):
@@ -50,12 +57,18 @@ class Validator:
             self._validate_create(ast, catalog_info)
         elif (ExplainStmt is not None
               and isinstance(ast, ExplainStmt)):
-            self.validate(ast.statement, catalog_info)
+            self.validate(ast.statement, catalog_info, self._cte_names)
         elif (SetOperationStmt is not None
               and isinstance(ast, SetOperationStmt)):
-            self.validate(ast.left, catalog_info)
-            self.validate(ast.right, catalog_info)
+            self.validate(ast.left, catalog_info, self._cte_names)
+            self.validate(ast.right, catalog_info, self._cte_names)
         return ast
+
+    def _is_cte_table(self, name: str) -> bool:
+        """Check if a table name is a CTE reference."""
+        return (name in self._cte_names
+                or name.startswith(_CTE_PREFIX)
+                or f'{_CTE_PREFIX}{name}' in self._cte_names)
 
     def _validate_select(self, ast, cat):
         """验证 SELECT：表/列存在性、GROUP BY 一致性、嵌套聚合。"""
@@ -65,17 +78,38 @@ class Validator:
 
         if ast.from_clause:
             tref = ast.from_clause.table
-            if tref.subquery is None:
-                self._add_known(
-                    tref.name, tref.alias, cat,
-                    known, known_qualified)
+            if tref.subquery is None and tref.func_args is None:
+                if cat.table_exists(tref.name):
+                    self._add_known(
+                        tref.name, tref.alias, cat,
+                        known, known_qualified)
+                elif self._is_cte_table(tref.name):
+                    has_subquery_source = True
+                    # Try to load from materialized CTE table
+                    cte_table = f'{_CTE_PREFIX}{tref.name}'
+                    if cat.table_exists(cte_table):
+                        self._add_known(
+                            cte_table, tref.alias or tref.name, cat,
+                            known, known_qualified)
+                else:
+                    raise TableNotFoundError(tref.name)
             else:
                 has_subquery_source = True
             for jc in ast.from_clause.joins:
-                if jc.table and jc.table.subquery is None:
-                    self._add_known(
-                        jc.table.name, jc.table.alias,
-                        cat, known, known_qualified)
+                if jc.table and jc.table.subquery is None and jc.table.func_args is None:
+                    if cat.table_exists(jc.table.name):
+                        self._add_known(
+                            jc.table.name, jc.table.alias,
+                            cat, known, known_qualified)
+                    elif self._is_cte_table(jc.table.name):
+                        has_subquery_source = True
+                        cte_table = f'{_CTE_PREFIX}{jc.table.name}'
+                        if cat.table_exists(cte_table):
+                            self._add_known(
+                                cte_table, jc.table.alias or jc.table.name,
+                                cat, known, known_qualified)
+                    else:
+                        raise TableNotFoundError(jc.table.name)
                 elif jc.table and jc.table.subquery is not None:
                     has_subquery_source = True
 
@@ -98,7 +132,8 @@ class Validator:
         # GROUP BY 一致性检查
         has_agg = any(
             contains_agg(e) for e in ast.select_list)
-        if has_agg:
+        # Check if there are scalar subqueries - if all aggs are inside subqueries, skip check
+        if has_agg and not self._has_only_subquery_aggs(ast.select_list):
             gb_cols: Set[str] = set()
             gb_exprs: list = []
             if ast.group_by:
@@ -112,6 +147,48 @@ class Validator:
         # 嵌套聚合检测
         for expr in ast.select_list:
             self._check_nested_agg(expr, 0)
+
+    def _has_only_subquery_aggs(self, select_list) -> bool:
+        """Check if all aggregates are inside subqueries (scalar subquery in SELECT)."""
+        for item in select_list:
+            if self._has_direct_agg(item):
+                return False
+        return True
+
+    def _has_direct_agg(self, node) -> bool:
+        """Check if node contains a direct (non-subquery) aggregate."""
+        if isinstance(node, AggregateCall):
+            return True
+        if SubqueryExpr and isinstance(node, SubqueryExpr):
+            return False  # Don't look inside subqueries
+        if ExistsExpr and isinstance(node, ExistsExpr):
+            return False
+        if isinstance(node, AliasExpr):
+            return self._has_direct_agg(node.expr)
+        if (node is None
+                or not dataclasses.is_dataclass(node)
+                or isinstance(node, type)):
+            return False
+        for f in dataclasses.fields(node):
+            child = getattr(node, f.name)
+            if isinstance(child, list):
+                for i in child:
+                    if self._has_direct_agg(i):
+                        return True
+            elif child is not None:
+                if self._has_direct_agg(child):
+                    return True
+        return False
+
+    def _validate_create(self, ast, cat):
+        """[M08] CHECK 约束验证桩。当前仅验证列名唯一性。"""
+        if not ast.columns:
+            raise SemanticError("CREATE TABLE 至少需要一列")
+        seen: set = set()
+        for cd in ast.columns:
+            if cd.name in seen:
+                raise SemanticError(f"列名重复: '{cd.name}'")
+            seen.add(cd.name)
 
     def _validate_insert(self, ast, cat):
         if not cat.table_exists(ast.table):
@@ -130,23 +207,37 @@ class Validator:
         if not cat.table_exists(ast.table):
             raise TableNotFoundError(ast.table)
 
-    def _validate_create(self, ast, cat):
-        """[M08] CHECK 约束验证桩。当前仅验证列名唯一性。"""
-        if not ast.columns:
-            raise SemanticError("CREATE TABLE 至少需要一列")
-        seen: set = set()
-        for cd in ast.columns:
-            if cd.name in seen:
-                raise SemanticError(f"列名重复: '{cd.name}'")
-            seen.add(cd.name)
-            # [M08] CHECK 约束存在但暂不验证
-            # if cd.check is not None:
-            #     self._validate_check_expr(cd.check)
+    def _has_outer_agg(self, node):
+        """Check if node contains aggregates at the outer level (not inside subqueries)."""
+        if isinstance(node, AggregateCall):
+            return True
+        if SubqueryExpr and isinstance(node, SubqueryExpr):
+            return False
+        if ExistsExpr and isinstance(node, ExistsExpr):
+            return False
+        if WindowCall and isinstance(node, WindowCall):
+            return False
+        if isinstance(node, AliasExpr):
+            return self._has_outer_agg(node.expr)
+        if isinstance(node, tuple):
+            return any(self._has_outer_agg(i) for i in node)
+        if node is None or not dataclasses.is_dataclass(node) or isinstance(node, type):
+            return False
+        for f in dataclasses.fields(node):
+            c = getattr(node, f.name)
+            if isinstance(c, list):
+                if any(self._has_outer_agg(i) for i in c):
+                    return True
+            elif self._has_outer_agg(c):
+                return True
+        return False
 
     def _add_known(self, name, alias, cat,
                    known, known_qualified):
         if not cat.table_exists(name):
-            raise TableNotFoundError(name)
+            if not self._is_cte_table(name):
+                raise TableNotFoundError(name)
+            return
         cols = cat.get_table_columns(name)
         qualifier = alias or name
         for c in cols:
@@ -219,6 +310,10 @@ class Validator:
         if isinstance(node, AggregateCall):
             return  # 聚合内部不检查
         if WindowCall and isinstance(node, WindowCall):
+            return
+        if SubqueryExpr and isinstance(node, SubqueryExpr):
+            return  # 标量子查询不需要 GROUP BY
+        if ExistsExpr and isinstance(node, ExistsExpr):
             return
         if self._matches_group_by(node, gb_exprs):
             return

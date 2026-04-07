@@ -80,10 +80,14 @@ class WriteAheadLog:
 
     def close(self) -> None:
         if self._fh:
-            if self._dirty:
-                self._fsync()
-            self._fh.close()
-            self._fh = None
+            try:
+                if self._dirty:
+                    self._fsync()
+                self._fh.close()
+            except Exception:
+                pass
+            finally:
+                self._fh = None
 
     def append(self, op_type: str, table: str,
                data: Optional[dict] = None) -> int:

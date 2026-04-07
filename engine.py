@@ -162,13 +162,19 @@ class Engine:
                     ast = self._strip_ctes(ast)
                 if (isinstance(ast, SelectStmt) and ast.from_clause and
                         ast.from_clause.table and
-                        ast.from_clause.table.name in _SYSTEM_TABLE_NAMES):
+                        ast.from_clause.table.name in _SYSTEM_TABLE_NAMES and
+                        not any(self._simple_contains_agg(e) for e in ast.select_list)):
                     result = self._execute_system_table(ast)
                     return self._finalize_result(ast, result, sql_hash=None, timer=t)
                 # 语义处理
                 if isinstance(ast, _NEEDS_RESOLVE):
                     ast = Resolver().resolve(ast, self._catalog)
-                    ast = Validator().validate(ast, self._catalog)
+                    # Collect CTE names for validator
+                    cte_names = set()
+                    if isinstance(ast, SelectStmt) and ast.ctes:
+                        for entry in ast.ctes:
+                            cte_names.add(entry[0])
+                    ast = Validator().validate(ast, self._catalog, cte_names)
                     ast = self._optimize_ast(ast)
                     if (_HAS_COORDINATOR
                             and isinstance(ast, SelectStmt)):
@@ -203,6 +209,12 @@ class Engine:
         result.timing = t.elapsed
         self._post_execute(ast, result, sql_hash)
         return result
+
+    @staticmethod
+    def _simple_contains_agg(node):
+        """Quick check if node contains aggregate call."""
+        from parser.ast_utils import contains_agg
+        return contains_agg(node)
 
     def _handle_txn_command(self, upper) -> Optional[ExecutionResult]:
         if not self._txn:
@@ -252,12 +264,78 @@ class Engine:
         """执行 AST 节点。"""
         if isinstance(ast, VacuumStmt):
             return self._exec_vacuum(ast)
+        # Handle SelectStmt wrapping a SetOperationStmt (UNION + ORDER BY/LIMIT)
+        if isinstance(ast, SelectStmt) and hasattr(ast, '_set_op_source'):
+            set_result = self._execute_ast(ast._set_op_source)
+            # Apply ORDER BY and LIMIT to the set operation result
+            if set_result.rows and (ast.order_by or ast.limit is not None):
+                return self._apply_order_limit_to_result(ast, set_result)
+            return set_result
         # ExplainStmt / SetOperationStmt 走 planner
         if isinstance(ast, (ExplainStmt, SetOperationStmt)):
             return self._planner.execute(ast, self._catalog)
         if self._integrated and isinstance(ast, SelectStmt):
             return self._integrated.execute(ast, self._catalog)
         return self._planner.execute(ast, self._catalog)
+
+    def _apply_order_limit_to_result(self, ast, result):
+        """Apply ORDER BY and LIMIT to an already-computed result."""
+        import functools
+        from executor.expression.evaluator import ExpressionEvaluator
+        from executor.core.batch import VectorBatch
+
+        rows = list(result.rows)
+        cols = result.columns
+        col_types = result.column_types
+
+        if ast.order_by and rows:
+            evaluator = ExpressionEvaluator()
+            batch = VectorBatch.from_rows(rows, cols, col_types)
+            key_columns = []
+            for sk in ast.order_by:
+                vec = evaluator.evaluate(sk.expr, batch)
+                nulls = sk.nulls or ('NULLS_LAST' if sk.direction == 'ASC' else 'NULLS_FIRST')
+                key_columns.append((vec.to_python_list(), sk.direction, nulls))
+
+            indices = list(range(len(rows)))
+
+            def cmp(i, j):
+                for vals, d, np in key_columns:
+                    a, b = vals[i], vals[j]
+                    if a is None and b is None: continue
+                    if a is None: return 1 if np == 'NULLS_LAST' else -1
+                    if b is None: return -1 if np == 'NULLS_LAST' else 1
+                    if a < b:
+                        c = -1
+                    elif a > b:
+                        c = 1
+                    else:
+                        continue
+                    return -c if d == 'DESC' else c
+                return 0
+
+            indices.sort(key=functools.cmp_to_key(cmp))
+            rows = [rows[i] for i in indices]
+
+        # Apply LIMIT/OFFSET
+        evaluator = ExpressionEvaluator()
+        off = 0
+        lim = None
+        if ast.offset:
+            dummy = VectorBatch.single_row_no_columns()
+            off = int(evaluator.evaluate(ast.offset, dummy).get(0) or 0)
+        if ast.limit:
+            dummy = VectorBatch.single_row_no_columns()
+            lim = int(evaluator.evaluate(ast.limit, dummy).get(0))
+
+        if lim is not None:
+            rows = rows[off:off + lim]
+        elif off > 0:
+            rows = rows[off:]
+
+        return ExecutionResult(
+            columns=cols, column_types=col_types,
+            rows=rows, row_count=len(rows))
 
     def _exec_vacuum(self, ast) -> ExecutionResult:
         """[M05] VACUUM 命令执行。"""
@@ -343,6 +421,14 @@ class Engine:
             self._table_versions[table] = (
                 self._table_versions.get(table, 0) + 1)
             self._result_cache.invalidate_table(table)
+        # DDL operations also invalidate system table caches
+        if isinstance(ast, (CreateTableStmt, DropTableStmt, AlterTableStmt)):
+            self._table_versions['z1db_tables'] = (
+                self._table_versions.get('z1db_tables', 0) + 1)
+            self._table_versions['z1db_columns'] = (
+                self._table_versions.get('z1db_columns', 0) + 1)
+            self._result_cache.invalidate_table('z1db_tables')
+            self._result_cache.invalidate_table('z1db_columns')
 
     def _extract_tables(self, ast):
         tables = set()
@@ -477,6 +563,15 @@ class Engine:
                 right=self._optimize_ast(ast.right))
         return ast
 
+    @staticmethod
+    def _has_system_table_agg(ast):
+        """Check if the system table query contains aggregate functions."""
+        from parser.ast_utils import contains_agg
+        for expr in ast.select_list:
+            if contains_agg(expr):
+                return True
+        return False
+
     def _execute_system_table(self, ast: SelectStmt) -> ExecutionResult:
         """使用算子流水线执行系统表查询。"""
         tname = ast.from_clause.table.name
@@ -590,6 +685,12 @@ class Engine:
                                  if_not_exists: bool = False
                                  ) -> None:
         self._catalog.create_table(schema, if_not_exists)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def close(self):
         if self._merge_worker:

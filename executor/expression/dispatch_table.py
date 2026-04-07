@@ -52,7 +52,7 @@ def build_dispatch() -> Dict[str, Any]:
     D['LPAD'] = _safe(2, lambda s,a,n,e: s._lpad_rpad(a,n,True))
     D['RPAD'] = _safe(2, lambda s,a,n,e: s._lpad_rpad(a,n,False))
     D['ASCII'] = _safe(1, lambda s,a,n,e: s._num1(a[0],n,lambda x:ord(str(x)[0]) if str(x) else 0,DataType.INT))
-    D['CHR'] = _safe(1, lambda s,a,n,e: s._str1(a[0],n,lambda x:chr(int(x)) if isinstance(x,(int,float)) else ''))
+    D['CHR'] = _safe(1, lambda s,a,n,e: s._str1(a[0],n,lambda x:chr(int(float(x))) if x is not None else ''))
     D['SPLIT_PART'] = _safe(3, lambda s,a,n,e: s._split_part(a,n))
     D['SPLIT'] = _safe(2, lambda s,a,n,e: s._str2(a[0],a[1],n,lambda x,d:str(str(x).split(str(d)))))
     D['REGEXP_REPLACE'] = _safe(3, lambda s,a,n,e: s._str3(a[0],a[1],a[2],n,lambda x,p,r:_re.sub(p,r,x)))

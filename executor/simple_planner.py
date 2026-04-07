@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 """SELECT 规划器 + 路由门面。
 DDL 委托到 ddl_executor，DML 委托到 dml_executor。"""
@@ -26,6 +27,7 @@ from executor.operators.window.window_op import WindowOperator
 from executor.ddl_executor import DDLExecutor
 from executor.dml_executor import DMLExecutor
 from parser.ast import *
+from parser.resolver import Resolver
 from parser.ast_utils import contains_agg as _contains_agg_util
 from parser.ast_utils import contains_window as _contains_window_util
 from parser.formatter import Formatter
@@ -54,15 +56,15 @@ class SimplePlanner:
                  budget: Optional[Any] = None) -> None:
         self._registry = function_registry
         self._evaluator = ExpressionEvaluator(function_registry)
+        self._catalog_ref = None  # Set during execute
         self._budget = budget
         self._ddl = DDLExecutor()
         self._dml = DMLExecutor(self._evaluator, planner=self)
 
     def execute(self, ast: Any, catalog: Catalog) -> ExecutionResult:
+        self._catalog_ref = catalog
         # 禁止系统表修改
         if hasattr(ast, 'table') and ast.table in _SYSTEM_TABLE_NAMES:
-            from utils.errors import ExecutionError
-            from parser.ast import InsertStmt, UpdateStmt, DeleteStmt, DropTableStmt, AlterTableStmt
             if isinstance(ast, (InsertStmt, UpdateStmt, DeleteStmt,
                                 DropTableStmt, AlterTableStmt)):
                 raise ExecutionError(f"不允许修改系统表 {ast.table}")
@@ -139,6 +141,15 @@ class SimplePlanner:
         elif n == 'INTERSECT': op = IntersectOperator(lo, ro, ast.all)
         elif n == 'EXCEPT': op = ExceptOperator(lo, ro, ast.all)
         else: raise ExecutionError(f"未知集合操作: {n}")
+        # Handle ORDER BY / LIMIT on set operations
+        order_by = getattr(ast, '_order_by', None)
+        limit = getattr(ast, '_limit', None)
+        offset = getattr(ast, '_offset', None)
+        if order_by:
+            op = SortOperator(op, [(sk.expr, sk.direction, sk.nulls) for sk in order_by])
+        if limit is not None or offset is not None:
+            op = LimitOperator(op, self._eval_const(limit),
+                              self._eval_const(offset) or 0)
         return self._drain(op)
 
     def _plan_any(self, ast, catalog):
@@ -174,6 +185,41 @@ class SimplePlanner:
         if ast.having: ch['having'] = self._resolve_sq(ast.having, catalog)
         return dataclasses.replace(ast, **ch)
 
+    def _is_correlated_exists(self, query, catalog):
+        """Check if a subquery is correlated (references outer tables)."""
+        if not isinstance(query, SelectStmt):
+            return False
+        if query.where is None:
+            return False
+        local_tables = set()
+        if query.from_clause:
+            t = query.from_clause.table
+            local_tables.add(t.alias or t.name)
+            for jc in query.from_clause.joins:
+                if jc.table:
+                    local_tables.add(jc.table.alias or jc.table.name)
+        refs = self._collect_table_refs(query.where)
+        for ref in refs:
+            if ref and ref not in local_tables:
+                return True
+        return False
+
+    def _collect_table_refs(self, node):
+        """Collect all table references from an expression."""
+        if isinstance(node, ColumnRef):
+            return {node.table} if node.table else set()
+        if node is None or not dataclasses.is_dataclass(node) or isinstance(node, type):
+            return set()
+        result = set()
+        for f in dataclasses.fields(node):
+            c = getattr(node, f.name)
+            if isinstance(c, list):
+                for i in c:
+                    result |= self._collect_table_refs(i)
+            elif dataclasses.is_dataclass(c) and not isinstance(c, type):
+                result |= self._collect_table_refs(c)
+        return result
+
     def _resolve_sq(self, node, catalog):
         if node is None: return None
         if isinstance(node, SubqueryExpr):
@@ -186,18 +232,26 @@ class SimplePlanner:
             nv = []
             for v in node.values:
                 if isinstance(v, SubqueryExpr):
-                    r = self.execute(v.query, catalog)
-                    for row in r.rows:
-                        nv.append(Literal(value=row[0],
-                                          inferred_type=r.column_types[0] if r.column_types else DataType.INT))
+                    try:
+                        r = self.execute(v.query, catalog)
+                        for row in r.rows:
+                            nv.append(Literal(value=row[0],
+                                              inferred_type=r.column_types[0] if r.column_types else DataType.INT))
+                    except Exception:
+                        nv.append(v)
                 else: nv.append(v)
             return dataclasses.replace(node, values=nv,
                                         expr=self._resolve_sq(node.expr, catalog))
         if isinstance(node, ExistsExpr):
-            r = self.execute(node.query, catalog)
-            e = len(r.rows) > 0
-            return Literal(value=not e if node.negated else e,
-                           inferred_type=DataType.BOOLEAN)
+            if self._is_correlated_exists(node.query, catalog):
+                return node
+            try:
+                r = self.execute(node.query, catalog)
+                e = len(r.rows) > 0
+                return Literal(value=not e if node.negated else e,
+                               inferred_type=DataType.BOOLEAN)
+            except Exception:
+                return node
         if isinstance(node, tuple):
             return tuple(self._resolve_sq(i, catalog) for i in node)
         if not dataclasses.is_dataclass(node) or isinstance(node, type): return node
@@ -216,7 +270,7 @@ class SimplePlanner:
         if ast.where: c = FilterOperator(c, ast.where)
         if ast.order_by:
             c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
-        c = ProjectOperator(c, self._build_proj(ast))
+        c = ProjectOperator(c, self._build_proj(ast, c))
         if ast.distinct: c = DistinctOperator(c)
         if ast.limit is not None or ast.offset is not None:
             c = LimitOperator(c, self._eval_const(ast.limit),
@@ -233,7 +287,22 @@ class SimplePlanner:
                 for o, s in zip(ast.select_list, ns)]
         c = ProjectOperator(c, proj)
         if ast.order_by:
-            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
+            # After windowed projection, resolve ORDER BY columns
+            # The projected output has specific column names; ORDER BY must reference those
+            resolved_sort_keys = []
+            proj_names = {name for name, _ in proj}
+            for sk in ast.order_by:
+                sort_expr = sk.expr
+                # If ORDER BY references a column that's in the projection, use it directly
+                if isinstance(sort_expr, ColumnRef) and sort_expr.table is None:
+                    if sort_expr.column not in proj_names:
+                        # Try to find the column in the projection expressions
+                        for pname, pexpr in proj:
+                            if isinstance(pexpr, ColumnRef) and pexpr.column == sort_expr.column:
+                                sort_expr = ColumnRef(table=None, column=pname)
+                                break
+                resolved_sort_keys.append((sort_expr, sk.direction, sk.nulls))
+            c = SortOperator(c, resolved_sort_keys)
         if ast.distinct: c = DistinctOperator(c)
         if ast.limit is not None or ast.offset is not None:
             c = LimitOperator(c, self._eval_const(ast.limit),
@@ -244,10 +313,214 @@ class SimplePlanner:
         src = self._build_source(ast, catalog)
         if ast.where: src = FilterOperator(src, ast.where)
         ss = dict(src.output_schema())
-        ge = [(self._col_name(k), k) for k in ast.group_by.keys] if ast.group_by else []
+        ge = []
+        if ast.group_by:
+            for k in ast.group_by.keys:
+                gname = self._col_name(k)
+                ge.append((gname, k))
         am: Dict[str, AggregateCall] = {}
         sub = [self._extract_aggs(e, am) for e in ast.select_list]
         hs = self._extract_aggs(ast.having, am) if ast.having else None
+
+        # Also extract aggs from ORDER BY expressions
+        order_sub = []
+        if ast.order_by:
+            for sk in ast.order_by:
+                order_sub.append(self._extract_aggs(sk.expr, am))
+
+        ae = list(am.items())
+        if not ge and not ae: return self._plan_select(ast, catalog)
+        if not ge:
+            batch = self._compute_scalar_agg(src, ss, am, sub, ast)
+            return _ScalarAggOperator(batch)
+        fae = []
+        for t, ac in ae:
+            if ac.distinct and ac.name.upper() == 'COUNT':
+                fae.append((t, AggregateCall(name='COUNT_DISTINCT', args=ac.args)))
+            elif ac.distinct and ac.name.upper() == 'SUM':
+                fae.append((t, AggregateCall(name='SUM_DISTINCT', args=ac.args)))
+            elif ac.distinct and ac.name.upper() == 'AVG':
+                fae.append((t, AggregateCall(name='AVG_DISTINCT', args=ac.args)))
+            else:
+                fae.append((t, ac))
+        c: Operator = HashAggOperator(src, ge, fae, self._registry, budget=self._budget)
+        if hs is not None: c = FilterOperator(c, hs)
+
+        # Build projection: map output names to agg temp names or group key names
+        fp = []
+        for o, s in zip(ast.select_list, sub):
+            nm = self._out_name(o)
+            inner = s.expr if isinstance(s, AliasExpr) else s
+            # If inner expression matches a group-by key, use ColumnRef to the key name
+            matched_ge = None
+            for gname, gexpr in ge:
+                if inner == gexpr:
+                    matched_ge = gname
+                    break
+            if matched_ge is not None:
+                inner = ColumnRef(table=None, column=matched_ge)
+            fp.append((nm, inner))
+        c = ProjectOperator(c, fp)
+
+        if ast.order_by:
+            # Resolve ORDER BY: use projected output column names
+            resolved_keys = []
+            # Build map from output alias to projected position
+            out_names = [name for name, _ in fp]
+
+            for si, sk in enumerate(ast.order_by):
+                sort_expr = sk.expr
+                # If ORDER BY references an alias that's in our output, use it
+                if isinstance(sort_expr, ColumnRef) and sort_expr.table is None:
+                    if sort_expr.column in out_names:
+                        resolved_keys.append((sort_expr, sk.direction, sk.nulls))
+                        continue
+                # If the ORDER BY was rewritten to a ColumnRef pointing to an agg temp name
+                if isinstance(sort_expr, ColumnRef) and sort_expr.column.startswith('__agg_'):
+                    # Find the output column name that corresponds to this agg
+                    for idx, (nm, expr) in enumerate(fp):
+                        if isinstance(expr, ColumnRef) and expr.column == sort_expr.column:
+                            sort_expr = ColumnRef(table=None, column=nm)
+                            break
+                elif si < len(order_sub):
+                    order_expr = order_sub[si]
+                    # Check if order_sub produced a ColumnRef to an agg temp name
+                    if isinstance(order_expr, ColumnRef) and order_expr.column.startswith('__agg_'):
+                        for idx, (nm, expr) in enumerate(fp):
+                            if isinstance(expr, ColumnRef) and expr.column == order_expr.column:
+                                sort_expr = ColumnRef(table=None, column=nm)
+                                break
+                    else:
+                        sort_expr = order_expr
+                resolved_keys.append((sort_expr, sk.direction, sk.nulls))
+            c = SortOperator(c, resolved_keys)
+
+        if ast.distinct: c = DistinctOperator(c)
+        if ast.limit is not None or ast.offset is not None:
+            c = LimitOperator(c, self._eval_const(ast.limit),
+                              self._eval_const(ast.offset) or 0)
+        return c
+
+    def _build_proj(self, ast, source_op=None):
+        proj = []
+        for expr in ast.select_list:
+            nm = self._out_name(expr)
+            inner = expr.expr if isinstance(expr, AliasExpr) else expr
+            if isinstance(inner, StarExpr):
+                # Expand StarExpr from source operator's output schema
+                if source_op is not None:
+                    schema = source_op.output_schema()
+                    if schema:
+                        for col_name, _ in schema:
+                            proj.append((col_name, ColumnRef(table=None, column=col_name)))
+                        continue
+                # Try to expand from FROM clause
+                if ast.from_clause:
+                    tref = ast.from_clause.table
+                    if tref.subquery is not None:
+                        raise ExecutionError("内部错误: StarExpr 未展开")
+                    elif tref.func_args is not None or tref.name.lower() == 'generate_series':
+                        raise ExecutionError("内部错误: StarExpr 未展开")
+                    else:
+                        raise ExecutionError("内部错误: StarExpr 未展开")
+                raise ExecutionError("内部错误: StarExpr 未展开")
+            proj.append((nm, inner))
+        return proj
+
+    def _build_source(self, ast, catalog):
+        if ast.from_clause is None: return DualScan()
+        fc = ast.from_clause;
+        tref = fc.table
+        if tref.subquery:
+            sub_op = self._plan_any(tref.subquery, catalog)
+            # If the current select has *, expand it now
+            self._expand_star_from_source(ast, sub_op)
+            return sub_op
+        if tref.func_args is not None or tref.name.lower() == 'generate_series':
+            gs_op = self._build_generate_series(ast)
+            # Expand * for generate_series
+            self._expand_star_from_source(ast, gs_op)
+            return gs_op
+        has_join = bool(fc.joins)
+        if has_join:
+            need_resolve = any(getattr(jc, 'natural', False) or getattr(jc, 'using', None)
+                               for jc in fc.joins)
+            resolved = self._resolve_natural_using(fc, catalog) if need_resolve else fc.joins
+            lq = tref.alias or tref.name;
+            st = catalog.get_store(tref.name)
+            lc = [c.name for c in st.schema.columns]
+            cur: Operator = ProjectOperator(SeqScan(tref.name, st, lc),
+                                            [(f"{lq}.{c}", ColumnRef(table=None, column=c)) for c in lc])
+            for jc in resolved:
+                assert jc.table is not None
+                if jc.table.subquery:
+                    rop = self._plan_any(jc.table.subquery, catalog)
+                    rq = jc.table.alias or '__sub'
+                    rs = rop.output_schema()
+                    rop = ProjectOperator(rop,
+                                          [(f"{rq}.{n}", ColumnRef(table=None, column=n)) for n, _ in rs])
+                else:
+                    rq = jc.table.alias or jc.table.name
+                    if jc.table.name.lower() == 'generate_series' or jc.table.func_args is not None:
+                        rop = self._build_generate_series_from_ref(jc.table)
+                        if rop:
+                            if jc.join_type == 'CROSS':
+                                cur = CrossJoinOperator(cur, rop)
+                            else:
+                                cur = HashJoinOperator(cur, rop, jc.join_type, jc.on)
+                            continue
+                    rs = catalog.get_store(jc.table.name)
+                    rc = [c.name for c in rs.schema.columns]
+                    rop = ProjectOperator(SeqScan(jc.table.name, rs, rc),
+                                          [(f"{rq}.{c}", ColumnRef(table=None, column=c)) for c in rc])
+                if jc.join_type == 'CROSS':
+                    cur = CrossJoinOperator(cur, rop)
+                else:
+                    cur = HashJoinOperator(cur, rop, jc.join_type, jc.on)
+            return cur
+        else:
+            st = catalog.get_store(tref.name);
+            needed = self._collect_all_cols(ast)
+            ordered = [c.name for c in st.schema.columns if c.name in needed]
+            if not ordered: ordered = [st.schema.columns[0].name]
+            return SeqScan(tref.name, st, ordered)
+
+    def _expand_star_from_source(self, ast, source_op):
+        """Expand SELECT * in-place when source is a subquery or table function."""
+        new_select = []
+        changed = False
+        for item in ast.select_list:
+            inner = item.expr if isinstance(item, AliasExpr) else item
+            if isinstance(inner, StarExpr) and inner.table is None:
+                schema = source_op.output_schema()
+                for col_name, _ in schema:
+                    new_select.append(ColumnRef(table=None, column=col_name))
+                changed = True
+            else:
+                new_select.append(item)
+        if changed:
+            ast.select_list.clear()
+            ast.select_list.extend(new_select)
+
+    def _plan_grouped(self, ast, catalog):
+        src = self._build_source(ast, catalog)
+        if ast.where: src = FilterOperator(src, ast.where)
+        ss = dict(src.output_schema())
+        ge = []
+        if ast.group_by:
+            for k in ast.group_by.keys:
+                gname = self._col_name(k)
+                ge.append((gname, k))
+        am: Dict[str, AggregateCall] = {}
+        sub = [self._extract_aggs(e, am) for e in ast.select_list]
+        hs = self._extract_aggs(ast.having, am) if ast.having else None
+
+        # Also extract aggs from ORDER BY expressions
+        order_sub = []
+        if ast.order_by:
+            for sk in ast.order_by:
+                order_sub.append(self._extract_aggs(sk.expr, am))
+
         ae = list(am.items())
         if not ge and not ae: return self._plan_select(ast, catalog)
         if not ge:
@@ -264,11 +537,48 @@ class SimplePlanner:
             else: fae.append((t, ac))
         c: Operator = HashAggOperator(src, ge, fae, self._registry, budget=self._budget)
         if hs is not None: c = FilterOperator(c, hs)
-        if ast.order_by:
-            c = SortOperator(c, [(sk.expr, sk.direction, sk.nulls) for sk in ast.order_by])
-        fp = [(self._out_name(o), (s.expr if isinstance(s, AliasExpr) else s))
-              for o, s in zip(ast.select_list, sub)]
+
+        # Build projection
+        fp = []
+        for o, s in zip(ast.select_list, sub):
+            nm = self._out_name(o)
+            inner = s.expr if isinstance(s, AliasExpr) else s
+            matched_ge = None
+            for gname, gexpr in ge:
+                if inner == gexpr:
+                    matched_ge = gname
+                    break
+            if matched_ge is not None:
+                inner = ColumnRef(table=None, column=matched_ge)
+            fp.append((nm, inner))
         c = ProjectOperator(c, fp)
+
+        if ast.order_by:
+            resolved_keys = []
+            out_names = [name for name, _ in fp]
+            for si, sk in enumerate(ast.order_by):
+                sort_expr = sk.expr
+                if isinstance(sort_expr, ColumnRef) and sort_expr.table is None:
+                    if sort_expr.column in out_names:
+                        resolved_keys.append((sort_expr, sk.direction, sk.nulls))
+                        continue
+                if isinstance(sort_expr, ColumnRef) and sort_expr.column.startswith('__agg_'):
+                    for idx, (nm, expr) in enumerate(fp):
+                        if isinstance(expr, ColumnRef) and expr.column == sort_expr.column:
+                            sort_expr = ColumnRef(table=None, column=nm)
+                            break
+                elif si < len(order_sub):
+                    order_expr = order_sub[si]
+                    if isinstance(order_expr, ColumnRef) and order_expr.column.startswith('__agg_'):
+                        for idx, (nm, expr) in enumerate(fp):
+                            if isinstance(expr, ColumnRef) and expr.column == order_expr.column:
+                                sort_expr = ColumnRef(table=None, column=nm)
+                                break
+                    else:
+                        sort_expr = order_expr
+                resolved_keys.append((sort_expr, sk.direction, sk.nulls))
+            c = SortOperator(c, resolved_keys)
+
         if ast.distinct: c = DistinctOperator(c)
         if ast.limit is not None or ast.offset is not None:
             c = LimitOperator(c, self._eval_const(ast.limit),
@@ -318,50 +628,6 @@ class SimplePlanner:
         return VectorBatch(columns=rc, _column_order=on, _row_count=1)
 
     # ═══ 数据源 ═══
-
-    def _build_source(self, ast, catalog):
-        if ast.from_clause is None: return DualScan()
-        fc = ast.from_clause; tref = fc.table
-        if tref.subquery: return self._plan_any(tref.subquery, catalog)
-        if tref.func_args is not None or tref.name.lower() == 'generate_series':
-            return self._build_generate_series(ast)
-        has_join = bool(fc.joins)
-        if has_join:
-            need_resolve = any(getattr(jc, 'natural', False) or getattr(jc, 'using', None)
-                               for jc in fc.joins)
-            resolved = self._resolve_natural_using(fc, catalog) if need_resolve else fc.joins
-            lq = tref.alias or tref.name; st = catalog.get_store(tref.name)
-            lc = [c.name for c in st.schema.columns]
-            cur: Operator = ProjectOperator(SeqScan(tref.name, st, lc),
-                [(f"{lq}.{c}", ColumnRef(table=None, column=c)) for c in lc])
-            for jc in resolved:
-                assert jc.table is not None
-                if jc.table.subquery:
-                    rop = self._plan_any(jc.table.subquery, catalog)
-                    rq = jc.table.alias or '__sub'
-                    rs = rop.output_schema()
-                    rop = ProjectOperator(rop,
-                        [(f"{rq}.{n}", ColumnRef(table=None, column=n)) for n, _ in rs])
-                else:
-                    rq = jc.table.alias or jc.table.name
-                    if jc.table.name.lower() == 'generate_series' or jc.table.func_args is not None:
-                        rop = self._build_generate_series_from_ref(jc.table)
-                        if rop:
-                            if jc.join_type == 'CROSS': cur = CrossJoinOperator(cur, rop)
-                            else: cur = HashJoinOperator(cur, rop, jc.join_type, jc.on)
-                            continue
-                    rs = catalog.get_store(jc.table.name)
-                    rc = [c.name for c in rs.schema.columns]
-                    rop = ProjectOperator(SeqScan(jc.table.name, rs, rc),
-                        [(f"{rq}.{c}", ColumnRef(table=None, column=c)) for c in rc])
-                if jc.join_type == 'CROSS': cur = CrossJoinOperator(cur, rop)
-                else: cur = HashJoinOperator(cur, rop, jc.join_type, jc.on)
-            return cur
-        else:
-            st = catalog.get_store(tref.name); needed = self._collect_all_cols(ast)
-            ordered = [c.name for c in st.schema.columns if c.name in needed]
-            if not ordered: ordered = [st.schema.columns[0].name]
-            return SeqScan(tref.name, st, ordered)
 
     def _build_generate_series(self, ast):
         try:
@@ -493,16 +759,6 @@ class SimplePlanner:
                 for i in c: r |= self._cc(i)
             else: r |= self._cc(c)
         return r
-
-    def _build_proj(self, ast):
-        proj = []
-        for expr in ast.select_list:
-            nm = self._out_name(expr)
-            inner = expr.expr if isinstance(expr, AliasExpr) else expr
-            if isinstance(inner, StarExpr):
-                raise ExecutionError("内部错误: StarExpr 未展开")
-            proj.append((nm, inner))
-        return proj
 
     def _out_name(self, expr):
         if isinstance(expr, AliasExpr): return expr.alias

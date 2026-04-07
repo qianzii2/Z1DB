@@ -110,6 +110,31 @@ class Parser:
                 TokenType.UNION, TokenType.INTERSECT,
                 TokenType.EXCEPT):
             stmt = self._parse_set_operation(stmt)
+        # Handle ORDER BY / LIMIT after set operations
+        if isinstance(stmt, SetOperationStmt):
+            if self._current.type in (TokenType.ORDER, TokenType.LIMIT, TokenType.OFFSET):
+                order_by = []
+                limit = None
+                offset = None
+                if self._current.type == TokenType.ORDER:
+                    order_by = self._parse_order_by()
+                if self._current.type == TokenType.LIMIT:
+                    self._advance()
+                    limit = self._expr.parse_expression()
+                if self._current.type == TokenType.OFFSET:
+                    self._advance()
+                    offset = self._expr.parse_expression()
+                # Wrap: SELECT * FROM (set_op) __setop ORDER BY ... LIMIT ...
+                from parser.ast import FromClause, TableRef
+                stmt = SelectStmt(
+                    select_list=[StarExpr()],
+                    from_clause=FromClause(
+                        table=TableRef(name='__setop', alias='__setop', subquery=stmt),
+                        joins=[]),
+                    order_by=order_by,
+                    limit=limit,
+                    offset=offset,
+                )
         if self._current.type == TokenType.SEMICOLON:
             self._advance()
         if self._current.type != TokenType.EOF:
@@ -171,13 +196,44 @@ class Parser:
         if self._current.type == TokenType.ALL:
             all_ = True
             self._advance()
-        right = self._parse_select()
+        right = self._parse_select_no_order()
         while self._current.type in (
                 TokenType.UNION, TokenType.INTERSECT,
                 TokenType.EXCEPT):
             right = self._parse_set_operation(right)
         return SetOperationStmt(
             op=op, all=all_, left=left, right=right)
+
+    def _parse_select_no_order(self):
+        """Parse SELECT without trailing ORDER BY/LIMIT (for set operations)."""
+        self._expect(TokenType.SELECT)
+        distinct = False
+        if self._current.type == TokenType.DISTINCT:
+            distinct = True
+            self._advance()
+        select_list = [self._parse_select_item()]
+        while self._current.type == TokenType.COMMA:
+            self._advance()
+            select_list.append(self._parse_select_item())
+        from_clause = (self._parse_from()
+                       if self._current.type == TokenType.FROM
+                       else None)
+        where = None
+        if self._current.type == TokenType.WHERE:
+            self._advance()
+            where = self._expr.parse_expression()
+        group_by = (self._parse_group_by()
+                    if self._current.type == TokenType.GROUP
+                    else None)
+        having = None
+        if self._current.type == TokenType.HAVING:
+            self._advance()
+            having = self._expr.parse_expression()
+        # No ORDER BY / LIMIT here — they apply to the set operation
+        return SelectStmt(
+            distinct=distinct, select_list=select_list,
+            from_clause=from_clause, where=where,
+            group_by=group_by, having=having)
 
     # ═══ SELECT ═══
 

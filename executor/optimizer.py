@@ -230,9 +230,17 @@ class QueryOptimizer:
     def _arith_type(self, left: Literal, right: Literal) -> DataType:
         if isinstance(left.value, float) or isinstance(right.value, float):
             return DataType.DOUBLE
-        return (left.inferred_type
-                if left.inferred_type != DataType.UNKNOWN
-                else DataType.INT)
+        lt = left.inferred_type if left.inferred_type != DataType.UNKNOWN else DataType.INT
+        rt = right.inferred_type if right.inferred_type != DataType.UNKNOWN else DataType.INT
+        if lt == DataType.BOOLEAN:
+            lt = DataType.INT
+        if rt == DataType.BOOLEAN:
+            rt = DataType.INT
+        from storage.types import promote
+        try:
+            return promote(lt, rt)
+        except Exception:
+            return DataType.INT
 
     def _simplify_predicates(self, ast: SelectStmt) -> SelectStmt:
         if ast.where:

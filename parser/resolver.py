@@ -49,9 +49,13 @@ class Resolver:
         if ast.from_clause is not None:
             tref = ast.from_clause.table
             if tref.subquery is None:
-                self._add_table(
-                    tref.name, tref.alias, cat,
-                    scope, all_cols_ordered)
+                if cat.table_exists(tref.name):
+                    self._add_table(
+                        tref.name, tref.alias, cat,
+                        scope, all_cols_ordered)
+                else:
+                    # Could be a CTE or generate_series - treat as subquery source
+                    has_subquery_source = True
             else:
                 has_subquery_source = True
                 qualifier = tref.alias or tref.name
@@ -63,9 +67,12 @@ class Resolver:
                     all_cols_ordered.append((qualifier, c))
             for jc in ast.from_clause.joins:
                 if jc.table and jc.table.subquery is None:
-                    self._add_table(
-                        jc.table.name, jc.table.alias,
-                        cat, scope, all_cols_ordered)
+                    if cat.table_exists(jc.table.name):
+                        self._add_table(
+                            jc.table.name, jc.table.alias,
+                            cat, scope, all_cols_ordered)
+                    else:
+                        has_subquery_source = True
                 elif jc.table and jc.table.subquery is not None:
                     has_subquery_source = True
                     jq = jc.table.alias or jc.table.name
@@ -108,6 +115,7 @@ class Resolver:
                             new_select.append(
                                 ColumnRef(table=None, column=col))
                     else:
+                        # Can't expand * - leave as is for later handling
                         new_select.append(item)
             else:
                 new_select.append(item)
@@ -189,19 +197,26 @@ class Resolver:
     @staticmethod
     def _infer_subquery_columns(subquery):
         """从子查询 AST 推断输出列名。"""
-        if not isinstance(subquery, SelectStmt):
-            return []
-        cols = []
-        for item in subquery.select_list:
-            if isinstance(item, AliasExpr):
-                cols.append(item.alias)
-            elif isinstance(item, ColumnRef):
-                cols.append(item.column)
-            elif isinstance(item, StarExpr):
-                return []
-            else:
-                cols.append(f'__expr_{len(cols)}')
-        return cols
+        if isinstance(subquery, SelectStmt):
+            cols = []
+            for item in subquery.select_list:
+                if isinstance(item, AliasExpr):
+                    cols.append(item.alias)
+                elif isinstance(item, ColumnRef):
+                    cols.append(item.column)
+                elif isinstance(item, StarExpr):
+                    return []
+                else:
+                    cols.append(f'__expr_{len(cols)}')
+            return cols
+        # Handle SetOperationStmt: infer from left side
+        try:
+            from parser.ast import SetOperationStmt
+            if isinstance(subquery, SetOperationStmt):
+                return Resolver._infer_subquery_columns(subquery.left)
+        except ImportError:
+            pass
+        return []
 
     @staticmethod
     def _find_ambiguous_columns(scope):

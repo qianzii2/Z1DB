@@ -17,7 +17,7 @@ from executor.expression.dispatch_table import build_dispatch
 from metal.bitmap import Bitmap
 from metal.typed_vector import TypedVector
 from parser.ast import (
-    AggregateCall, AliasExpr, BetweenExpr, BinaryExpr,
+    AggregateCall, AliasExpr, BetweenExpr, BinaryExpr,ExistsExpr,
     CaseExpr, CastExpr, ColumnRef, FunctionCall, InExpr,
     IsNullExpr, LikeExpr, Literal, StarExpr, UnaryExpr)
 from storage.types import (
@@ -86,8 +86,9 @@ class ExpressionEvaluator(EvalHelpers):
 
     _FUNC_DISPATCH: Optional[Dict[str, Any]] = None
 
-    def __init__(self, registry: Optional[Any] = None):
+    def __init__(self, registry: Optional[Any] = None, catalog: Optional[Any] = None):
         self._registry = registry
+        self._catalog = catalog
 
     # ═══ 主入口 ═══
 
@@ -119,6 +120,8 @@ class ExpressionEvaluator(EvalHelpers):
             return self._eval_like(expr, batch)
         if isinstance(expr, FunctionCall):
             return self._eval_function(expr, batch)
+        if isinstance(expr, ExistsExpr):
+            return self._eval_exists(expr, batch)
         if isinstance(expr, AggregateCall):
             raise ExecutionError("聚合出现在非聚合上下文中")
         if isinstance(expr, StarExpr):
@@ -475,6 +478,43 @@ class ExpressionEvaluator(EvalHelpers):
                 elif tdt in (DataType.FLOAT, DataType.DOUBLE): results[i] = float(v)
                 elif tdt in (DataType.VARCHAR, DataType.TEXT): results[i] = str(v)
                 elif tdt == DataType.BOOLEAN: results[i] = _cast_to_bool(v)
+                elif tdt == DataType.DATE:
+                    # Handle string to date conversion
+                    if isinstance(v, str):
+                        from executor.expression.helpers import _HAS_COMPILED_DATE, _parse_date_auto, ISO_DATE_PARSER
+                        if _HAS_COMPILED_DATE and _parse_date_auto:
+                            results[i] = _parse_date_auto(v)
+                        else:
+                            import datetime
+                            for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d.%m.%Y'):
+                                try:
+                                    d = datetime.datetime.strptime(v, fmt).date()
+                                    results[i] = (d - datetime.date(1970, 1, 1)).days
+                                    break
+                                except ValueError:
+                                    continue
+                    elif isinstance(v, (int, float)):
+                        results[i] = int(v)
+                    else:
+                        results[i] = v
+                elif tdt == DataType.TIMESTAMP:
+                    if isinstance(v, str):
+                        from executor.expression.helpers import _HAS_COMPILED_DATE, ISO_DATE_PARSER
+                        if _HAS_COMPILED_DATE and ISO_DATE_PARSER:
+                            results[i] = ISO_DATE_PARSER.parse_timestamp(v)
+                        else:
+                            import datetime
+                            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d'):
+                                try:
+                                    dt_obj = datetime.datetime.strptime(v, fmt)
+                                    results[i] = int((dt_obj - datetime.datetime(1970, 1, 1)).total_seconds() * 1_000_000)
+                                    break
+                                except ValueError:
+                                    continue
+                    elif isinstance(v, (int, float)):
+                        results[i] = int(v)
+                    else:
+                        results[i] = v
                 else: results[i] = v
             except (ValueError, TypeError): pass
         return self._list_to_vec(results, tdt, n)
@@ -661,6 +701,97 @@ class ExpressionEvaluator(EvalHelpers):
             rd.append(int(lv.get(i)) - int(rv.get(i)))
         return DataVector(dtype=out_dtype, data=rd, nulls=rn, _length=n)
 
+
+    def _eval_exists(self, expr, batch):
+        """Evaluate EXISTS per-row for correlated subqueries."""
+        n = batch.row_count
+        rd = Bitmap(n)
+        rn = Bitmap(n)
+        col_names = batch.column_names
+        col_types = [batch.columns[cn].dtype for cn in col_names]
+
+        for i in range(n):
+            # Build outer row values
+            outer_row = {cn: batch.columns[cn].get(i) for cn in col_names}
+            # Bind outer references in the subquery
+            bound_query = self._bind_outer_refs(expr.query, outer_row)
+            try:
+                from parser.resolver import Resolver
+                from parser.validator import Validator
+                # We need a planner to execute the subquery
+                from executor.simple_planner import SimplePlanner
+                from executor.functions.registry import FunctionRegistry
+                # Get catalog from a simple approach
+                result = self._exec_subquery(bound_query)
+                has_rows = len(result.rows) > 0
+                val = not has_rows if expr.negated else has_rows
+                if val:
+                    rd.set_bit(i)
+            except Exception:
+                pass  # No match on error
+        return DataVector(dtype=DataType.BOOLEAN, data=rd, nulls=rn, _length=n)
+
+    def _bind_outer_refs(self, query, outer_row):
+        """Replace outer column references with literal values."""
+        import dataclasses as _dc
+        if isinstance(query, ColumnRef):
+            # Check if this column exists in outer row
+            key = f"{query.table}.{query.column}" if query.table else query.column
+            if key in outer_row:
+                val = outer_row[key]
+                return Literal(value=val,
+                              inferred_type=DataType.INT if isinstance(val, int)
+                              else DataType.VARCHAR if isinstance(val, str)
+                              else DataType.DOUBLE if isinstance(val, float)
+                              else DataType.BOOLEAN if isinstance(val, bool)
+                              else DataType.UNKNOWN)
+            # Try without table qualifier
+            if query.table and query.column in outer_row:
+                val = outer_row[query.column]
+                return Literal(value=val,
+                              inferred_type=DataType.INT if isinstance(val, int)
+                              else DataType.VARCHAR if isinstance(val, str)
+                              else DataType.DOUBLE if isinstance(val, float)
+                              else DataType.BOOLEAN if isinstance(val, bool)
+                              else DataType.UNKNOWN)
+            return query
+        if query is None or not _dc.is_dataclass(query) or isinstance(query, type):
+            return query
+        changes = {}
+        for f in _dc.fields(query):
+            child = getattr(query, f.name)
+            if isinstance(child, ColumnRef):
+                changes[f.name] = self._bind_outer_refs(child, outer_row)
+            elif isinstance(child, list):
+                changes[f.name] = [self._bind_outer_refs(item, outer_row) for item in child]
+            elif isinstance(child, tuple):
+                changes[f.name] = tuple(self._bind_outer_refs(item, outer_row) for item in child)
+            elif _dc.is_dataclass(child) and not isinstance(child, type):
+                changes[f.name] = self._bind_outer_refs(child, outer_row)
+        return _dc.replace(query, **changes) if changes else query
+
+    def _exec_subquery(self, query):
+        """Execute a subquery using a minimal planner."""
+        # This is called from the evaluator which doesn't have direct planner access
+        # We create a minimal planner for subquery execution
+        from executor.simple_planner import SimplePlanner
+        from executor.functions.registry import FunctionRegistry
+        from executor.core.result import ExecutionResult
+        # We need the catalog - get it from the registry context
+        # This is a limitation; for now use a thread-local or global
+        if hasattr(self, '_catalog') and self._catalog:
+            reg = FunctionRegistry()
+            reg.register_defaults()
+            planner = SimplePlanner(reg)
+            try:
+                from parser.resolver import Resolver
+                from parser.validator import Validator
+                resolved = Resolver().resolve(query, self._catalog)
+                validated = Validator().validate(resolved, self._catalog)
+                return planner.execute(validated, self._catalog)
+            except Exception:
+                return ExecutionResult()
+        return ExecutionResult()
 
     # ═══ 委托到 type_inference 模块 ═══
 

@@ -90,7 +90,7 @@ class ScalarFunctionRegistry:
         def _ends_with(a, n, ev): return ev._bool2(a[0], a[1], n, lambda s, p: str(s).endswith(str(p)))
         def _contains(a, n, ev): return ev._bool2(a[0], a[1], n, lambda s, p: str(p) in str(s))
         def _ascii(a, n, ev): return ev._num1(a[0], n, lambda s: ord(str(s)[0]) if str(s) else 0, I)
-        def _chr(a, n, ev): return ev._str1(a[0], n, lambda x: chr(int(x)) if isinstance(x, (int, float)) else '')
+        def _chr(a, n, ev): return ev._str1(a[0], n, lambda x: chr(int(float(x))) if x else '')
         def _split(a, n, ev): return ev._str2(a[0], a[1], n, lambda s, d: str(str(s).split(str(d))))
         def _regexp_replace(a, n, ev): return ev._str3(a[0], a[1], a[2], n, lambda s, p, r: _re.sub(p, r, s))
         def _regexp_extract(a, n, ev): return ev._str2(a[0], a[1], n, lambda s, p: (m.group(0) if (m := _re.search(str(p), str(s))) else ''))
