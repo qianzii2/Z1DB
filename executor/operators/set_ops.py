@@ -1,6 +1,7 @@
 from __future__ import annotations
 """UNION / INTERSECT / EXCEPT 算子。
-[P13] UNION ALL 改为流式（不物化全部数据）。"""
+[P13] UNION ALL 改为流式（不物化全部数据）。
+[FIX] close() 避免重复关闭已在 open/next_batch 中关闭的子算子。"""
 from typing import List, Optional, Tuple
 from executor.core.batch import VectorBatch
 from executor.core.operator import Operator
@@ -9,18 +10,18 @@ from storage.types import DataType
 
 
 def _drain_to_rows(op: Operator) -> list:
-    """排空算子收集所有行。"""
+    """排空算子收集所有行。注意：不关闭算子，由调用方管理。"""
     rows = []
     while True:
         b = Operator._ensure_batch(op.next_batch())
         if b is None: break
         rows.extend(b.to_rows())
-    op.close()
     return rows
 
 
 class UnionOperator(Operator):
-    """UNION [ALL]。[P13] ALL 模式流式输出，不物化。"""
+    """UNION [ALL]。[P13] ALL 模式流式输出，不物化。
+    [FIX] 统一用 _left_closed/_right_closed 跟踪关闭状态，避免重复关闭。"""
 
     def __init__(self, left: Operator, right: Operator,
                  all_: bool = False) -> None:
@@ -34,6 +35,9 @@ class UnionOperator(Operator):
         # ALL 模式：流式
         self._left_done = False
         self._right_done = False
+        # [FIX] 统一关闭状态跟踪
+        self._left_closed = False
+        self._right_closed = False
 
     def output_schema(self) -> List[Tuple[str, DataType]]:
         return self.left.output_schema()
@@ -41,7 +45,9 @@ class UnionOperator(Operator):
     def open(self) -> None:
         self.left.open()
         self.right.open()
-        self._emitted = False  # [NB04] 两种模式都需要
+        self._emitted = False
+        self._left_closed = False
+        self._right_closed = False
         if self._all:
             self._left_done = False
             self._right_done = False
@@ -49,6 +55,9 @@ class UnionOperator(Operator):
             # 去重模式：全量物化
             left_rows = _drain_to_rows(self.left)
             right_rows = _drain_to_rows(self.right)
+            # [FIX] 物化后立即关闭子算子并标记
+            self.left.close(); self._left_closed = True
+            self.right.close(); self._right_closed = True
             combined = left_rows + right_rows
             seen: set = set()
             unique = []
@@ -75,14 +84,14 @@ class UnionOperator(Operator):
                 if batch is not None:
                     return batch
                 self._left_done = True
-                self.left.close()
+                self.left.close(); self._left_closed = True
             if not self._right_done:
                 batch = self._ensure_batch(
                     self.right.next_batch())
                 if batch is not None:
                     return batch
                 self._right_done = True
-                self.right.close()
+                self.right.close(); self._right_closed = True
             return None
         else:
             if self._emitted: return None
@@ -90,30 +99,19 @@ class UnionOperator(Operator):
             return self._result
 
     def close(self) -> None:
-        if self._all:
-            if not self._left_done:
-                try:
-                    self.left.close()
-                except Exception:
-                    pass
-                self._left_done = True
-            if not self._right_done:
-                try:
-                    self.right.close()
-                except Exception:
-                    pass
-                self._right_done = True
-        # 非 ALL 模式：open 中已通过 _drain_to_rows 关闭，
-        # 但为安全起见也尝试关闭
-        else:
+        # [FIX] 只关闭尚未关闭的子算子
+        if not self._left_closed:
             try:
                 self.left.close()
             except Exception:
                 pass
+            self._left_closed = True
+        if not self._right_closed:
             try:
                 self.right.close()
             except Exception:
                 pass
+            self._right_closed = True
 
 
 class IntersectOperator(Operator):
@@ -127,14 +125,18 @@ class IntersectOperator(Operator):
         self._all = all_
         self._result: Optional[VectorBatch] = None
         self._emitted = False
+        self._closed = False
 
     def output_schema(self):
         return self.left.output_schema()
 
     def open(self) -> None:
         self.left.open(); self.right.open()
+        self._closed = False
         lr = _drain_to_rows(self.left)
         rr = _drain_to_rows(self.right)
+        self.left.close(); self.right.close()
+        self._closed = True
         right_set: dict = {}
         for row in rr:
             key = null_safe_row_key(tuple(row))
@@ -163,14 +165,16 @@ class IntersectOperator(Operator):
         return self._result
 
     def close(self) -> None:
-        try:
-            self.left.close()
-        except Exception:
-            pass
-        try:
-            self.right.close()
-        except Exception:
-            pass
+        if not self._closed:
+            try:
+                self.left.close()
+            except Exception:
+                pass
+            try:
+                self.right.close()
+            except Exception:
+                pass
+            self._closed = True
 
 
 class ExceptOperator(Operator):
@@ -184,14 +188,18 @@ class ExceptOperator(Operator):
         self._all = all_
         self._result: Optional[VectorBatch] = None
         self._emitted = False
+        self._closed = False
 
     def output_schema(self):
         return self.left.output_schema()
 
     def open(self) -> None:
         self.left.open(); self.right.open()
+        self._closed = False
         lr = _drain_to_rows(self.left)
         rr = _drain_to_rows(self.right)
+        self.left.close(); self.right.close()
+        self._closed = True
         right_set: dict = {}
         for row in rr:
             key = null_safe_row_key(tuple(row))
@@ -221,11 +229,13 @@ class ExceptOperator(Operator):
         return self._result
 
     def close(self) -> None:
-        try:
-            self.left.close()
-        except Exception:
-            pass
-        try:
-            self.right.close()
-        except Exception:
-            pass
+        if not self._closed:
+            try:
+                self.left.close()
+            except Exception:
+                pass
+            try:
+                self.right.close()
+            except Exception:
+                pass
+            self._closed = True

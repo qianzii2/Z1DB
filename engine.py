@@ -29,6 +29,13 @@ from parser.validator import Validator
 from storage.types import DataType
 from utils.timer import Timer
 
+from executor.operators.system_table_scan import SystemTableScanOperator
+from executor.operators.system_table_filter import SystemTableFilterOperator
+from executor.operators.system_table_sort import SystemTableSortOperator
+from executor.operators.system_table_limit import SystemTableLimitOperator
+from executor.operators.system_table_project import SystemTableProjectOperator
+
+
 try:
     from executor.query_coordinator import QueryCoordinator
     _HAS_COORDINATOR = True
@@ -62,6 +69,8 @@ class _SuppressPersist:
     def __exit__(self, *args):
         self._engine._thread_local.suppress_persist = False
 
+_SYSTEM_TABLE_NAMES = {'z1db_tables', 'z1db_columns'}
+
 
 class Engine:
     """Z1DB 引擎主入口。"""
@@ -82,6 +91,7 @@ class Engine:
         self._init_txn()
         self._init_integrated()
         self._init_merge_worker()
+        self._thread_local = threading.local()
 
     # ═══ 初始化辅助 [D07] ═══
 
@@ -150,6 +160,11 @@ class Engine:
             try:
                 if cte_tables:
                     ast = self._strip_ctes(ast)
+                if (isinstance(ast, SelectStmt) and ast.from_clause and
+                        ast.from_clause.table and
+                        ast.from_clause.table.name in _SYSTEM_TABLE_NAMES):
+                    result = self._execute_system_table(ast)
+                    return self._finalize_result(ast, result, sql_hash=None, timer=t)
                 # 语义处理
                 if isinstance(ast, _NEEDS_RESOLVE):
                     ast = Resolver().resolve(ast, self._catalog)
@@ -461,6 +476,74 @@ class Engine:
                 left=self._optimize_ast(ast.left),
                 right=self._optimize_ast(ast.right))
         return ast
+
+    def _execute_system_table(self, ast: SelectStmt) -> ExecutionResult:
+        """使用算子流水线执行系统表查询。"""
+        tname = ast.from_clause.table.name
+        schema = self._catalog.get_table(tname)
+        all_columns = [c.name for c in schema.columns]
+
+        # 构建算子流水线
+        # 1. 扫描算子
+        scan_op = SystemTableScanOperator(self._catalog, tname)
+
+        # 2. 过滤算子（如果有 WHERE）
+        current_op = scan_op
+        if ast.where is not None:
+            current_op = SystemTableFilterOperator(current_op, ast.where)
+
+        # 3. 排序算子（如果有 ORDER BY）
+        if ast.order_by:
+            current_op = SystemTableSortOperator(current_op, ast.order_by)
+
+        # 4. 限制算子（如果有 LIMIT / OFFSET）
+        if ast.limit is not None or ast.offset is not None:
+            current_op = SystemTableLimitOperator(
+                current_op,
+                limit_expr=ast.limit,
+                offset_expr=ast.offset
+            )
+
+        # 5. 投影算子（处理 SELECT 列表）
+        current_op = SystemTableProjectOperator(
+            current_op,
+            select_list=ast.select_list,
+            all_columns=all_columns
+        )
+
+        # 执行流水线
+        current_op.open()
+        try:
+            rows = []
+            while True:
+                batch = current_op.next_batch()
+                if batch is None:
+                    break
+                rows.extend(batch.to_rows())
+
+            # 获取输出 schema
+            output_schema = current_op.output_schema()
+            columns = [name for name, _ in output_schema]
+            column_types = [dtype for _, dtype in output_schema]
+
+            return ExecutionResult(
+                columns=columns,
+                column_types=column_types,
+                rows=rows,
+                row_count=len(rows)
+            )
+        finally:
+            current_op.close()
+
+    def _finalize_result(self, ast, result, sql_hash, timer) -> ExecutionResult:
+        # 处理 timing、缓存等后续逻辑，保持原 execute 函数风格
+        result.timing = timer.elapsed
+        if sql_hash is not None:
+            tables = self._extract_tables(ast)
+            versions = {tbl: self._table_versions.get(tbl, 0)
+                        for tbl in tables}
+            self._result_cache.put(sql_hash, result, versions)
+        return result
 
     # ═══ 公共接口 ═══
 

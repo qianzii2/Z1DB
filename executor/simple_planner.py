@@ -47,6 +47,8 @@ class _ScalarAggOperator(Operator):
     def close(self): pass
 
 
+_SYSTEM_TABLE_NAMES = {'z1db_tables', 'z1db_columns'}
+
 class SimplePlanner:
     def __init__(self, function_registry: FunctionRegistry,
                  budget: Optional[Any] = None) -> None:
@@ -57,6 +59,13 @@ class SimplePlanner:
         self._dml = DMLExecutor(self._evaluator, planner=self)
 
     def execute(self, ast: Any, catalog: Catalog) -> ExecutionResult:
+        # 禁止系统表修改
+        if hasattr(ast, 'table') and ast.table in _SYSTEM_TABLE_NAMES:
+            from utils.errors import ExecutionError
+            from parser.ast import InsertStmt, UpdateStmt, DeleteStmt, DropTableStmt, AlterTableStmt
+            if isinstance(ast, (InsertStmt, UpdateStmt, DeleteStmt,
+                                DropTableStmt, AlterTableStmt)):
+                raise ExecutionError(f"不允许修改系统表 {ast.table}")
         if isinstance(ast, ExplainStmt):
             return self._exec_explain(ast, catalog)
         if isinstance(ast, AlterTableStmt):

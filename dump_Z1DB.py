@@ -7,7 +7,7 @@ SKIP_DIRS = {'__pycache__', '.git', 'test', '.idea', 'venv', '.venv',
              'node_modules', '.mypy_cache', '.pytest_cache', 'dist', 'build'}
 SKIP_FILES = {'dump_Z1DB.py', 'dump_project.py'}
 SKIP_PREFIXES = ('z1db_part', 'z1db_full')
-MAX_CHARS_PER_PART = 50000
+MAX_CHARS_PER_PART = 5000000
 
 
 def collect_files():
