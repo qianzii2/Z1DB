@@ -8,13 +8,19 @@ character classes [abc], [a-z], [^abc]."""
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 
+import threading
+
+_NFA_COUNTER_LOCK = threading.Lock()
+
+
 class _NFAState:
     __slots__ = ('id', 'transitions', 'epsilon')
     _counter = 0
 
     def __init__(self) -> None:
-        self.id = _NFAState._counter
-        _NFAState._counter += 1
+        with _NFA_COUNTER_LOCK:
+            self.id = _NFAState._counter
+            _NFAState._counter += 1
         self.transitions: Dict[str, List[_NFAState]] = {}
         self.epsilon: List[_NFAState] = []
 
@@ -122,7 +128,8 @@ class DFARegex:
     @staticmethod
     def compile(pattern: str) -> DFARegex:
         """编译正则为 DFA。"""
-        _NFAState._counter = 0  # R4：每次编译重置
+        with _NFA_COUNTER_LOCK:
+            _NFAState._counter = 0
         nfa = _parse_regex(pattern)
         return _nfa_to_dfa(nfa)
 

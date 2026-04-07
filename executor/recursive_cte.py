@@ -81,11 +81,15 @@ class RecursiveCTEExecutor:
             result_rows.extend(new_rows)
             working_rows = new_rows
 
-        return ExecutionResult(
+        result = ExecutionResult(
             columns=columns,
             column_types=col_types,
             rows=result_rows,
             row_count=len(result_rows))
+
+        self._cleanup(cte_name)
+
+        return result
 
     def _execute_query(self, query: Any) -> ExecutionResult:
         """通过planner执行查询AST。"""

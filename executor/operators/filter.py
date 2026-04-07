@@ -23,13 +23,21 @@ except ImportError:
     _HAS_LAZY = False
 
 # 全局共享编译缓存
+import threading
+
+_COMPILE_CACHE_LOCK = threading.Lock()
 _GLOBAL_COMPILE_CACHE: Optional[CompileCache] = None
 
 
 def _get_compile_cache() -> Optional[CompileCache]:
     global _GLOBAL_COMPILE_CACHE
-    if _HAS_JIT and _GLOBAL_COMPILE_CACHE is None:
-        _GLOBAL_COMPILE_CACHE = CompileCache(max_size=512)
+    if not _HAS_JIT:
+        return None
+    if _GLOBAL_COMPILE_CACHE is not None:
+        return _GLOBAL_COMPILE_CACHE
+    with _COMPILE_CACHE_LOCK:
+        if _GLOBAL_COMPILE_CACHE is None:
+            _GLOBAL_COMPILE_CACHE = CompileCache(max_size=512)
     return _GLOBAL_COMPILE_CACHE
 
 

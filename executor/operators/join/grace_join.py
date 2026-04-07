@@ -160,4 +160,14 @@ class GraceHashJoinOperator(Operator):
             self._result_rows, self._out_names,
             self._out_types)
 
-    def close(self): self._cleanup()
+    def close(self):
+        self._cleanup()
+        try:
+            self.left.close()
+        except Exception:
+            pass
+        try:
+            self.right.close()
+        except Exception:
+            pass
+

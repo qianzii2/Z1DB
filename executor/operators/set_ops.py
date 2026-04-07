@@ -92,11 +92,28 @@ class UnionOperator(Operator):
     def close(self) -> None:
         if self._all:
             if not self._left_done:
-                try: self.left.close()
-                except Exception: pass
+                try:
+                    self.left.close()
+                except Exception:
+                    pass
+                self._left_done = True
             if not self._right_done:
-                try: self.right.close()
-                except Exception: pass
+                try:
+                    self.right.close()
+                except Exception:
+                    pass
+                self._right_done = True
+        # 非 ALL 模式：open 中已通过 _drain_to_rows 关闭，
+        # 但为安全起见也尝试关闭
+        else:
+            try:
+                self.left.close()
+            except Exception:
+                pass
+            try:
+                self.right.close()
+            except Exception:
+                pass
 
 
 class IntersectOperator(Operator):
@@ -145,7 +162,15 @@ class IntersectOperator(Operator):
         self._emitted = True
         return self._result
 
-    def close(self): pass
+    def close(self) -> None:
+        try:
+            self.left.close()
+        except Exception:
+            pass
+        try:
+            self.right.close()
+        except Exception:
+            pass
 
 
 class ExceptOperator(Operator):
@@ -195,4 +220,12 @@ class ExceptOperator(Operator):
         self._emitted = True
         return self._result
 
-    def close(self): pass
+    def close(self) -> None:
+        try:
+            self.left.close()
+        except Exception:
+            pass
+        try:
+            self.right.close()
+        except Exception:
+            pass

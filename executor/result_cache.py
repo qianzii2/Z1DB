@@ -22,41 +22,43 @@ class ResultCache:
     def hash_sql(sql: str) -> int:
         """[P25] 标准化 SQL 后哈希。
         - 字符串外：多余空白压缩为单个空格
-        - 字符串内：保持原样（包括空白和大小写）
-        - 'SELECT  *  FROM  t' 与 'SELECT * FROM t' 命中同一缓存
-        - "WHERE name = 'hello  world'" 中 'hello  world' 不被修改"""
+        - 单引号和双引号内：保持原样
+        """
         parts: list = []
-        in_str = False
+        in_quote = False
+        quote_char = ''
         current: list = []
         stripped = sql.strip()
         i = 0
         while i < len(stripped):
             ch = stripped[i]
-            if not in_str:
-                if ch == "'":
+            if not in_quote:
+                if ch in ("'", '"'):
                     # 先标准化非字符串部分
                     text = ''.join(current)
                     parts.append(_WHITESPACE_RE.sub(' ', text))
                     current = [ch]
-                    in_str = True
+                    in_quote = True
+                    quote_char = ch
                 else:
                     current.append(ch)
             else:
                 current.append(ch)
-                if ch == "'":
-                    # 检查转义引号 ''
-                    if i + 1 < len(stripped) and stripped[i + 1] == "'":
-                        current.append("'")
+                if ch == quote_char:
+                    # 检查转义引号（'' 或 ""）
+                    if i + 1 < len(stripped) and stripped[i + 1] == quote_char:
+                        current.append(quote_char)
                         i += 1
                     else:
-                        # 字符串结束——原样保留
+                        # 引号结束——原样保留
                         parts.append(''.join(current))
                         current = []
-                        in_str = False
+                        in_quote = False
+                        quote_char = ''
             i += 1
         # 处理剩余
         if current:
-            if in_str:
+            if in_quote:
                 parts.append(''.join(current))
             else:
                 parts.append(_WHITESPACE_RE.sub(' ', ''.join(current)))

@@ -94,27 +94,27 @@ class SortOperator(Operator):
         self._emitted = False
 
     def _build_inline_stores(self, key_columns, key_dtypes, n):
-        if not _HAS_INLINE_STRING: return {}
+        if not _HAS_INLINE_STRING:
+            return {}
         stores = {}
-        null_sets = {}  # [P19] 记录哪些行是 NULL
         for ki, (values, _, _) in enumerate(key_columns):
-            if key_dtypes[ki] not in (DataType.VARCHAR, DataType.TEXT): continue
-            if n < 100: continue
+            if key_dtypes[ki] not in (DataType.VARCHAR, DataType.TEXT):
+                continue
+            if n < 100:
+                continue
             try:
                 iss = InlineStringStore(capacity=n)
                 ns = set()
                 for idx, val in enumerate(values):
                     if val is None:
-                        iss.append(_NULL_SENTINEL)  # [P19] NULL 哨兵
+                        iss.append(_NULL_SENTINEL)
                         ns.add(idx)
                     else:
                         iss.append(str(val))
-                stores[ki] = iss
-                null_sets[ki] = ns
-            except Exception: pass
-        # 将 null_sets 附加到 stores 字典
-        for ki in stores:
-            stores[ki] = (stores[ki], null_sets.get(ki, set()))
+                # 直接存为元组，避免后续覆盖步骤的不一致
+                stores[ki] = (iss, ns)
+            except Exception:
+                pass
         return stores
 
     def _make_compare_fn(self, key_columns, inline_stores):

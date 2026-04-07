@@ -43,23 +43,24 @@ except ImportError:
 
 _CTE_PREFIX = '__cte_'
 _DML_TYPES = (InsertStmt, UpdateStmt, DeleteStmt)
-_MUTATING_TYPES = (InsertStmt, UpdateStmt, DeleteStmt,
-                   CreateTableStmt, DropTableStmt,
-                   AlterTableStmt, CopyStmt)
 _NEEDS_RESOLVE = (SelectStmt, ExplainStmt, SetOperationStmt,
                   InsertStmt, UpdateStmt, DeleteStmt)
 _MUTATING_TYPES = (InsertStmt, UpdateStmt, DeleteStmt,
                    CreateTableStmt, DropTableStmt,
                    AlterTableStmt, CopyStmt, VacuumStmt)
 
+import threading
+
 class _SuppressPersist:
-    """[B03] 安全的 _suppress_persist 上下文管理器。"""
+    """[B03] 安全的 _suppress_persist 线程局部上下文管理器。"""
     def __init__(self, engine):
         self._engine = engine
+
     def __enter__(self):
-        self._engine._suppress_persist = True
+        self._engine._thread_local.suppress_persist = True
+
     def __exit__(self, *args):
-        self._engine._suppress_persist = False
+        self._engine._thread_local.suppress_persist = False
 
 
 class Engine:
@@ -264,8 +265,9 @@ class Engine:
 
     def _post_execute(self, ast, result, sql_hash):
         is_mutation = isinstance(ast, _MUTATING_TYPES)
+        suppress = getattr(self._thread_local, 'suppress_persist', False)
         if (self._catalog.is_persistent
-                and not self._suppress_persist
+                and not suppress
                 and is_mutation):
             self._catalog.persist()
             if self._wal:
@@ -398,18 +400,20 @@ class Engine:
                     cols = list(cr.columns)
                     if cc and len(cc) == len(cols):
                         cols = list(cc)
+
                     cs = [ColumnSchema(
                         name=c, dtype=t, nullable=True)
                         for c, t in zip(cols, cr.column_types)]
+
+                    cte_table_name = f'{_CTE_PREFIX}{cn}'
                     with _SuppressPersist(self):
-                        for nm in (f'{_CTE_PREFIX}{cn}', cn):
-                            if not self._catalog.table_exists(nm):
-                                self._catalog.create_table(
-                                    TableSchema(name=nm, columns=cs))
-                                st = self._catalog.get_store(nm)
-                                for row in cr.rows:
-                                    st.append_row(list(row))
-                                created.append(nm)
+                        if not self._catalog.table_exists(cte_table_name):
+                            self._catalog.create_table(
+                                TableSchema(name=cte_table_name, columns=cs))
+                            st = self._catalog.get_store(cte_table_name)
+                            for row in cr.rows:
+                                st.append_row(list(row))
+                            created.append(cte_table_name)
         elif isinstance(ast, ExplainStmt):
             created.extend(
                 self._materialize_ctes(ast.statement))

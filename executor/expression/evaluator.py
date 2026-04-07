@@ -195,10 +195,14 @@ class ExpressionEvaluator(EvalHelpers):
                     op, left, right, len(left))
                 if result is not None:
                     return result
-            # 如果 _is_temporal_arith 返回 True 但 _eval_temporal_arith
-            # 返回 None（如 int - date），跳过 promote 直接报错
+            # 检查不支持的时间算术（如 date - date、int - date）
             from storage.types import is_temporal
-            if (is_temporal(left.dtype) or is_temporal(right.dtype)):
+            if is_temporal(left.dtype) or is_temporal(right.dtype):
+                # DATE - DATE → 返回天数差（而非报错）
+                if (op == '-' and is_temporal(left.dtype)
+                        and is_temporal(right.dtype)
+                        and left.dtype == right.dtype):
+                    return self._eval_temporal_diff(left, right, len(left))
                 raise ExecutionError(
                     f"不支持的时间算术: {left.dtype.name} {op} {right.dtype.name}")
 
@@ -633,6 +637,30 @@ class ExpressionEvaluator(EvalHelpers):
             else:  # '-'
                 rd.append(tv - nv)
         return DataVector(dtype=out_dtype, data=rd, nulls=rn, _length=n)
+
+    def _eval_temporal_diff(self, lv, rv, n):
+        """DATE - DATE → INT（天数差），TIMESTAMP - TIMESTAMP → BIGINT（微秒差）。"""
+        from storage.types import DataType
+        from metal.bitmap import Bitmap
+        from metal.typed_vector import TypedVector
+        from storage.types import DTYPE_TO_ARRAY_CODE
+
+        if lv.dtype == DataType.DATE:
+            out_dtype = DataType.INT
+        else:
+            out_dtype = DataType.BIGINT
+
+        code = DTYPE_TO_ARRAY_CODE.get(out_dtype)
+        rd = TypedVector(code) if code else []
+        rn = Bitmap(n)
+        for i in range(n):
+            if lv.is_null(i) or rv.is_null(i):
+                rn.set_bit(i)
+                rd.append(0)
+                continue
+            rd.append(int(lv.get(i)) - int(rv.get(i)))
+        return DataVector(dtype=out_dtype, data=rd, nulls=rn, _length=n)
+
 
     # ═══ 委托到 type_inference 模块 ═══
 

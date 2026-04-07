@@ -60,4 +60,12 @@ class CrossJoinOperator(Operator):
         return VectorBatch.from_rows(self._result_rows, names, types)
 
     def close(self) -> None:
-        pass
+        try:
+            self.left.close()
+        except Exception:
+            pass
+        try:
+            self.right.close()
+        except Exception:
+            pass
+

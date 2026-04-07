@@ -83,26 +83,35 @@ class LSMStore:
                 except (ValueError, TypeError):
                     pass
         except ImportError:
+            # 回退路径：按 source 顺序遍历，后来的覆盖先前的
+            # SSTable 按层级排列（L0 最新在后），MemTable 最新
             merged = {}
-            for st in self._manifest.all_sstables():
+            all_sstables = self._manifest.all_sstables()
+            for si, st in enumerate(all_sstables):
                 for key, row in st.scan():
                     if row is None:
-                        merged.pop(key, None)
+                        # tombstone：标记删除
+                        merged[key] = (None, si)
                     else:
-                        merged[key] = True
+                        merged[key] = (row, si)
+            # MemTable 是最新的源
+            mem_source_id = len(all_sstables)
             for key, row in self._memtable.scan():
                 if row is None:
-                    merged.pop(key, None)
+                    merged[key] = (None, mem_source_id)
                 else:
-                    merged[key] = True
-            row_count = sum(1 for v in merged.values() if v)
-            for key in merged:
-                try:
-                    k = int(key)
-                    if k > max_key:
-                        max_key = k
-                except (ValueError, TypeError):
-                    pass
+                    merged[key] = (row, mem_source_id)
+            # 统计存活行（排除 tombstone）
+            row_count = 0
+            for key, (row, _) in merged.items():
+                if row is not None:
+                    row_count += 1
+                    try:
+                        k = int(key)
+                        if k > max_key:
+                            max_key = k
+                    except (ValueError, TypeError):
+                        pass
         self._next_key = max_key + 1 if max_key >= 0 else 0
         self._row_count = row_count
 

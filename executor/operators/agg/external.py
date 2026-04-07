@@ -20,7 +20,7 @@ class ExternalAggOperator(Operator):
     """哈希聚合 + 磁盘溢写。组数过多时分区到磁盘再逐分区聚合。"""
 
     NUM_PARTITIONS = 32
-    MEMORY_GROUP_LIMIT = 50000  # 内存中最多保持的组数
+    MEMORY_GROUP_LIMIT = 50000
 
     def __init__(self, child: Operator, group_exprs: list,
                  agg_exprs: list, registry: FunctionRegistry,
@@ -37,17 +37,25 @@ class ExternalAggOperator(Operator):
         self._emitted = False
 
     def output_schema(self) -> List[Tuple[str, DataType]]:
+        child_schema = dict(self.child.output_schema())
         result: List[Tuple[str, DataType]] = []
-        for name, _ in self._group_exprs:
-            result.append((name, DataType.VARCHAR))
-        for name, _ in self._agg_exprs:
-            result.append((name, DataType.VARCHAR))
+        for name, expr in self._group_exprs:
+            dt = ExpressionEvaluator.infer_type(expr, child_schema)
+            result.append((name, dt))
+        for name, ac in self._agg_exprs:
+            func = self._registry.get_aggregate(ac.name)
+            from parser.ast import StarExpr
+            if ac.args and not isinstance(ac.args[0], StarExpr):
+                input_types = [ExpressionEvaluator.infer_type(
+                    ac.args[0], child_schema)]
+            else:
+                input_types = []
+            result.append((name, func.return_type(input_types)))
         return result
 
     def open(self) -> None:
         self.child.open()
 
-        # 阶段1：收集所有行的key和聚合参数值
         all_key_rows: List[list] = []
         all_agg_rows: List[list] = []
 
@@ -80,15 +88,13 @@ class ExternalAggOperator(Operator):
             tuple(kr) for kr in all_key_rows))
 
         if total_groups_estimate <= self.MEMORY_GROUP_LIMIT or not _HAS_SPILL:
-            # 内存聚合
             rows = self._aggregate_in_memory(all_key_rows, all_agg_rows)
         else:
-            # 磁盘溢写聚合
             rows = self._aggregate_with_spill(all_key_rows, all_agg_rows)
 
-        names = ([n for n, _ in self._group_exprs]
-                 + [n for n, _ in self._agg_exprs])
-        types = [DataType.VARCHAR] * len(names)
+        out_schema = self.output_schema()
+        names = [n for n, _ in out_schema]
+        types = [t for _, t in out_schema]
         self._result = (VectorBatch.from_rows(rows, names, types)
                         if rows
                         else VectorBatch.empty(names, types))
@@ -96,7 +102,6 @@ class ExternalAggOperator(Operator):
 
     def _aggregate_in_memory(self, key_rows: list,
                              agg_rows: list) -> List[list]:
-        """全内存聚合。"""
         groups: Dict[tuple, list] = {}
         group_order: list = []
         for ki in range(len(key_rows)):
@@ -117,17 +122,14 @@ class ExternalAggOperator(Operator):
 
     def _aggregate_with_spill(self, key_rows: list,
                               agg_rows: list) -> List[list]:
-        """分区溢写到磁盘，逐分区聚合。"""
         manager = SpillManager()
         spill = HashSpill(self.NUM_PARTITIONS, manager)
 
-        # 分区写入
         for ki in range(len(key_rows)):
             combined = key_rows[ki] + agg_rows[ki]
             key_str = str(tuple(key_rows[ki]))
             spill.spill_row(key_str, combined)
 
-        # 逐分区读回并聚合
         num_key_cols = len(self._group_exprs)
         all_rows = []
         for p in range(self.NUM_PARTITIONS):
@@ -154,7 +156,6 @@ class ExternalAggOperator(Operator):
         return all_rows
 
     def _init_agg_states(self) -> list:
-        """初始化所有聚合的状态。"""
         states = []
         for _, ac in self._agg_exprs:
             func = self._registry.get_aggregate(ac.name)
@@ -162,7 +163,6 @@ class ExternalAggOperator(Operator):
         return states
 
     def _update_agg_states(self, states: list, agg_vals: list) -> None:
-        """更新聚合状态（单行）。"""
         for si in range(len(states)):
             func, state = states[si]
             val = agg_vals[si] if si < len(agg_vals) else None

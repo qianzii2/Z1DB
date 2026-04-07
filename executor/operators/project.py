@@ -32,15 +32,24 @@ except ImportError:
     _HAS_JIT = False
 
 # 全局编译缓存（跨算子实例复用）
+import threading
+
+_PROJ_CACHE_LOCK = threading.Lock()
 _PROJ_COMPILE_CACHE: Optional['CompileCache'] = None
-_JIT_THRESHOLD = 256  # 行数超过此阈值才尝试 JIT
+_JIT_THRESHOLD = 256
 
 
 def _get_proj_cache() -> Optional['CompileCache']:
     global _PROJ_COMPILE_CACHE
-    if _HAS_JIT and _PROJ_COMPILE_CACHE is None:
-        _PROJ_COMPILE_CACHE = CompileCache(max_size=512)
+    if not _HAS_JIT:
+        return None
+    if _PROJ_COMPILE_CACHE is not None:
+        return _PROJ_COMPILE_CACHE
+    with _PROJ_CACHE_LOCK:
+        if _PROJ_COMPILE_CACHE is None:
+            _PROJ_COMPILE_CACHE = CompileCache(max_size=512)
     return _PROJ_COMPILE_CACHE
+
 
 
 class ProjectOperator(Operator):

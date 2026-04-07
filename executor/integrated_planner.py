@@ -498,13 +498,11 @@ class IntegratedPlanner:
         """[集成] AdaptiveStrategy 驱动 JOIN 算法选择。"""
         build = min(lr, rr)
 
-        # [集成] 策略推荐
-        selector = self._get_strategy_selector(
-            None)  # catalog 已在 _build_optimized_source 中传入
+        # [修复] 使用已缓存的 strategy_selector，不再传 None
         recommended_join = None
-        if selector and _HAS_STRATEGY:
+        if self._strategy_selector and _HAS_STRATEGY:
             try:
-                recommended_join = selector.recommend_join(lr, rr)
+                recommended_join = self._strategy_selector.recommend_join(lr, rr)
             except Exception:
                 pass
 

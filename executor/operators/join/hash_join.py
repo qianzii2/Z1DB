@@ -107,7 +107,7 @@ class HashJoinOperator(Operator):
         self._full_schema = self.left.output_schema() + self.right.output_schema()
         self._right_matched = set()
         self._left_exhausted = False
-        self._pending_right = None
+        self._pending_right = None # 重置状态
 
         # ═══ Build 阶段：物化右表 ═══
         self._right_rows = []
@@ -291,10 +291,9 @@ class HashJoinOperator(Operator):
         right_names = [n for n, _ in self.right.output_schema()]
         for ri, r_row in enumerate(self._right_rows):
             if ri not in self._right_matched:
-                row = [None] * left_col_count
-                row += [r_row.get(n) for n in right_names]
+                row = [None] * left_col_count + [r_row.get(n) for n in right_names]
                 rows.append(row)
-        self._pending_right = True  # 标记已处理
+        self._pending_right = []  # 标记已处理
         if rows:
             return VectorBatch.from_rows(rows, self._out_names, self._out_types)
         return None
@@ -309,4 +308,11 @@ class HashJoinOperator(Operator):
         return [l_row.get(n) for n in self._out_names]
 
     def close(self):
-        pass
+        try:
+            self.left.close()
+        except Exception:
+            pass
+        try:
+            self.right.close()
+        except Exception:
+            pass

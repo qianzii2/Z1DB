@@ -84,10 +84,7 @@ class SortMergeJoinOperator(Operator):
                     self._result_rows.append([None] * left_col_count + r_rows[ri][1])
                     right_matched.add(ri)
             ri += 1
-        if self._join_type in ('RIGHT', 'FULL'):
-            for rj in range(len(r_rows)):
-                if rj not in right_matched:
-                    self._result_rows.append([None] * left_col_count + r_rows[rj][1])
+
         self._emitted = False
 
     def _collect_and_sort(self, op, names, key_col):
@@ -121,7 +118,15 @@ class SortMergeJoinOperator(Operator):
             return VectorBatch.empty(self._out_names, self._out_types)
         return VectorBatch.from_rows(self._result_rows, self._out_names, self._out_types)
 
-    def close(self): pass
+    def close(self):
+        try:
+            self.left.close()
+        except Exception:
+            pass
+        try:
+            self.right.close()
+        except Exception:
+            pass
 
 
 class _SortableKey:

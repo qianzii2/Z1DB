@@ -86,7 +86,10 @@ class TopNOperator(Operator):
         return self._result
 
     def close(self) -> None:
-        pass
+        try:
+            self.child.close()
+        except Exception:
+            pass
 
 
 class _HeapEntry:
